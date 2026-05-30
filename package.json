@@ -1,0 +1,16 @@
+{
+  "name": "nebula-insight",
+  "version": "0.1.0",
+  "private": true,
+  "description": "星云洞察：个人日志知识图谱与行为分析系统",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev:client": "npm --prefix client run dev",
+    "dev:server": "npm --prefix server run dev",
+    "build": "npm --prefix client run build",
+    "start": "npm --prefix server start"
+  }
+}
