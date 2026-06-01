@@ -6,8 +6,9 @@ import { DatabaseSync } from 'node:sqlite';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dataDir = path.resolve(__dirname, '../data');
-const dbPath = path.join(dataDir, 'nebula.sqlite');
+const dataDir = path.resolve(__dirname, '../../local-data');
+const configuredDbPath = process.env.NEBULA_DB_PATH;
+const dbPath = configuredDbPath ? path.resolve(configuredDbPath) : path.join(dataDir, 'nebula-memory.sqlite');
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 
 if (!existsSync(dataDir)) {
@@ -15,7 +16,10 @@ if (!existsSync(dataDir)) {
 }
 
 export const db = new DatabaseSync(dbPath);
-db.exec('PRAGMA foreign_keys = ON;');
+db.exec(`
+  PRAGMA journal_mode = MEMORY;
+  PRAGMA foreign_keys = ON;
+`);
 
 export function initializeDatabase() {
   db.exec(`

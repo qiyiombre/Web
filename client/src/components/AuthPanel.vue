@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import { LogIn, Orbit, UserPlus } from 'lucide-vue-next';
+import { Eye, EyeOff, LogIn, Orbit, UserPlus } from 'lucide-vue-next';
 import { login, register } from '../services/api';
 import type { UserAccount } from '../types/domain';
 
@@ -12,6 +12,8 @@ const mode = ref<'login' | 'register'>('login');
 const username = ref('');
 const password = ref('');
 const confirmPassword = ref('');
+const showPassword = ref(false);
+const showConfirmPassword = ref(false);
 const loading = ref(false);
 const error = ref('');
 
@@ -48,6 +50,8 @@ function switchMode(nextMode: 'login' | 'register') {
   mode.value = nextMode;
   error.value = '';
   confirmPassword.value = '';
+  showPassword.value = false;
+  showConfirmPassword.value = false;
 }
 </script>
 
@@ -77,11 +81,45 @@ function switchMode(nextMode: 'login' | 'register') {
         </label>
         <label class="field">
           <span>密码</span>
-          <input v-model="password" autocomplete="current-password" type="password" placeholder="至少 6 个字符" />
+          <span class="password-input">
+            <input
+              v-model="password"
+              :autocomplete="mode === 'login' ? 'current-password' : 'new-password'"
+              :type="showPassword ? 'text' : 'password'"
+              placeholder="至少 6 个字符"
+            />
+            <button
+              class="password-toggle"
+              type="button"
+              :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+              :title="showPassword ? '隐藏密码' : '显示密码'"
+              @click="showPassword = !showPassword"
+            >
+              <EyeOff v-if="showPassword" :size="18" />
+              <Eye v-else :size="18" />
+            </button>
+          </span>
         </label>
         <label v-if="mode === 'register'" class="field">
           <span>确认密码</span>
-          <input v-model="confirmPassword" autocomplete="new-password" type="password" placeholder="再次输入密码" />
+          <span class="password-input">
+            <input
+              v-model="confirmPassword"
+              autocomplete="new-password"
+              :type="showConfirmPassword ? 'text' : 'password'"
+              placeholder="再次输入密码"
+            />
+            <button
+              class="password-toggle"
+              type="button"
+              :aria-label="showConfirmPassword ? '隐藏确认密码' : '显示确认密码'"
+              :title="showConfirmPassword ? '隐藏确认密码' : '显示确认密码'"
+              @click="showConfirmPassword = !showConfirmPassword"
+            >
+              <EyeOff v-if="showConfirmPassword" :size="18" />
+              <Eye v-else :size="18" />
+            </button>
+          </span>
         </label>
 
         <p v-if="error" class="form-error">{{ error }}</p>
