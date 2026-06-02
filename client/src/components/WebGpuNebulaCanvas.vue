@@ -9,7 +9,7 @@ type PickNode =
 
 type LayoutPoint = { x: number; y: number; r: number };
 type Point3D = { x: number; y: number; z: number };
-type CameraTarget = { scale: number; x: number; y: number; yaw?: number; pitch?: number };
+type CameraTarget = { scale: number; panX: number; panY: number; yaw?: number; pitch?: number };
 
 interface LayoutResponse {
   requestId: number;
@@ -36,6 +36,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   tagToggle: [tagId: number];
   logOpen: [logId: number];
+  logInspect: [payload: { logId: number; x: number; y: number }];
 }>();
 
 const FOCAL_LENGTH = 740;
@@ -50,7 +51,8 @@ const webgpuError = ref('');
 const heatMode = ref(false);
 const fullscreen = ref(false);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
-const camera = reactive({ yaw: -0.42, pitch: -0.32 });
+const camera = reactive({ yaw: -0.42, pitch: -0.32, panX: 0, panY: 0 });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false });
 
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
@@ -103,7 +105,7 @@ let raf = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
 let isDragging = false;
-let dragMode: 'orbit' | 'tag' | 'log' | null = null;
+let dragMode: 'orbit' | 'pan' | 'tag' | 'log' | null = null;
 let dragTagId: number | null = null;
 let dragLogId: number | null = null;
 let dragTagOffset = { x: 0, y: 0 };
@@ -111,6 +113,7 @@ let dragLogOffset = { x: 0, y: 0 };
 let dragWorldZ = 0;
 let moved = false;
 let lastPointer = { x: 0, y: 0 };
+let dragButton = 0;
 let stars: Array<{ x: number; y: number; z: number; r: number; alpha: number; seed: number }> = [];
 let cameraTarget: CameraTarget | null = null;
 let resizeObserver: ResizeObserver | null = null;
@@ -470,8 +473,8 @@ function render(timeMs: number) {
       rect.height,
       transform.scale,
       timeMs / 1000,
-      transform.x,
-      transform.y,
+      camera.panX,
+      camera.panY,
       camera.yaw,
       camera.pitch,
       FOCAL_LENGTH,
@@ -664,8 +667,8 @@ function animateCamera() {
   }
   const ease = 0.12;
   transform.scale += (cameraTarget.scale - transform.scale) * ease;
-  transform.x += (cameraTarget.x - transform.x) * ease;
-  transform.y += (cameraTarget.y - transform.y) * ease;
+  camera.panX += (cameraTarget.panX - camera.panX) * ease;
+  camera.panY += (cameraTarget.panY - camera.panY) * ease;
   if (cameraTarget.yaw !== undefined) {
     camera.yaw += (cameraTarget.yaw - camera.yaw) * ease;
   }
@@ -674,14 +677,14 @@ function animateCamera() {
   }
   if (
     Math.abs(transform.scale - cameraTarget.scale) < 0.002 &&
-    Math.abs(transform.x - cameraTarget.x) < 0.5 &&
-    Math.abs(transform.y - cameraTarget.y) < 0.5 &&
+    Math.abs(camera.panX - cameraTarget.panX) < 0.5 &&
+    Math.abs(camera.panY - cameraTarget.panY) < 0.5 &&
     (cameraTarget.yaw === undefined || Math.abs(camera.yaw - cameraTarget.yaw) < 0.003) &&
     (cameraTarget.pitch === undefined || Math.abs(camera.pitch - cameraTarget.pitch) < 0.003)
   ) {
     transform.scale = cameraTarget.scale;
-    transform.x = cameraTarget.x;
-    transform.y = cameraTarget.y;
+    camera.panX = cameraTarget.panX;
+    camera.panY = cameraTarget.panY;
     if (cameraTarget.yaw !== undefined) {
       camera.yaw = cameraTarget.yaw;
     }
@@ -732,16 +735,19 @@ function isLogHighlighted(log: LogEntry) {
 }
 
 function onPointerDown(event: PointerEvent) {
+  event.preventDefault();
+  updateNebulaCursor(event);
   cameraTarget = null;
   isDragging = true;
-  dragMode = 'orbit';
+  dragMode = event.button === 1 ? 'pan' : 'orbit';
   dragTagId = null;
   dragLogId = null;
   dragWorldZ = 0;
   moved = false;
+  dragButton = event.button;
   lastPointer = { x: event.clientX, y: event.clientY };
   const picked = pickNodeAt(event.offsetX, event.offsetY);
-  if (picked?.kind === 'tag') {
+  if (event.button === 0 && picked?.kind === 'tag') {
     const current = tagPositions.get(picked.id);
     dragWorldZ = tagDepth(picked.id);
     const point = screenToWorldAtDepth(event.offsetX, event.offsetY, dragWorldZ);
@@ -751,7 +757,7 @@ function onPointerDown(event: PointerEvent) {
       x: (current?.x ?? point.x) - point.x,
       y: (current?.y ?? point.y) - point.y
     };
-  } else if (picked?.kind === 'log') {
+  } else if (event.button === 0 && picked?.kind === 'log') {
     const current = logPositions.get(picked.id);
     const log = props.graph.logs.find((item) => item.id === picked.id);
     dragWorldZ = log && current ? logPoint3D(log, current).z : 0;
@@ -767,6 +773,7 @@ function onPointerDown(event: PointerEvent) {
 }
 
 function onPointerMove(event: PointerEvent) {
+  updateNebulaCursor(event);
   if (!isDragging) {
     return;
   }
@@ -799,9 +806,8 @@ function onPointerMove(event: PointerEvent) {
       current.x = next.x;
       current.y = next.y;
     }
-  } else if (event.shiftKey) {
-    transform.x += dx;
-    transform.y += dy;
+  } else if (dragMode === 'pan') {
+    panCameraByScreenDelta(dx, dy);
   } else {
     camera.yaw += dx * 0.004;
     camera.pitch = clamp(camera.pitch + dy * 0.003, -0.82, 0.58);
@@ -811,15 +817,18 @@ function onPointerMove(event: PointerEvent) {
 }
 
 function onPointerUp(event: PointerEvent) {
+  updateNebulaCursor(event);
   canvas.value?.releasePointerCapture(event.pointerId);
   isDragging = false;
   const mode = dragMode;
   const tagId = dragTagId;
   const logId = dragLogId;
+  const button = dragButton;
   dragMode = null;
   dragTagId = null;
   dragLogId = null;
   dragWorldZ = 0;
+  dragButton = 0;
   if (mode === 'tag' && tagId !== null) {
     if (moved) {
       saveManualPositions();
@@ -841,6 +850,9 @@ function onPointerUp(event: PointerEvent) {
   if (moved) {
     return;
   }
+  if (button !== 0) {
+    return;
+  }
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (!picked) {
     return;
@@ -858,10 +870,48 @@ function onWheel(event: WheelEvent) {
   const zoom = event.deltaY < 0 ? 1.08 : 0.92;
   const before = screenToWorld(event.offsetX, event.offsetY);
   transform.scale = Math.min(2.55, Math.max(0.42, transform.scale * zoom));
-  const after = worldToScreen(before.x, before.y);
-  transform.x += event.offsetX - after.x;
-  transform.y += event.offsetY - after.y;
+  const after = screenToWorld(event.offsetX, event.offsetY);
+  camera.panX += before.x - after.x;
+  camera.panY += before.y - after.y;
   updateLabels();
+}
+
+function panCameraByScreenDelta(dx: number, dy: number) {
+  const delta = cameraPanDeltaForScreenShift(dx, dy, transform.scale, 0);
+  camera.panX += delta.x;
+  camera.panY += delta.y;
+}
+
+function cameraPanDeltaForScreenShift(dx: number, dy: number, scale: number, worldZ: number) {
+  if (!canvas.value) {
+    return { x: 0, y: 0 };
+  }
+  const rect = canvas.value.getBoundingClientRect();
+  const cx = rect.width / 2;
+  const cy = rect.height / 2;
+  const current = screenToWorldAtDepthWithCamera(cx, cy, worldZ, scale, camera.panX, camera.panY);
+  const shifted = screenToWorldAtDepthWithCamera(cx - dx, cy - dy, worldZ, scale, camera.panX, camera.panY);
+  return {
+    x: shifted.x - current.x,
+    y: shifted.y - current.y
+  };
+}
+
+function updateNebulaCursor(event: PointerEvent) {
+  nebulaCursor.x = event.offsetX;
+  nebulaCursor.y = event.offsetY;
+  nebulaCursor.visible = true;
+}
+
+function hideNebulaCursor() {
+  nebulaCursor.visible = false;
+}
+
+function onDoubleClick(event: MouseEvent) {
+  const picked = pickNodeAt(event.offsetX, event.offsetY);
+  if (picked?.kind === 'log') {
+    emit('logInspect', { logId: picked.id, x: event.clientX, y: event.clientY });
+  }
 }
 
 async function toggleFullscreen() {
@@ -903,11 +953,13 @@ function centerTag(tagId: number) {
   }
   const rect = canvas.value.getBoundingClientRect();
   const nextScale = Math.max(transform.scale, 1.18);
-  const base = projectWorldToScreen(tagPoint3D(tagId, point), nextScale, 0, 0);
+  const world = tagPoint3D(tagId, point);
+  const base = projectWorldToScreen(world, nextScale);
+  const delta = cameraPanDeltaForScreenShift(rect.width / 2 - base.x, rect.height / 2 - base.y, nextScale, world.z);
   cameraTarget = {
     scale: nextScale,
-    x: rect.width / 2 - base.x,
-    y: rect.height / 2 - base.y
+    panX: camera.panX + delta.x,
+    panY: camera.panY + delta.y
   };
 }
 
@@ -1033,18 +1085,29 @@ function screenToWorld(x: number, y: number) {
 }
 
 function screenToWorldAtDepth(x: number, y: number, worldZ: number) {
+  return screenToWorldAtDepthWithCamera(x, y, worldZ, transform.scale, camera.panX, camera.panY);
+}
+
+function screenToWorldAtDepthWithCamera(
+  x: number,
+  y: number,
+  worldZ: number,
+  scaleValue: number,
+  panX: number,
+  panY: number
+) {
   if (!canvas.value) {
     return { x: 0, y: 0 };
   }
   const rect = canvas.value.getBoundingClientRect();
-  const scale = Math.max(0.001, transform.scale);
-  const rayX = (x - rect.width / 2 - transform.x) / (scale * FOCAL_LENGTH);
-  const rayY = (y - rect.height / 2 - transform.y) / (scale * FOCAL_LENGTH);
+  const scale = Math.max(0.001, scaleValue);
+  const rayX = (x - rect.width / 2) / (scale * FOCAL_LENGTH);
+  const rayY = (y - rect.height / 2) / (scale * FOCAL_LENGTH);
   const worldAtDepth0 = inverseRotateWorld({ x: 0, y: 0, z: -VIEW_DISTANCE });
   const worldAtDepth1 = inverseRotateWorld({ x: rayX, y: rayY, z: 1 - VIEW_DISTANCE });
   const depthDelta = worldAtDepth1.z - worldAtDepth0.z;
   if (Math.abs(depthDelta) < 0.0001) {
-    return { x: worldAtDepth0.x, y: worldAtDepth0.y };
+    return { x: worldAtDepth0.x + panX, y: worldAtDepth0.y + panY };
   }
   const depth = Math.max(170, (worldZ - worldAtDepth0.z) / depthDelta);
   const world = inverseRotateWorld({
@@ -1052,20 +1115,20 @@ function screenToWorldAtDepth(x: number, y: number, worldZ: number) {
     y: rayY * depth,
     z: depth - VIEW_DISTANCE
   });
-  return { x: world.x, y: world.y };
+  return { x: world.x + panX, y: world.y + panY };
 }
 
-function projectWorldToScreen(point: Point3D, scale = transform.scale, panX = transform.x, panY = transform.y) {
+function projectWorldToScreen(point: Point3D, scale = transform.scale, panX = camera.panX, panY = camera.panY) {
   if (!canvas.value) {
     return { x: 0, y: 0, perspective: 1, depth: VIEW_DISTANCE };
   }
   const rect = canvas.value.getBoundingClientRect();
-  const rotated = rotateWorld(point);
+  const rotated = rotateWorld({ x: point.x - panX, y: point.y - panY, z: point.z });
   const depth = Math.max(170, VIEW_DISTANCE + rotated.z);
   const perspective = FOCAL_LENGTH / depth;
   return {
-    x: rect.width / 2 + panX + rotated.x * scale * perspective,
-    y: rect.height / 2 + panY + rotated.y * scale * perspective,
+    x: rect.width / 2 + rotated.x * scale * perspective,
+    y: rect.height / 2 + rotated.y * scale * perspective,
     perspective,
     depth
   };
@@ -1306,7 +1369,8 @@ fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 fn fs(input: VertexOut) -> @location(0) vec4f {
   let time = u.viewport.w;
   let aspect = max(0.4, u.viewport.x / max(1.0, u.viewport.y));
-  let screen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0);
+  let viewPan = vec2f(u.camera.x, -u.camera.y) / max(1.0, u.space.y) * 0.72;
+  let screen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0) + viewPan;
   let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
   let dir = rotateSky(viewDir);
   let lon = atan2(dir.x, dir.z);
@@ -1363,11 +1427,11 @@ fn rotateWorld(point: vec3f) -> vec3f {
 }
 
 fn projectWorld(point: vec3f) -> Projected {
-  let rotated = rotateWorld(point);
+  let rotated = rotateWorld(point - vec3f(u.camera.x, u.camera.y, 0.0));
   let depth = max(170.0, u.space.y + rotated.z);
   let perspective = u.space.x / depth;
   let center = u.viewport.xy * 0.5;
-  let screen = center + u.camera.xy + rotated.xy * u.viewport.z * perspective;
+  let screen = center + rotated.xy * u.viewport.z * perspective;
   return Projected(screen, perspective, depth);
 }
 `;
@@ -1573,15 +1637,24 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
 </script>
 
 <template>
-  <div ref="wrap" class="canvas-wrap webgpu-wrap" :class="{ fullscreen }">
+  <div ref="wrap" class="canvas-wrap webgpu-wrap nebula-interactive-surface" :class="{ fullscreen }">
     <canvas
       ref="canvas"
       class="nebula-canvas webgpu-canvas"
+      @pointerenter="updateNebulaCursor"
+      @pointerleave="hideNebulaCursor"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
+      @dblclick="onDoubleClick"
+      @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
+    <div
+      class="nebula-star-cursor"
+      :class="{ visible: nebulaCursor.visible }"
+      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px)` }"
+    ></div>
 
     <div class="webgpu-label-layer">
       <button
@@ -1612,6 +1685,6 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
     <button class="webgpu-heat-toggle" :class="{ active: heatMode }" type="button" @click="heatMode = !heatMode">
       热力
     </button>
-    <div class="webgpu-hud">WebGPU 3D 星系 · Shader 星云 · GPU 恒星/行星 · 空间能量线 · 拖拽旋转 · Shift 拖拽平移</div>
+    <div class="webgpu-hud">WebGPU 3D 星系 · Shader 星云 · GPU 恒星/行星 · 空间能量线 · 左/右键旋转 · 中键平移</div>
   </div>
 </template>

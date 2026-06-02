@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
-import { Cpu, Download, Edit3, FilePlus2, LogOut, Orbit, Plus, RefreshCw, RotateCcw, Trash2, UserRound } from 'lucide-vue-next';
+import { Cpu, Download, Edit3, FilePlus2, LogOut, Orbit, Plus, RefreshCw, RotateCcw, Trash2, UserRound, X } from 'lucide-vue-next';
 import AuthPanel from './components/AuthPanel.vue';
 import InsightPanel from './components/InsightPanel.vue';
 import LogEditor from './components/LogEditor.vue';
@@ -29,12 +29,20 @@ type NebulaRenderer = {
   resetTagLayout: () => void;
 };
 
+type NebulaLogCard = {
+  logId: number;
+  x: number;
+  y: number;
+};
+
 const maps = ref<NebulaMap[]>([]);
 const activeMapId = ref<number | null>(null);
 const graph = ref<GraphData | null>(null);
 const insights = ref<Insight | null>(null);
 const activeTagIds = ref<Set<number>>(new Set());
 const selectedLogId = ref<number | null>(null);
+const detailLogId = ref<number | null>(null);
+const nebulaLogCard = ref<NebulaLogCard | null>(null);
 const editorMode = ref<'new' | 'edit' | null>('new');
 const editingLog = ref<LogEntry | null>(null);
 const draft = ref<DraftLog | undefined>();
@@ -51,7 +59,14 @@ const rendererMode = ref<'canvas' | 'webgpu'>(localStorage.getItem('nebula.rende
 const canvasRef = ref<NebulaRenderer | null>(null);
 const tagManagerRef = ref<InstanceType<typeof TagManager> | null>(null);
 
-const selectedLog = computed(() => graph.value?.logs.find((log) => log.id === selectedLogId.value) ?? null);
+const selectedLog = computed(() => graph.value?.logs.find((log) => log.id === detailLogId.value) ?? null);
+const nebulaCardLog = computed(() => {
+  if (!graph.value || !nebulaLogCard.value) {
+    return null;
+  }
+  const log = graph.value.logs.find((item) => item.id === nebulaLogCard.value?.logId);
+  return log ? { log, x: nebulaLogCard.value.x, y: nebulaLogCard.value.y } : null;
+});
 
 const filteredLogs = computed(() => {
   if (!graph.value) {
@@ -150,6 +165,8 @@ async function loadWorkspace() {
   graph.value = null;
   insights.value = null;
   selectedLogId.value = null;
+  detailLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = null;
 }
 
@@ -160,6 +177,8 @@ function resetWorkspace() {
   insights.value = null;
   activeTagIds.value = new Set();
   selectedLogId.value = null;
+  detailLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = 'new';
   editingLog.value = null;
   draft.value = undefined;
@@ -179,6 +198,8 @@ async function selectMap(mapId: number) {
   localStorage.setItem('nebula.activeMapId', String(mapId));
   activeTagIds.value = new Set();
   selectedLogId.value = null;
+  detailLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = 'new';
   editingLog.value = null;
   draft.value = await loadDraft(mapId).catch(() => undefined);
@@ -239,6 +260,8 @@ async function addMap() {
 
 function startNewLog() {
   selectedLogId.value = null;
+  detailLogId.value = null;
+  nebulaLogCard.value = null;
   editingLog.value = null;
   editorMode.value = 'new';
 }
@@ -280,6 +303,8 @@ async function handleSaveLog(payload: DraftLog) {
     draftRestored.value = false;
     draftSavedAt.value = '';
     selectedLogId.value = saved.id;
+    detailLogId.value = saved.id;
+    nebulaLogCard.value = null;
     editorMode.value = null;
     editingLog.value = null;
     await refreshData();
@@ -304,6 +329,8 @@ async function removeSelectedLog() {
   }
   await deleteLog(selectedLog.value.id);
   selectedLogId.value = null;
+  detailLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = 'new';
   await refreshData();
   showNotice('日志已删除');
@@ -344,13 +371,40 @@ async function toggleTag(tagId: number) {
 }
 
 function openLog(logId: number) {
-  if (selectedLogId.value === logId && editorMode.value === null) {
+  if (detailLogId.value === logId && editorMode.value === null) {
+    detailLogId.value = null;
     selectedLogId.value = null;
+    nebulaLogCard.value = null;
     return;
   }
   selectedLogId.value = logId;
+  detailLogId.value = logId;
+  nebulaLogCard.value = null;
   editorMode.value = null;
   editingLog.value = null;
+}
+
+function selectNebulaLog(logId: number) {
+  if (selectedLogId.value === logId) {
+    selectedLogId.value = null;
+    nebulaLogCard.value = null;
+    return;
+  }
+  selectedLogId.value = logId;
+  nebulaLogCard.value = null;
+}
+
+function inspectNebulaLog(payload: NebulaLogCard) {
+  selectedLogId.value = payload.logId;
+  nebulaLogCard.value = {
+    logId: payload.logId,
+    x: Math.min(window.innerWidth - 280, Math.max(24, payload.x + 16)),
+    y: Math.min(window.innerHeight - 220, Math.max(24, payload.y - 16))
+  };
+}
+
+function closeNebulaCard() {
+  nebulaLogCard.value = null;
 }
 
 function focusTag(tagId: number) {
@@ -359,18 +413,20 @@ function focusTag(tagId: number) {
 
 function resetAiLayout() {
   canvasRef.value?.resetTagLayout();
-  showNotice('已清除手动位置，恢复自动布局');
+  showNotice('已清除手动位置，正在按标签关系重新布局');
 }
 
 function switchRenderer(mode: 'canvas' | 'webgpu') {
   rendererMode.value = mode;
   localStorage.setItem('nebula.rendererMode', mode);
+  nebulaLogCard.value = null;
   showNotice(mode === 'webgpu' ? '已切换到 WebGPU 星云渲染' : '已切换到 Canvas 兼容渲染');
 }
 
 async function activateTagAndFocus(tagId: number) {
   activeTagIds.value = new Set([tagId]);
   selectedLogId.value = null;
+  nebulaLogCard.value = null;
   await nextTick();
   window.requestAnimationFrame(() => canvasRef.value?.focusTag(tagId));
 }
@@ -553,7 +609,8 @@ function formatTime(value: Date) {
         :active-tag-ids="activeTagIds"
         :selected-log-id="selectedLogId"
         @tag-toggle="toggleTag"
-        @log-open="openLog"
+        @log-open="selectNebulaLog"
+        @log-inspect="inspectNebulaLog"
       />
       <WebGpuNebulaCanvas
         v-else-if="graph"
@@ -562,7 +619,8 @@ function formatTime(value: Date) {
         :active-tag-ids="activeTagIds"
         :selected-log-id="selectedLogId"
         @tag-toggle="toggleTag"
-        @log-open="openLog"
+        @log-open="selectNebulaLog"
+        @log-inspect="inspectNebulaLog"
       />
       <div v-else-if="hasNoMaps" class="empty-state">
         <div class="empty-state-content">
@@ -575,6 +633,34 @@ function formatTime(value: Date) {
         </div>
       </div>
       <div v-else class="empty-state">正在生成星云图...</div>
+
+      <div
+        v-if="nebulaCardLog"
+        class="nebula-log-card"
+        :style="{ left: `${nebulaCardLog.x}px`, top: `${nebulaCardLog.y}px` }"
+      >
+        <div class="nebula-log-card-head">
+          <span>日志星卡</span>
+          <button class="icon-button" title="关闭" @click="closeNebulaCard">
+            <X :size="14" />
+          </button>
+        </div>
+        <h3>{{ nebulaCardLog.log.title }}</h3>
+        <p class="detail-time">{{ formatDate(nebulaCardLog.log.createdAt) }}</p>
+        <p class="nebula-log-card-content">{{ nebulaCardLog.log.content }}</p>
+        <div class="chip-list">
+          <button
+            v-for="tag in nebulaCardLog.log.tags"
+            :key="tag.id"
+            class="chip"
+            :style="{ borderColor: tag.color }"
+            @click="focusTag(tag.id)"
+          >
+            {{ tag.name }}
+          </button>
+        </div>
+        <button class="text-button compact" @click="openLog(nebulaCardLog.log.id)">在侧栏打开</button>
+      </div>
     </section>
 
     <aside class="right-rail">

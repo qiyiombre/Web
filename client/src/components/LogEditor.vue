@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { Check, Save, Plus, Sparkles, WifiOff, X } from 'lucide-vue-next';
 import { suggestTags } from '../services/api';
 import type { DraftLog, LogEntry, TagNode, TagSuggestion } from '../types/domain';
@@ -26,7 +26,10 @@ const selectedTags = ref<string[]>([]);
 const tagInput = ref('');
 const suggestions = ref<TagSuggestion[]>([]);
 const loadingSuggestions = ref(false);
+const suggestionHint = ref('');
 const error = ref('');
+let suggestionTimer = 0;
+let suggestionRequestId = 0;
 
 const isEditing = computed(() => Boolean(props.initialLog));
 const canSave = computed(() => title.value.trim() && content.value.trim() && selectedTags.value.length > 0);
@@ -47,12 +50,24 @@ watch([title, content, selectedTags], () => {
   }
 });
 
+watch([title, content], () => {
+  if (isEditing.value) {
+    return;
+  }
+  scheduleAutoSuggestions();
+});
+
+onBeforeUnmount(() => {
+  window.clearTimeout(suggestionTimer);
+});
+
 function resetForm() {
   if (props.initialLog) {
     title.value = props.initialLog.title;
     content.value = props.initialLog.content;
     selectedTags.value = props.initialLog.tags.map((tag) => tag.name);
     suggestions.value = [];
+    suggestionHint.value = '';
     return;
   }
 
@@ -60,21 +75,57 @@ function resetForm() {
   content.value = props.draft?.content ?? '';
   selectedTags.value = props.draft?.tagNames ?? [];
   suggestions.value = [];
+  suggestionHint.value = '';
+  scheduleAutoSuggestions();
 }
 
-async function requestSuggestions() {
+function scheduleAutoSuggestions() {
+  window.clearTimeout(suggestionTimer);
+  const text = `${title.value}\n${content.value}`.trim();
+  if (text.length < 12) {
+    suggestions.value = [];
+    suggestionHint.value = text.length > 0 ? '再写一点内容后会自动推荐标签。' : '';
+    return;
+  }
+  suggestionHint.value = '内容停顿后会自动分析候选标签。';
+  suggestionTimer = window.setTimeout(() => {
+    void requestSuggestions('auto');
+  }, 900);
+}
+
+async function requestSuggestions(trigger: 'auto' | 'manual' = 'manual') {
   error.value = '';
   if (!content.value.trim()) {
     error.value = '先写一点日志内容，系统才能推荐标签。';
     return;
   }
+  window.clearTimeout(suggestionTimer);
+  const requestId = ++suggestionRequestId;
   loadingSuggestions.value = true;
+  suggestionHint.value = trigger === 'auto' ? '正在分析日志内容并推荐标签...' : '正在重新推荐标签...';
   try {
-    suggestions.value = await suggestTags(props.mapId, `${title.value}\n${content.value}`);
+    const result = await suggestTags(props.mapId, `${title.value}\n${content.value}`);
+    if (requestId !== suggestionRequestId) {
+      return;
+    }
+    suggestions.value = result.filter((item) => !selectedTags.value.includes(item.name));
+    if (suggestions.value.length === 0) {
+      suggestionHint.value = '暂时没有新的候选标签，可以手动添加。';
+      return;
+    }
+    suggestionHint.value = suggestions.value.some((item) => item.source === 'deepseek')
+      ? 'AI 已根据日志内容生成候选标签。'
+      : '当前使用本地推荐，配置 API Key 后会启用语义分析。';
   } catch (err) {
+    if (requestId !== suggestionRequestId) {
+      return;
+    }
     error.value = err instanceof Error ? err.message : '推荐失败';
+    suggestionHint.value = '推荐失败，可以先手动添加标签。';
   } finally {
-    loadingSuggestions.value = false;
+    if (requestId === suggestionRequestId) {
+      loadingSuggestions.value = false;
+    }
   }
 }
 
@@ -84,6 +135,7 @@ function addTag(name: string) {
     return;
   }
   selectedTags.value = [...selectedTags.value, clean];
+  suggestions.value = suggestions.value.filter((item) => item.name !== clean);
   tagInput.value = '';
 }
 
@@ -140,15 +192,19 @@ function save() {
     </label>
 
     <div class="editor-row">
-      <button class="secondary-button" :disabled="loadingSuggestions" @click="requestSuggestions">
+      <button class="secondary-button" :disabled="loadingSuggestions" @click="requestSuggestions('manual')">
         <Sparkles :size="16" />
         {{ loadingSuggestions ? '分析中' : '推荐标签' }}
       </button>
+      <span v-if="suggestionHint" class="suggestion-hint">{{ suggestionHint }}</span>
     </div>
 
     <div v-if="suggestions.length" class="suggestion-box">
       <button v-for="item in suggestions" :key="item.name" class="suggestion-item" @click="addTag(item.name)">
-        <span>{{ item.name }}</span>
+        <span class="suggestion-name">
+          {{ item.name }}
+          <small class="suggestion-source">{{ item.source === 'deepseek' ? 'AI' : '本地' }}</small>
+        </span>
         <small>{{ item.reason }}</small>
       </button>
     </div>

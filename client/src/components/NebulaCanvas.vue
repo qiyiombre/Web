@@ -23,10 +23,12 @@ const props = defineProps<{
 const emit = defineEmits<{
   tagToggle: [tagId: number];
   logOpen: [logId: number];
+  logInspect: [payload: { logId: number; x: number; y: number }];
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false });
 const pickNodes: PickNode[] = [];
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
@@ -44,6 +46,7 @@ let dragTagOffset = { x: 0, y: 0 };
 let dragLogOffset = { x: 0, y: 0 };
 let moved = false;
 let lastPointer = { x: 0, y: 0 };
+let dragButton = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
 
@@ -331,14 +334,17 @@ function isLogHighlighted(log: LogEntry) {
 }
 
 function onPointerDown(event: PointerEvent) {
+  event.preventDefault();
+  updateNebulaCursor(event);
   isDragging = true;
-  dragMode = 'pan';
+  dragMode = event.button === 1 ? 'pan' : null;
   dragTagId = null;
   dragLogId = null;
   moved = false;
+  dragButton = event.button;
   lastPointer = { x: event.clientX, y: event.clientY };
   const picked = pickNodeAt(event.offsetX, event.offsetY);
-  if (picked?.kind === 'tag') {
+  if (event.button === 0 && picked?.kind === 'tag') {
     const point = screenToWorld(event.offsetX, event.offsetY);
     dragMode = 'tag';
     dragTagId = picked.id;
@@ -346,7 +352,7 @@ function onPointerDown(event: PointerEvent) {
       x: picked.x - point.x,
       y: picked.y - point.y
     };
-  } else if (picked?.kind === 'log') {
+  } else if (event.button === 0 && picked?.kind === 'log') {
     const point = screenToWorld(event.offsetX, event.offsetY);
     dragMode = 'log';
     dragLogId = picked.id;
@@ -359,6 +365,7 @@ function onPointerDown(event: PointerEvent) {
 }
 
 function onPointerMove(event: PointerEvent) {
+  updateNebulaCursor(event);
   if (!isDragging) {
     return;
   }
@@ -399,14 +406,17 @@ function onPointerMove(event: PointerEvent) {
 }
 
 function onPointerUp(event: PointerEvent) {
+  updateNebulaCursor(event);
   canvas.value?.releasePointerCapture(event.pointerId);
   isDragging = false;
   const mode = dragMode;
   const tagId = dragTagId;
   const logId = dragLogId;
+  const button = dragButton;
   dragMode = null;
   dragTagId = null;
   dragLogId = null;
+  dragButton = 0;
   if (mode === 'tag' && tagId !== null) {
     if (moved) {
       saveManualPositions();
@@ -428,6 +438,9 @@ function onPointerUp(event: PointerEvent) {
   if (moved) {
     return;
   }
+  if (button !== 0) {
+    return;
+  }
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (!picked) {
     return;
@@ -447,6 +460,23 @@ function onWheel(event: WheelEvent) {
   const after = worldToScreen(before.x, before.y);
   transform.x += event.offsetX - after.x;
   transform.y += event.offsetY - after.y;
+}
+
+function updateNebulaCursor(event: PointerEvent) {
+  nebulaCursor.x = event.offsetX;
+  nebulaCursor.y = event.offsetY;
+  nebulaCursor.visible = true;
+}
+
+function hideNebulaCursor() {
+  nebulaCursor.visible = false;
+}
+
+function onDoubleClick(event: MouseEvent) {
+  const picked = pickNodeAt(event.offsetX, event.offsetY);
+  if (picked?.kind === 'log') {
+    emit('logInspect', { logId: picked.id, x: event.clientX, y: event.clientY });
+  }
 }
 
 function focusTag(tagId: number) {
@@ -561,14 +591,23 @@ function seeded(input: number) {
 </script>
 
 <template>
-  <div class="canvas-wrap">
+  <div class="canvas-wrap nebula-interactive-surface">
     <canvas
       ref="canvas"
       class="nebula-canvas"
+      @pointerenter="updateNebulaCursor"
+      @pointerleave="hideNebulaCursor"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
+      @dblclick="onDoubleClick"
+      @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
+    <div
+      class="nebula-star-cursor"
+      :class="{ visible: nebulaCursor.visible }"
+      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px)` }"
+    ></div>
   </div>
 </template>
