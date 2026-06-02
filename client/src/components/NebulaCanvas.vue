@@ -7,6 +7,10 @@ type PickNode =
   | { kind: 'log'; id: number; x: number; y: number; r: number };
 
 type LayoutPoint = { x: number; y: number; r: number };
+type LayoutSnapshot = {
+  tags: Array<[number, { x: number; y: number }]>;
+  logs: Array<[number, { x: number; y: number }]>;
+};
 
 interface LayoutResponse {
   requestId: number;
@@ -23,12 +27,13 @@ const props = defineProps<{
 const emit = defineEmits<{
   tagToggle: [tagId: number];
   logOpen: [logId: number];
-  logInspect: [payload: { logId: number; x: number; y: number }];
+  logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
+  layoutDirty: [dirty: boolean];
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
-const nebulaCursor = reactive({ x: 0, y: 0, visible: false });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2 });
 const pickNodes: PickNode[] = [];
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
@@ -49,6 +54,10 @@ let lastPointer = { x: 0, y: 0 };
 let dragButton = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
+let dragSnapshot: LayoutSnapshot | null = null;
+let lastPanInteractionAt = 0;
+const layoutHistory: LayoutSnapshot[] = [];
+const redoHistory: LayoutSnapshot[] = [];
 
 const layoutWorker = new Worker(new URL('../workers/layoutWorker.ts', import.meta.url), { type: 'module' });
 const activeIds = computed(() => [...props.activeTagIds]);
@@ -120,7 +129,11 @@ watch(
 
 defineExpose({
   focusTag,
-  resetTagLayout
+  resetTagLayout,
+  refreshLayout,
+  saveLayout,
+  undoLayout,
+  redoLayout
 });
 
 function resize() {
@@ -245,13 +258,14 @@ function drawTags() {
     }
     const active = props.activeTagIds.has(tag.id);
     const related = activeIds.value.length === 0 || active || props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
-    const glow = active ? 18 : related ? 9 : 3;
+    const glow = active ? 22 : related ? 12 : 4;
     ctx.save();
     ctx.shadowColor = tag.color;
     ctx.shadowBlur = glow;
     ctx.beginPath();
     ctx.fillStyle = active ? tag.color : `${tag.color}dd`;
-    ctx.arc(point.x, point.y, point.r, 0, Math.PI * 2);
+    const visualRadius = point.r * (active ? 1.08 : 1);
+    ctx.arc(point.x, point.y, visualRadius, 0, Math.PI * 2);
     ctx.fill();
     ctx.lineWidth = active ? 3 / transform.scale : 1.4 / transform.scale;
     ctx.strokeStyle = active ? '#ffffff' : 'rgba(255, 255, 255, 0.55)';
@@ -261,8 +275,8 @@ function drawTags() {
     ctx.fillStyle = active ? '#ffffff' : 'rgba(232, 243, 255, 0.86)';
     ctx.font = `${Math.max(12, 14 / transform.scale)}px "Microsoft YaHei", sans-serif`;
     ctx.textAlign = 'center';
-    ctx.fillText(tag.name, point.x, point.y + point.r + 18 / transform.scale);
-    pickNodes.push({ kind: 'tag', id: tag.id, x: point.x, y: point.y, r: point.r + 8 });
+    ctx.fillText(tag.name, point.x, point.y + visualRadius + 18 / transform.scale);
+    pickNodes.push({ kind: 'tag', id: tag.id, x: point.x, y: point.y, r: visualRadius + 10 });
   }
 }
 
@@ -279,16 +293,21 @@ function drawLogs() {
     const selected = props.selectedLogId === log.id;
     ctx.save();
     ctx.shadowColor = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'transparent';
-    ctx.shadowBlur = selected ? 16 : highlighted ? 9 : 0;
+    ctx.shadowBlur = selected ? 14 : highlighted ? 8 : 0;
     ctx.beginPath();
     ctx.fillStyle = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'rgba(151, 165, 182, 0.38)';
-    ctx.arc(point.x, point.y, selected ? 8 : point.r, 0, Math.PI * 2);
+    const logRadius = selected ? 6.4 : highlighted ? 5.6 : point.r;
+    ctx.moveTo(point.x, point.y - logRadius);
+    ctx.lineTo(point.x + logRadius, point.y);
+    ctx.lineTo(point.x, point.y + logRadius);
+    ctx.lineTo(point.x - logRadius, point.y);
+    ctx.closePath();
     ctx.fill();
     ctx.lineWidth = selected ? 2 / transform.scale : 1 / transform.scale;
     ctx.strokeStyle = selected ? '#55d6ff' : 'rgba(255,255,255,0.28)';
     ctx.stroke();
     ctx.restore();
-    pickNodes.push({ kind: 'log', id: log.id, x: point.x, y: point.y, r: 10 });
+    pickNodes.push({ kind: 'log', id: log.id, x: point.x, y: point.y, r: 12 });
   }
 }
 
@@ -338,13 +357,18 @@ function onPointerDown(event: PointerEvent) {
   updateNebulaCursor(event);
   isDragging = true;
   dragMode = event.button === 1 ? 'pan' : null;
+  if (dragMode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   dragTagId = null;
   dragLogId = null;
   moved = false;
   dragButton = event.button;
+  dragSnapshot = null;
   lastPointer = { x: event.clientX, y: event.clientY };
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (event.button === 0 && picked?.kind === 'tag') {
+    dragSnapshot = captureManualPositions();
     const point = screenToWorld(event.offsetX, event.offsetY);
     dragMode = 'tag';
     dragTagId = picked.id;
@@ -353,6 +377,7 @@ function onPointerDown(event: PointerEvent) {
       y: picked.y - point.y
     };
   } else if (event.button === 0 && picked?.kind === 'log') {
+    dragSnapshot = captureManualPositions();
     const point = screenToWorld(event.offsetX, event.offsetY);
     dragMode = 'log';
     dragLogId = picked.id;
@@ -399,6 +424,7 @@ function onPointerMove(event: PointerEvent) {
       current.y = next.y;
     }
   } else {
+    lastPanInteractionAt = performance.now();
     transform.x += dx;
     transform.y += dy;
   }
@@ -417,9 +443,13 @@ function onPointerUp(event: PointerEvent) {
   dragTagId = null;
   dragLogId = null;
   dragButton = 0;
+  if (mode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   if (mode === 'tag' && tagId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -428,7 +458,8 @@ function onPointerUp(event: PointerEvent) {
   }
   if (mode === 'log' && logId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -454,6 +485,9 @@ function onPointerUp(event: PointerEvent) {
 
 function onWheel(event: WheelEvent) {
   event.preventDefault();
+  if (isDragging || performance.now() - lastPanInteractionAt < 220) {
+    return;
+  }
   const zoom = event.deltaY < 0 ? 1.08 : 0.92;
   const before = screenToWorld(event.offsetX, event.offsetY);
   transform.scale = Math.min(2.4, Math.max(0.45, transform.scale * zoom));
@@ -463,6 +497,11 @@ function onWheel(event: WheelEvent) {
 }
 
 function updateNebulaCursor(event: PointerEvent) {
+  const dx = event.offsetX - nebulaCursor.x;
+  const dy = event.offsetY - nebulaCursor.y;
+  if (Math.abs(dx) + Math.abs(dy) > 1) {
+    nebulaCursor.angle = Math.atan2(dy, dx);
+  }
   nebulaCursor.x = event.offsetX;
   nebulaCursor.y = event.offsetY;
   nebulaCursor.visible = true;
@@ -475,7 +514,14 @@ function hideNebulaCursor() {
 function onDoubleClick(event: MouseEvent) {
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (picked?.kind === 'log') {
-    emit('logInspect', { logId: picked.id, x: event.clientX, y: event.clientY });
+    const rect = canvas.value?.getBoundingClientRect();
+    emit('logInspect', {
+      logId: picked.id,
+      x: event.offsetX,
+      y: event.offsetY,
+      width: rect?.width ?? window.innerWidth,
+      height: rect?.height ?? window.innerHeight
+    });
   }
 }
 
@@ -522,6 +568,8 @@ function logPositionStorageKey() {
 function loadManualPositions() {
   manualTagPositions.clear();
   manualLogPositions.clear();
+  layoutHistory.length = 0;
+  redoHistory.length = 0;
   loadManualPointMap(tagPositionStorageKey(), new Set(props.graph.tags.map((tag) => tag.id)), manualTagPositions);
   loadManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
@@ -553,6 +601,77 @@ function saveManualPositions() {
   saveManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
 
+function saveLayout() {
+  if (manualTagPositions.size === 0 && manualLogPositions.size === 0) {
+    return false;
+  }
+  saveManualPositions();
+  emit('layoutDirty', false);
+  return true;
+}
+
+function undoLayout() {
+  const snapshot = layoutHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushRedoHistory(captureManualPositions());
+  restoreManualPositions(snapshot);
+  requestLayout();
+  draw();
+  return true;
+}
+
+function redoLayout() {
+  const snapshot = redoHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushLayoutHistory(captureManualPositions(), false);
+  restoreManualPositions(snapshot);
+  requestLayout();
+  draw();
+  return true;
+}
+
+function captureManualPositions(): LayoutSnapshot {
+  return {
+    tags: [...manualTagPositions.entries()].map(([id, point]) => [id, { ...point }]),
+    logs: [...manualLogPositions.entries()].map(([id, point]) => [id, { ...point }])
+  };
+}
+
+function restoreManualPositions(snapshot: LayoutSnapshot) {
+  manualTagPositions.clear();
+  manualLogPositions.clear();
+  for (const [id, point] of snapshot.tags) {
+    manualTagPositions.set(id, { ...point });
+  }
+  for (const [id, point] of snapshot.logs) {
+    manualLogPositions.set(id, { ...point });
+  }
+}
+
+function pushLayoutHistory(snapshot: LayoutSnapshot | null, clearRedo = true) {
+  if (!snapshot) {
+    return;
+  }
+  layoutHistory.push(snapshot);
+  if (layoutHistory.length > 30) {
+    layoutHistory.shift();
+  }
+  if (clearRedo) {
+    redoHistory.length = 0;
+  }
+}
+
+function pushRedoHistory(snapshot: LayoutSnapshot) {
+  redoHistory.push(snapshot);
+  if (redoHistory.length > 30) {
+    redoHistory.shift();
+  }
+}
+
 function saveManualPointMap(
   key: string,
   validIds: Set<number>,
@@ -563,11 +682,18 @@ function saveManualPointMap(
 }
 
 function resetTagLayout() {
+  pushLayoutHistory(captureManualPositions());
   manualTagPositions.clear();
   manualLogPositions.clear();
   window.localStorage.removeItem(tagPositionStorageKey());
   window.localStorage.removeItem(logPositionStorageKey());
+  emit('layoutDirty', false);
   requestLayout();
+}
+
+function refreshLayout() {
+  requestLayout();
+  draw();
 }
 
 function worldToScreen(x: number, y: number) {
@@ -607,7 +733,8 @@ function seeded(input: number) {
     <div
       class="nebula-star-cursor"
       :class="{ visible: nebulaCursor.visible }"
-      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px)` }"
+      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px) rotate(${nebulaCursor.angle}rad)` }"
     ></div>
+    <slot name="overlay"></slot>
   </div>
 </template>

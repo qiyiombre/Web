@@ -113,9 +113,7 @@ async function requestSuggestions(trigger: 'auto' | 'manual' = 'manual') {
       suggestionHint.value = '暂时没有新的候选标签，可以手动添加。';
       return;
     }
-    suggestionHint.value = suggestions.value.some((item) => item.source === 'deepseek')
-      ? 'AI 已根据日志内容生成候选标签。'
-      : '当前使用本地推荐，配置 API Key 后会启用语义分析。';
+    suggestionHint.value = '已根据日志内容生成候选标签。';
   } catch (err) {
     if (requestId !== suggestionRequestId) {
       return;
@@ -203,7 +201,7 @@ function save() {
       <button v-for="item in suggestions" :key="item.name" class="suggestion-item" @click="addTag(item.name)">
         <span class="suggestion-name">
           {{ item.name }}
-          <small class="suggestion-source">{{ item.source === 'deepseek' ? 'AI' : '本地' }}</small>
+          <small class="suggestion-source">{{ item.existing ? '已有' : '新增' }}</small>
         </span>
         <small>{{ item.reason }}</small>
       </button>

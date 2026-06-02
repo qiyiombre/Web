@@ -9,7 +9,11 @@ type PickNode =
 
 type LayoutPoint = { x: number; y: number; r: number };
 type Point3D = { x: number; y: number; z: number };
-type CameraTarget = { scale: number; panX: number; panY: number; yaw?: number; pitch?: number };
+type CameraTarget = { scale: number; panX: number; panY: number; panZ: number; yaw?: number; pitch?: number };
+type LayoutSnapshot = {
+  tags: Array<[number, { x: number; y: number }]>;
+  logs: Array<[number, { x: number; y: number }]>;
+};
 
 interface LayoutResponse {
   requestId: number;
@@ -36,7 +40,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   tagToggle: [tagId: number];
   logOpen: [logId: number];
-  logInspect: [payload: { logId: number; x: number; y: number }];
+  logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
+  layoutDirty: [dirty: boolean];
 }>();
 
 const FOCAL_LENGTH = 740;
@@ -51,8 +56,8 @@ const webgpuError = ref('');
 const heatMode = ref(false);
 const fullscreen = ref(false);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
-const camera = reactive({ yaw: -0.42, pitch: -0.32, panX: 0, panY: 0 });
-const nebulaCursor = reactive({ x: 0, y: 0, visible: false });
+const camera = reactive({ yaw: -0.42, pitch: -0.32, panX: 0, panY: 0, panZ: 0 });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2 });
 
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
@@ -117,6 +122,10 @@ let dragButton = 0;
 let stars: Array<{ x: number; y: number; z: number; r: number; alpha: number; seed: number }> = [];
 let cameraTarget: CameraTarget | null = null;
 let resizeObserver: ResizeObserver | null = null;
+let dragSnapshot: LayoutSnapshot | null = null;
+let lastPanInteractionAt = 0;
+const layoutHistory: LayoutSnapshot[] = [];
+const redoHistory: LayoutSnapshot[] = [];
 
 const layoutWorker = new Worker(new URL('../workers/layoutWorker.ts', import.meta.url), { type: 'module' });
 
@@ -193,7 +202,11 @@ watch(
 
 defineExpose({
   focusTag,
-  resetTagLayout
+  resetTagLayout,
+  refreshLayout,
+  saveLayout,
+  undoLayout,
+  redoLayout
 });
 
 async function initWebGpu() {
@@ -481,7 +494,7 @@ function render(timeMs: number) {
       VIEW_DISTANCE,
       1,
       0,
-      0,
+      camera.panZ,
       0,
       0,
       0
@@ -560,11 +573,11 @@ function updateGeometryBuffers() {
       props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
     const state = heatMode.value && heat !== 'flat' ? 1 : active ? 1 : related ? 0.62 : 0.28;
     const depth = 0.92 + seeded(tag.id + 2200) * 0.22;
-    const activeScale = active ? 1.36 : 1;
-    const coreRadius = point.r * 1.86 * depth * activeScale;
+    const activeScale = active ? 1.22 : 1;
+    const coreRadius = point.r * 1.38 * depth * activeScale;
     const world = tagPoint3D(tag.id, point);
-    pushNodeInstance(nodeRows, world, coreRadius * (active ? 1.46 : 1.24), 3, color, active ? 0.1 : 0.055, state, seeded(tag.id + 700), 0);
-    pushNodeInstance(nodeRows, world, coreRadius * (active ? 2.22 : 1.98), 1, color, active ? 1 : 0.96, state, seeded(tag.id + 800), 0);
+    pushNodeInstance(nodeRows, world, coreRadius * (active ? 1.32 : 1.12), 3, color, active ? 0.12 : 0.06, state, seeded(tag.id + 700), 0);
+    pushNodeInstance(nodeRows, world, coreRadius * (active ? 1.76 : 1.48), 1, color, active ? 1 : 0.94, state, seeded(tag.id + 800), 0);
   }
 
   for (const log of props.graph.logs) {
@@ -575,9 +588,9 @@ function updateGeometryBuffers() {
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
     const state = selected ? 1 : highlighted ? 0.82 : 0.26;
-    const radius = highlighted ? 9.8 : selected ? 9.8 : 7.2;
-    const glowAlpha = selected ? 0.66 : highlighted ? 0.3 : 0.08;
-    const glowRadius = selected ? 3.75 : highlighted ? 2.9 : 2.25;
+    const radius = selected ? 6.8 : highlighted ? 6.2 : 4.9;
+    const glowAlpha = selected ? 0.6 : highlighted ? 0.28 : 0.07;
+    const glowRadius = selected ? 3.4 : highlighted ? 2.75 : 2.1;
     const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : 0.84;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
@@ -669,6 +682,7 @@ function animateCamera() {
   transform.scale += (cameraTarget.scale - transform.scale) * ease;
   camera.panX += (cameraTarget.panX - camera.panX) * ease;
   camera.panY += (cameraTarget.panY - camera.panY) * ease;
+  camera.panZ += (cameraTarget.panZ - camera.panZ) * ease;
   if (cameraTarget.yaw !== undefined) {
     camera.yaw += (cameraTarget.yaw - camera.yaw) * ease;
   }
@@ -679,12 +693,14 @@ function animateCamera() {
     Math.abs(transform.scale - cameraTarget.scale) < 0.002 &&
     Math.abs(camera.panX - cameraTarget.panX) < 0.5 &&
     Math.abs(camera.panY - cameraTarget.panY) < 0.5 &&
+    Math.abs(camera.panZ - cameraTarget.panZ) < 0.5 &&
     (cameraTarget.yaw === undefined || Math.abs(camera.yaw - cameraTarget.yaw) < 0.003) &&
     (cameraTarget.pitch === undefined || Math.abs(camera.pitch - cameraTarget.pitch) < 0.003)
   ) {
     transform.scale = cameraTarget.scale;
     camera.panX = cameraTarget.panX;
     camera.panY = cameraTarget.panY;
+    camera.panZ = cameraTarget.panZ;
     if (cameraTarget.yaw !== undefined) {
       camera.yaw = cameraTarget.yaw;
     }
@@ -740,14 +756,19 @@ function onPointerDown(event: PointerEvent) {
   cameraTarget = null;
   isDragging = true;
   dragMode = event.button === 1 ? 'pan' : 'orbit';
+  if (dragMode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   dragTagId = null;
   dragLogId = null;
   dragWorldZ = 0;
   moved = false;
   dragButton = event.button;
+  dragSnapshot = null;
   lastPointer = { x: event.clientX, y: event.clientY };
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (event.button === 0 && picked?.kind === 'tag') {
+    dragSnapshot = captureManualPositions();
     const current = tagPositions.get(picked.id);
     dragWorldZ = tagDepth(picked.id);
     const point = screenToWorldAtDepth(event.offsetX, event.offsetY, dragWorldZ);
@@ -758,6 +779,7 @@ function onPointerDown(event: PointerEvent) {
       y: (current?.y ?? point.y) - point.y
     };
   } else if (event.button === 0 && picked?.kind === 'log') {
+    dragSnapshot = captureManualPositions();
     const current = logPositions.get(picked.id);
     const log = props.graph.logs.find((item) => item.id === picked.id);
     dragWorldZ = log && current ? logPoint3D(log, current).z : 0;
@@ -807,6 +829,7 @@ function onPointerMove(event: PointerEvent) {
       current.y = next.y;
     }
   } else if (dragMode === 'pan') {
+    lastPanInteractionAt = performance.now();
     panCameraByScreenDelta(dx, dy);
   } else {
     camera.yaw += dx * 0.004;
@@ -829,9 +852,13 @@ function onPointerUp(event: PointerEvent) {
   dragLogId = null;
   dragWorldZ = 0;
   dragButton = 0;
+  if (mode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   if (mode === 'tag' && tagId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -840,7 +867,8 @@ function onPointerUp(event: PointerEvent) {
   }
   if (mode === 'log' && logId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -866,6 +894,9 @@ function onPointerUp(event: PointerEvent) {
 
 function onWheel(event: WheelEvent) {
   event.preventDefault();
+  if (isDragging || performance.now() - lastPanInteractionAt < 220) {
+    return;
+  }
   cameraTarget = null;
   const zoom = event.deltaY < 0 ? 1.08 : 0.92;
   const before = screenToWorld(event.offsetX, event.offsetY);
@@ -877,27 +908,29 @@ function onWheel(event: WheelEvent) {
 }
 
 function panCameraByScreenDelta(dx: number, dy: number) {
-  const delta = cameraPanDeltaForScreenShift(dx, dy, transform.scale, 0);
+  const delta = cameraPanDeltaForScreenShift(dx, dy, transform.scale, VIEW_DISTANCE);
   camera.panX += delta.x;
   camera.panY += delta.y;
+  camera.panZ += delta.z;
 }
 
-function cameraPanDeltaForScreenShift(dx: number, dy: number, scale: number, worldZ: number) {
-  if (!canvas.value) {
-    return { x: 0, y: 0 };
-  }
-  const rect = canvas.value.getBoundingClientRect();
-  const cx = rect.width / 2;
-  const cy = rect.height / 2;
-  const current = screenToWorldAtDepthWithCamera(cx, cy, worldZ, scale, camera.panX, camera.panY);
-  const shifted = screenToWorldAtDepthWithCamera(cx - dx, cy - dy, worldZ, scale, camera.panX, camera.panY);
+function cameraPanDeltaForScreenShift(dx: number, dy: number, scale: number, depth = VIEW_DISTANCE) {
+  const worldPerPixel = Math.max(170, depth) / (Math.max(0.001, scale) * FOCAL_LENGTH);
+  const right = inverseRotateWorld({ x: 1, y: 0, z: 0 });
+  const up = inverseRotateWorld({ x: 0, y: 1, z: 0 });
   return {
-    x: shifted.x - current.x,
-    y: shifted.y - current.y
+    x: (-dx * right.x - dy * up.x) * worldPerPixel,
+    y: (-dx * right.y - dy * up.y) * worldPerPixel,
+    z: (-dx * right.z - dy * up.z) * worldPerPixel
   };
 }
 
 function updateNebulaCursor(event: PointerEvent) {
+  const dx = event.offsetX - nebulaCursor.x;
+  const dy = event.offsetY - nebulaCursor.y;
+  if (Math.abs(dx) + Math.abs(dy) > 1) {
+    nebulaCursor.angle = Math.atan2(dy, dx);
+  }
   nebulaCursor.x = event.offsetX;
   nebulaCursor.y = event.offsetY;
   nebulaCursor.visible = true;
@@ -910,7 +943,14 @@ function hideNebulaCursor() {
 function onDoubleClick(event: MouseEvent) {
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (picked?.kind === 'log') {
-    emit('logInspect', { logId: picked.id, x: event.clientX, y: event.clientY });
+    const rect = canvas.value?.getBoundingClientRect();
+    emit('logInspect', {
+      logId: picked.id,
+      x: event.offsetX,
+      y: event.offsetY,
+      width: rect?.width ?? window.innerWidth,
+      height: rect?.height ?? window.innerHeight
+    });
   }
 }
 
@@ -955,11 +995,12 @@ function centerTag(tagId: number) {
   const nextScale = Math.max(transform.scale, 1.18);
   const world = tagPoint3D(tagId, point);
   const base = projectWorldToScreen(world, nextScale);
-  const delta = cameraPanDeltaForScreenShift(rect.width / 2 - base.x, rect.height / 2 - base.y, nextScale, world.z);
+  const delta = cameraPanDeltaForScreenShift(rect.width / 2 - base.x, rect.height / 2 - base.y, nextScale, base.depth);
   cameraTarget = {
     scale: nextScale,
     panX: camera.panX + delta.x,
-    panY: camera.panY + delta.y
+    panY: camera.panY + delta.y,
+    panZ: camera.panZ + delta.z
   };
 }
 
@@ -985,14 +1026,14 @@ function updateLabels() {
     const screen = projectWorldToScreen(tagPoint3D(tag.id, point));
     const heat = heatMode.value ? heatState(tag.id) : 'flat';
     const active = props.activeTagIds.has(tag.id);
-    const radius = Math.max(active ? 38 : 28, point.r * transform.scale * screen.perspective * (active ? 2.85 : 2.18));
+    const radius = Math.max(active ? 32 : 24, point.r * transform.scale * screen.perspective * (active ? 2.1 : 1.72));
     if (screen.x > -140 && screen.x < rect.width + 140 && screen.y > -140 && screen.y < rect.height + 140) {
       pickNodes.push({ kind: 'tag', id: tag.id, x: screen.x, y: screen.y, r: radius });
       nextLabels.push({
         id: tag.id,
         name: tag.name,
         x: screen.x,
-        y: screen.y + radius + 13,
+        y: screen.y + radius + 15,
         color: heatMode.value ? rgbToCss(heatColor(tag.color, heat)) : tag.color,
         active,
         heat
@@ -1008,9 +1049,9 @@ function updateLabels() {
     const screen = projectWorldToScreen(logPoint3D(log, point));
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
-    const radius = Math.max(11, (highlighted || selected ? 14 : 10) * transform.scale * screen.perspective);
+    const radius = Math.max(12, (highlighted || selected ? 11 : 8) * transform.scale * screen.perspective);
     if (screen.x > -90 && screen.x < rect.width + 90 && screen.y > -90 && screen.y < rect.height + 90) {
-      pickNodes.push({ kind: 'log', id: log.id, x: screen.x, y: screen.y, r: radius + 7 });
+      pickNodes.push({ kind: 'log', id: log.id, x: screen.x, y: screen.y, r: radius + 6 });
     }
   }
 
@@ -1028,6 +1069,8 @@ function logPositionStorageKey() {
 function loadManualPositions() {
   manualTagPositions.clear();
   manualLogPositions.clear();
+  layoutHistory.length = 0;
+  redoHistory.length = 0;
   loadManualPointMap(tagPositionStorageKey(), new Set(props.graph.tags.map((tag) => tag.id)), manualTagPositions);
   loadManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
@@ -1059,6 +1102,77 @@ function saveManualPositions() {
   saveManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
 
+function saveLayout() {
+  if (manualTagPositions.size === 0 && manualLogPositions.size === 0) {
+    return false;
+  }
+  saveManualPositions();
+  emit('layoutDirty', false);
+  return true;
+}
+
+function undoLayout() {
+  const snapshot = layoutHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushRedoHistory(captureManualPositions());
+  restoreManualPositions(snapshot);
+  requestLayout();
+  updateLabels();
+  return true;
+}
+
+function redoLayout() {
+  const snapshot = redoHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushLayoutHistory(captureManualPositions(), false);
+  restoreManualPositions(snapshot);
+  requestLayout();
+  updateLabels();
+  return true;
+}
+
+function captureManualPositions(): LayoutSnapshot {
+  return {
+    tags: [...manualTagPositions.entries()].map(([id, point]) => [id, { ...point }]),
+    logs: [...manualLogPositions.entries()].map(([id, point]) => [id, { ...point }])
+  };
+}
+
+function restoreManualPositions(snapshot: LayoutSnapshot) {
+  manualTagPositions.clear();
+  manualLogPositions.clear();
+  for (const [id, point] of snapshot.tags) {
+    manualTagPositions.set(id, { ...point });
+  }
+  for (const [id, point] of snapshot.logs) {
+    manualLogPositions.set(id, { ...point });
+  }
+}
+
+function pushLayoutHistory(snapshot: LayoutSnapshot | null, clearRedo = true) {
+  if (!snapshot) {
+    return;
+  }
+  layoutHistory.push(snapshot);
+  if (layoutHistory.length > 30) {
+    layoutHistory.shift();
+  }
+  if (clearRedo) {
+    redoHistory.length = 0;
+  }
+}
+
+function pushRedoHistory(snapshot: LayoutSnapshot) {
+  redoHistory.push(snapshot);
+  if (redoHistory.length > 30) {
+    redoHistory.shift();
+  }
+}
+
 function saveManualPointMap(
   key: string,
   validIds: Set<number>,
@@ -1069,11 +1183,19 @@ function saveManualPointMap(
 }
 
 function resetTagLayout() {
+  pushLayoutHistory(captureManualPositions());
   manualTagPositions.clear();
   manualLogPositions.clear();
   window.localStorage.removeItem(tagPositionStorageKey());
   window.localStorage.removeItem(logPositionStorageKey());
+  emit('layoutDirty', false);
   requestLayout();
+}
+
+function refreshLayout() {
+  cameraTarget = null;
+  requestLayout();
+  updateLabels();
 }
 
 function worldToScreen(x: number, y: number) {
@@ -1085,7 +1207,7 @@ function screenToWorld(x: number, y: number) {
 }
 
 function screenToWorldAtDepth(x: number, y: number, worldZ: number) {
-  return screenToWorldAtDepthWithCamera(x, y, worldZ, transform.scale, camera.panX, camera.panY);
+  return screenToWorldAtDepthWithCamera(x, y, worldZ, transform.scale, camera.panX, camera.panY, camera.panZ);
 }
 
 function screenToWorldAtDepthWithCamera(
@@ -1094,7 +1216,8 @@ function screenToWorldAtDepthWithCamera(
   worldZ: number,
   scaleValue: number,
   panX: number,
-  panY: number
+  panY: number,
+  panZ: number
 ) {
   if (!canvas.value) {
     return { x: 0, y: 0 };
@@ -1109,7 +1232,7 @@ function screenToWorldAtDepthWithCamera(
   if (Math.abs(depthDelta) < 0.0001) {
     return { x: worldAtDepth0.x + panX, y: worldAtDepth0.y + panY };
   }
-  const depth = Math.max(170, (worldZ - worldAtDepth0.z) / depthDelta);
+  const depth = Math.max(170, (worldZ - panZ - worldAtDepth0.z) / depthDelta);
   const world = inverseRotateWorld({
     x: rayX * depth,
     y: rayY * depth,
@@ -1118,12 +1241,18 @@ function screenToWorldAtDepthWithCamera(
   return { x: world.x + panX, y: world.y + panY };
 }
 
-function projectWorldToScreen(point: Point3D, scale = transform.scale, panX = camera.panX, panY = camera.panY) {
+function projectWorldToScreen(
+  point: Point3D,
+  scale = transform.scale,
+  panX = camera.panX,
+  panY = camera.panY,
+  panZ = camera.panZ
+) {
   if (!canvas.value) {
     return { x: 0, y: 0, perspective: 1, depth: VIEW_DISTANCE };
   }
   const rect = canvas.value.getBoundingClientRect();
-  const rotated = rotateWorld({ x: point.x - panX, y: point.y - panY, z: point.z });
+  const rotated = rotateWorld({ x: point.x - panX, y: point.y - panY, z: point.z - panZ });
   const depth = Math.max(170, VIEW_DISTANCE + rotated.z);
   const perspective = FOCAL_LENGTH / depth;
   return {
@@ -1427,7 +1556,7 @@ fn rotateWorld(point: vec3f) -> vec3f {
 }
 
 fn projectWorld(point: vec3f) -> Projected {
-  let rotated = rotateWorld(point - vec3f(u.camera.x, u.camera.y, 0.0));
+  let rotated = rotateWorld(point - vec3f(u.camera.x, u.camera.y, u.extra.x));
   let depth = max(170.0, u.space.y + rotated.z);
   let perspective = u.space.x / depth;
   let center = u.viewport.xy * 0.5;
@@ -1653,8 +1782,9 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
     <div
       class="nebula-star-cursor"
       :class="{ visible: nebulaCursor.visible }"
-      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px)` }"
+      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px) rotate(${nebulaCursor.angle}rad)` }"
     ></div>
+    <slot name="overlay"></slot>
 
     <div class="webgpu-label-layer">
       <button

@@ -293,6 +293,25 @@ export function createMap(name, description = '', userId) {
   return getMapById(Number(result.lastInsertRowid), ownerId);
 }
 
+export function updateMap(id, userId, payload) {
+  const map = getMapById(id, userId);
+  if (!map) {
+    return null;
+  }
+  const name = String(payload.name ?? map.name).trim();
+  if (!name) {
+    throw new Error('星云图名称不能为空');
+  }
+  const description = String(payload.description ?? map.description ?? '').trim();
+  db.prepare('UPDATE nebula_maps SET name = ?, description = ? WHERE id = ? AND user_id = ?').run(
+    name,
+    description,
+    id,
+    userId
+  );
+  return getMapById(id, userId);
+}
+
 export function getMapById(id, userId) {
   if (Number.isFinite(Number(userId))) {
     const row = db
