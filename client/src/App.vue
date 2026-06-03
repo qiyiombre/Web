@@ -5,7 +5,6 @@ import {
   Download,
   Edit3,
   FilePlus2,
-  Info,
   Layers,
   Link2,
   List,
@@ -49,15 +48,6 @@ import {
 } from './services/api';
 import type { DraftLog, GraphData, Insight, LogEntry, NebulaMap, TagNode, UserAccount } from './types/domain';
 
-type NebulaRenderer = {
-  focusTag: (tagId: number) => void;
-  resetTagLayout: () => void;
-  refreshLayout: () => void;
-  saveLayout: () => boolean;
-  undoLayout: () => boolean;
-  redoLayout: () => boolean;
-};
-
 type NebulaLogCard = {
   logId: number;
   x: number;
@@ -65,7 +55,18 @@ type NebulaLogCard = {
   width?: number;
   height?: number;
 };
-type RightPanel = 'logs' | 'detail' | 'editor' | 'insight';
+
+type NebulaRenderer = {
+  focusTag: (tagId: number) => void;
+  focusLog: (logId: number) => NebulaLogCard | null;
+  resetTagLayout: () => void;
+  refreshLayout: () => void;
+  saveLayout: () => boolean;
+  undoLayout: () => boolean;
+  redoLayout: () => boolean;
+};
+
+type RightPanel = 'logs' | 'editor' | 'insight';
 type LeftPanel = 'maps' | 'active' | 'related' | 'manage';
 
 const maps = ref<NebulaMap[]>([]);
@@ -74,7 +75,6 @@ const graph = ref<GraphData | null>(null);
 const insights = ref<Insight | null>(null);
 const activeTagIds = ref<Set<number>>(new Set());
 const selectedLogId = ref<number | null>(null);
-const detailLogId = ref<number | null>(null);
 const nebulaLogCard = ref<NebulaLogCard | null>(null);
 const editorMode = ref<'new' | 'edit' | null>('new');
 const editingLog = ref<LogEntry | null>(null);
@@ -96,7 +96,6 @@ const rightPanel = ref<RightPanel | null>(null);
 const leftPanel = ref<LeftPanel | null>(null);
 const layoutDirty = ref(false);
 
-const selectedLog = computed(() => graph.value?.logs.find((log) => log.id === detailLogId.value) ?? null);
 const nebulaCardLog = computed(() => {
   if (!graph.value || !nebulaLogCard.value) {
     return null;
@@ -151,12 +150,6 @@ const stats = computed(() => ({
 
 const hasNoMaps = computed(() => currentUser.value !== null && maps.value.length === 0);
 
-watch(selectedLogId, (logId) => {
-  if (logId === null && rightPanel.value === 'detail') {
-    rightPanel.value = null;
-  }
-});
-
 onMounted(async () => {
   window.addEventListener('online', handleNetworkChange);
   window.addEventListener('offline', handleNetworkChange);
@@ -210,7 +203,6 @@ async function loadWorkspace() {
   graph.value = null;
   insights.value = null;
   selectedLogId.value = null;
-  detailLogId.value = null;
   nebulaLogCard.value = null;
   editorMode.value = null;
 }
@@ -222,7 +214,6 @@ function resetWorkspace() {
   insights.value = null;
   activeTagIds.value = new Set();
   selectedLogId.value = null;
-  detailLogId.value = null;
   nebulaLogCard.value = null;
   editorMode.value = 'new';
   editingLog.value = null;
@@ -246,7 +237,6 @@ async function selectMap(mapId: number) {
   localStorage.setItem('nebula.activeMapId', String(mapId));
   activeTagIds.value = new Set();
   selectedLogId.value = null;
-  detailLogId.value = null;
   nebulaLogCard.value = null;
   editorMode.value = 'new';
   editingLog.value = null;
@@ -284,7 +274,6 @@ async function refreshNebulaView() {
   }
   activeTagIds.value = new Set();
   selectedLogId.value = null;
-  detailLogId.value = null;
   nebulaLogCard.value = null;
   rightPanel.value = null;
   nebulaRenderKey.value += 1;
@@ -356,19 +345,20 @@ async function renameActiveMap(mapId = activeMapId.value) {
 
 function startNewLog() {
   selectedLogId.value = null;
-  detailLogId.value = null;
   nebulaLogCard.value = null;
   editingLog.value = null;
   editorMode.value = 'new';
   rightPanel.value = 'editor';
 }
 
-function startEditLog() {
-  if (!selectedLog.value) {
+function startEditLog(logId = selectedLogId.value) {
+  const log = logId === null ? null : graph.value?.logs.find((item) => item.id === logId) ?? null;
+  if (!log) {
     return;
   }
-  editingLog.value = selectedLog.value;
+  editingLog.value = log;
   editorMode.value = 'edit';
+  nebulaLogCard.value = null;
   rightPanel.value = 'editor';
 }
 
@@ -401,11 +391,10 @@ async function handleSaveLog(payload: DraftLog) {
     draftRestored.value = false;
     draftSavedAt.value = '';
     selectedLogId.value = saved.id;
-    detailLogId.value = saved.id;
     nebulaLogCard.value = null;
     editorMode.value = null;
     editingLog.value = null;
-    rightPanel.value = 'detail';
+    rightPanel.value = null;
     await refreshData();
     showNotice(wasEditing ? '日志已更新' : '日志已保存');
   } catch (err) {
@@ -418,29 +407,29 @@ async function handleSaveLog(payload: DraftLog) {
   }
 }
 
-async function removeSelectedLog() {
-  if (!selectedLog.value) {
+async function removeLog(logId = selectedLogId.value) {
+  const log = logId === null ? null : graph.value?.logs.find((item) => item.id === logId) ?? null;
+  if (!log) {
     return;
   }
-  const ok = window.confirm(`确认删除「${selectedLog.value.title}」吗？`);
+  const ok = window.confirm(`确认删除「${log.title}」吗？`);
   if (!ok) {
     return;
   }
-  await deleteLog(selectedLog.value.id);
+  await deleteLog(log.id);
   selectedLogId.value = null;
-  detailLogId.value = null;
   nebulaLogCard.value = null;
   editorMode.value = 'new';
-  rightPanel.value = 'editor';
+  rightPanel.value = null;
   await refreshData();
   showNotice('日志已删除');
 }
 
-function exportSelectedLog() {
-  if (!selectedLog.value) {
+function exportLog(logId = selectedLogId.value) {
+  const log = logId === null ? null : graph.value?.logs.find((item) => item.id === logId) ?? null;
+  if (!log) {
     return;
   }
-  const log = selectedLog.value;
   const markdown = [
     `# ${log.title}`,
     '',
@@ -473,7 +462,6 @@ async function toggleTag(tagId: number) {
 
 function selectLogOnly(logId: number, resetEditor = true) {
   selectedLogId.value = logId;
-  detailLogId.value = logId;
   nebulaLogCard.value = null;
   if (resetEditor) {
     editorMode.value = null;
@@ -481,18 +469,23 @@ function selectLogOnly(logId: number, resetEditor = true) {
   }
 }
 
-function selectLogFromList(logId: number) {
+async function selectLogFromList(logId: number) {
   selectLogOnly(logId);
+  await nextTick();
+  let card = canvasRef.value?.focusLog(logId);
+  if (!card) {
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    card = canvasRef.value?.focusLog(logId);
+  }
+  if (card) {
+    inspectNebulaLog(card);
+  }
 }
 
 function selectNebulaLog(logId: number) {
   if (selectedLogId.value === logId) {
     selectedLogId.value = null;
-    detailLogId.value = null;
     nebulaLogCard.value = null;
-    if (rightPanel.value === 'detail') {
-      rightPanel.value = null;
-    }
     return;
   }
   selectLogOnly(logId, rightPanel.value !== 'editor');
@@ -524,6 +517,10 @@ function inspectNebulaLog(payload: NebulaLogCard) {
   const maxX = Math.max(16, width - 356);
   const maxY = Math.max(16, height - 300);
   selectedLogId.value = payload.logId;
+  if (rightPanel.value !== 'editor') {
+    editorMode.value = null;
+    editingLog.value = null;
+  }
   nebulaLogCard.value = {
     logId: payload.logId,
     x: Math.min(maxX, Math.max(16, payload.x + 16)),
@@ -603,7 +600,7 @@ function isTextInput(target: EventTarget | null) {
 function cancelEditor() {
   editorMode.value = null;
   editingLog.value = null;
-  rightPanel.value = selectedLog.value ? 'detail' : null;
+  rightPanel.value = null;
 }
 
 function toggleRightPanel(panel: RightPanel) {
@@ -865,9 +862,20 @@ function formatTime(value: Date) {
           >
             <div class="nebula-log-card-head">
               <span>日志星卡</span>
-              <button class="icon-button" title="关闭" @click="closeNebulaCard">
-                <X :size="14" />
-              </button>
+              <div class="nebula-log-card-actions">
+                <button class="icon-button" title="编辑" @click="startEditLog(nebulaCardLog.log.id)">
+                  <Edit3 :size="15" />
+                </button>
+                <button class="icon-button" title="导出 Markdown" @click="exportLog(nebulaCardLog.log.id)">
+                  <Download :size="15" />
+                </button>
+                <button class="icon-button danger" title="删除" @click="removeLog(nebulaCardLog.log.id)">
+                  <Trash2 :size="15" />
+                </button>
+                <button class="icon-button" title="关闭" @click="closeNebulaCard">
+                  <X :size="14" />
+                </button>
+              </div>
             </div>
             <h3>{{ nebulaCardLog.log.title }}</h3>
             <p class="detail-time">{{ formatDate(nebulaCardLog.log.createdAt) }}</p>
@@ -906,9 +914,20 @@ function formatTime(value: Date) {
           >
             <div class="nebula-log-card-head">
               <span>日志星卡</span>
-              <button class="icon-button" title="关闭" @click="closeNebulaCard">
-                <X :size="14" />
-              </button>
+              <div class="nebula-log-card-actions">
+                <button class="icon-button" title="编辑" @click="startEditLog(nebulaCardLog.log.id)">
+                  <Edit3 :size="15" />
+                </button>
+                <button class="icon-button" title="导出 Markdown" @click="exportLog(nebulaCardLog.log.id)">
+                  <Download :size="15" />
+                </button>
+                <button class="icon-button danger" title="删除" @click="removeLog(nebulaCardLog.log.id)">
+                  <Trash2 :size="15" />
+                </button>
+                <button class="icon-button" title="关闭" @click="closeNebulaCard">
+                  <X :size="14" />
+                </button>
+              </div>
             </div>
             <h3>{{ nebulaCardLog.log.title }}</h3>
             <p class="detail-time">{{ formatDate(nebulaCardLog.log.createdAt) }}</p>
@@ -948,15 +967,6 @@ function formatTime(value: Date) {
           日志
         </button>
         <button
-          :class="{ active: rightPanel === 'detail' }"
-          :disabled="!selectedLog"
-          title="日志详情"
-          @click="toggleRightPanel('detail')"
-        >
-          <Info :size="17" />
-          详情
-        </button>
-        <button
           :class="{ active: rightPanel === 'editor' }"
           :disabled="!activeMapId"
           title="新建或编辑日志"
@@ -989,37 +999,6 @@ function formatTime(value: Date) {
             <small>{{ formatDate(log.createdAt) }}</small>
           </button>
         </div>
-      </section>
-
-      <section v-if="rightPanel === 'detail' && selectedLog && !editorMode" class="panel detail-panel">
-        <div class="panel-title">
-          <span>日志详情</span>
-          <div class="button-row">
-            <button class="icon-button" title="编辑" @click="startEditLog">
-              <Edit3 :size="16" />
-            </button>
-            <button class="icon-button" title="导出 Markdown" @click="exportSelectedLog">
-              <Download :size="16" />
-            </button>
-            <button class="icon-button danger" title="删除" @click="removeSelectedLog">
-              <Trash2 :size="16" />
-            </button>
-          </div>
-        </div>
-        <h3>{{ selectedLog.title }}</h3>
-        <p class="detail-time">{{ formatDate(selectedLog.createdAt) }}</p>
-        <div class="chip-list">
-          <button
-            v-for="tag in selectedLog.tags"
-            :key="tag.id"
-            class="chip"
-            :style="{ borderColor: tag.color }"
-            @click="focusTag(tag.id)"
-          >
-            {{ tag.name }}
-          </button>
-        </div>
-        <p class="log-content">{{ selectedLog.content }}</p>
       </section>
 
       <LogEditor

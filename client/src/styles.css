@@ -1285,11 +1285,6 @@ small {
   box-shadow: 0 0 12px currentColor;
 }
 
-.detail-panel h3 {
-  margin-bottom: 6px;
-  font-size: 18px;
-}
-
 .nebula-log-card {
   position: absolute;
   z-index: 30;
@@ -1331,6 +1326,13 @@ small {
   color: #9ee7ff;
   font-size: 12px;
   font-weight: 750;
+}
+
+.nebula-log-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
 }
 
 .nebula-log-card-head .icon-button {

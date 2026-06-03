@@ -64,7 +64,6 @@ const logPositions = new Map<number, LayoutPoint>();
 const manualTagPositions = new Map<number, { x: number; y: number }>();
 const manualLogPositions = new Map<number, { x: number; y: number }>();
 const pickNodes: PickNode[] = [];
-const activeIds = computed(() => [...props.activeTagIds]);
 const tagTrendById = computed(() => {
   const now = Date.now();
   const week = 1000 * 60 * 60 * 24 * 7;
@@ -202,6 +201,7 @@ watch(
 
 defineExpose({
   focusTag,
+  focusLog,
   resetTagLayout,
   refreshLayout,
   saveLayout,
@@ -564,20 +564,25 @@ function updateGeometryBuffers() {
     if (!point) {
       continue;
     }
+    if (!isTagVisible(tag.id)) {
+      continue;
+    }
     const heat = heatState(tag.id);
     const color = heatMode.value ? heatColor(tag.color, heat) : hexToRgb(tag.color);
     const active = props.activeTagIds.has(tag.id);
+    const relatedToSelected = isTagRelatedToSelectedLog(tag.id);
     const related =
-      activeIds.value.length === 0 ||
+      !hasActiveRelationMode() ||
       active ||
+      relatedToSelected ||
       props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
-    const state = heatMode.value && heat !== 'flat' ? 1 : active ? 1 : related ? 0.62 : 0.28;
+    const state = heatMode.value && heat !== 'flat' ? 1 : active || relatedToSelected ? 1 : related ? 0.62 : 0.18;
     const depth = 0.92 + seeded(tag.id + 2200) * 0.22;
-    const activeScale = active ? 1.22 : 1;
+    const activeScale = active || relatedToSelected ? 1.22 : related ? 1 : 0.92;
     const coreRadius = point.r * 1.38 * depth * activeScale;
     const world = tagPoint3D(tag.id, point);
-    pushNodeInstance(nodeRows, world, coreRadius * (active ? 1.32 : 1.12), 3, color, active ? 0.12 : 0.06, state, seeded(tag.id + 700), 0);
-    pushNodeInstance(nodeRows, world, coreRadius * (active ? 1.76 : 1.48), 1, color, active ? 1 : 0.94, state, seeded(tag.id + 800), 0);
+    pushNodeInstance(nodeRows, world, coreRadius * (active || relatedToSelected ? 1.44 : 1.12), 3, color, active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025, state, seeded(tag.id + 700), 0);
+    pushNodeInstance(nodeRows, world, coreRadius * (active || relatedToSelected ? 1.82 : 1.48), 1, color, active || relatedToSelected ? 1 : related ? 0.92 : 0.46, state, seeded(tag.id + 800), 0);
   }
 
   for (const log of props.graph.logs) {
@@ -585,13 +590,17 @@ function updateGeometryBuffers() {
     if (!point) {
       continue;
     }
+    if (!isLogVisible(log)) {
+      continue;
+    }
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
-    const state = selected ? 1 : highlighted ? 0.82 : 0.26;
+    const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !highlighted;
+    const state = selected ? 1 : highlighted ? 0.82 : muted ? 0.12 : 0.26;
     const radius = selected ? 6.8 : highlighted ? 6.2 : 4.9;
     const glowAlpha = selected ? 0.6 : highlighted ? 0.28 : 0.07;
     const glowRadius = selected ? 3.4 : highlighted ? 2.75 : 2.1;
-    const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : 0.84;
+    const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : muted ? 0.38 : 0.84;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
     const seed = seeded(log.id + 1900);
@@ -603,29 +612,36 @@ function updateGeometryBuffers() {
   writeDynamicBuffer('node', new Float32Array(nodeRows), 48);
 
   const lineRows: number[] = [];
-  for (const edge of props.graph.edges) {
-    const tagPoint = tagPositions.get(edge.tagId);
-    const logPoint = logPositions.get(edge.logId);
-    const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
-    if (!tagPoint || !logPoint || !logEntry) {
-      continue;
+  if (hasActiveRelationMode()) {
+    for (const edge of props.graph.edges) {
+      const tagPoint = tagPositions.get(edge.tagId);
+      const logPoint = logPositions.get(edge.logId);
+      const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
+      if (!tagPoint || !logPoint || !logEntry) {
+        continue;
+      }
+      const relation = relationFlowState(edge.tagId, logEntry);
+      if (!relation.visible) {
+        continue;
+      }
+      const tagMeta = props.graph.tags.find((item) => item.id === edge.tagId);
+      const tagColor = tagMeta ? hexToRgb(tagMeta.color) : { r: 0.38, g: 0.84, b: 1 };
+      const color = [
+        Math.min(1, tagColor.r + 0.18),
+        Math.min(1, tagColor.g + 0.28),
+        Math.min(1, tagColor.b + 0.28),
+        relation.selected ? 0.62 : 0.44
+      ];
+      pushLineInstance(
+        lineRows,
+        tagPoint3D(edge.tagId, tagPoint),
+        logPoint3D(logEntry, logPoint),
+        color,
+        relation.selected ? 4.8 : 3.4,
+        relation.selected ? 1 : 0.74,
+        seeded(edge.tagId * 31 + edge.logId)
+      );
     }
-    const selected = props.selectedLogId === edge.logId;
-    const highlighted = selected || isLogHighlighted(logEntry);
-    const tagMeta = props.graph.tags.find((item) => item.id === edge.tagId);
-    const tagColor = tagMeta ? hexToRgb(tagMeta.color) : { r: 0.38, g: 0.84, b: 1 };
-    const color = highlighted
-      ? [Math.min(1, tagColor.r + 0.18), Math.min(1, tagColor.g + 0.28), Math.min(1, tagColor.b + 0.28), 0.8]
-      : [tagColor.r * 0.7, tagColor.g * 0.82, Math.min(1, tagColor.b + 0.18), 0.2];
-    pushLineInstance(
-      lineRows,
-      tagPoint3D(edge.tagId, tagPoint),
-      logPoint3D(logEntry, logPoint),
-      color,
-      highlighted ? 3.4 : 1.25,
-      highlighted ? 1 : 0.18,
-      seeded(edge.tagId * 31 + edge.logId)
-    );
   }
   lineCount = lineRows.length / 16;
   writeDynamicBuffer('line', new Float32Array(lineRows), 64);
@@ -748,6 +764,46 @@ function isLogHighlighted(log: LogEntry) {
     return false;
   }
   return [...props.activeTagIds].every((id) => log.tags.some((tag) => tag.id === id));
+}
+
+function isLogVisible(log: LogEntry) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags = tagModeActive && isLogHighlighted(log);
+  const visibleBySelectedLog = logModeActive && props.selectedLogId === log.id;
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function isTagVisible(tagId: number) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags =
+    tagModeActive &&
+    (props.activeTagIds.has(tagId) ||
+      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((tag) => tag.id === tagId)));
+  const visibleBySelectedLog = logModeActive && isTagRelatedToSelectedLog(tagId);
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function hasActiveRelationMode() {
+  return props.activeTagIds.size > 0 || props.selectedLogId !== null;
+}
+
+function isTagRelatedToSelectedLog(tagId: number) {
+  const selectedLog = props.graph.logs.find((log) => log.id === props.selectedLogId);
+  return Boolean(selectedLog?.tags.some((tag) => tag.id === tagId));
+}
+
+function relationFlowState(tagId: number, log: LogEntry) {
+  const selected = props.selectedLogId === log.id;
+  const active = props.activeTagIds.has(tagId) && isLogHighlighted(log);
+  return { visible: (selected && isLogVisible(log) && isTagVisible(tagId)) || active, selected };
 }
 
 function onPointerDown(event: PointerEvent) {
@@ -878,11 +934,17 @@ function onPointerUp(event: PointerEvent) {
   if (moved) {
     return;
   }
-  if (button !== 0) {
+  if (button !== 0 && button !== 2) {
     return;
   }
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (!picked) {
+    return;
+  }
+  if (button === 2) {
+    if (picked.kind === 'log') {
+      inspectLogAt(picked.id, event);
+    }
     return;
   }
   if (picked.kind === 'tag') {
@@ -940,18 +1002,15 @@ function hideNebulaCursor() {
   nebulaCursor.visible = false;
 }
 
-function onDoubleClick(event: MouseEvent) {
-  const picked = pickNodeAt(event.offsetX, event.offsetY);
-  if (picked?.kind === 'log') {
-    const rect = canvas.value?.getBoundingClientRect();
-    emit('logInspect', {
-      logId: picked.id,
-      x: event.offsetX,
-      y: event.offsetY,
-      width: rect?.width ?? window.innerWidth,
-      height: rect?.height ?? window.innerHeight
-    });
-  }
+function inspectLogAt(logId: number, event: PointerEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('logInspect', {
+    logId,
+    x: event.offsetX,
+    y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
 }
 
 async function toggleFullscreen() {
@@ -981,6 +1040,36 @@ function focusTag(tagId: number) {
     return;
   }
   centerTag(tagId);
+}
+
+function focusLog(logId: number) {
+  if (!canvas.value) {
+    return null;
+  }
+  const point = logPositions.get(logId);
+  const log = props.graph.logs.find((item) => item.id === logId);
+  if (!point || !log) {
+    requestLayout();
+    return null;
+  }
+  const rect = canvas.value.getBoundingClientRect();
+  const nextScale = Math.max(transform.scale, 1.2);
+  const world = logPoint3D(log, point);
+  const base = projectWorldToScreen(world, nextScale);
+  const delta = cameraPanDeltaForScreenShift(rect.width / 2 - base.x, rect.height / 2 - base.y, nextScale, base.depth);
+  cameraTarget = null;
+  transform.scale = nextScale;
+  camera.panX += delta.x;
+  camera.panY += delta.y;
+  camera.panZ += delta.z;
+  updateLabels();
+  return {
+    logId,
+    x: rect.width / 2,
+    y: rect.height / 2,
+    width: rect.width,
+    height: rect.height
+  };
 }
 
 function centerTag(tagId: number) {
@@ -1023,6 +1112,9 @@ function updateLabels() {
     if (!point) {
       continue;
     }
+    if (!isTagVisible(tag.id)) {
+      continue;
+    }
     const screen = projectWorldToScreen(tagPoint3D(tag.id, point));
     const heat = heatMode.value ? heatState(tag.id) : 'flat';
     const active = props.activeTagIds.has(tag.id);
@@ -1044,6 +1136,9 @@ function updateLabels() {
   for (const log of props.graph.logs) {
     const point = logPositions.get(log.id);
     if (!point) {
+      continue;
+    }
+    if (!isLogVisible(log)) {
       continue;
     }
     const screen = projectWorldToScreen(logPoint3D(log, point));
@@ -1755,12 +1850,17 @@ fn vs(input: LineIn, @builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
-  let wave = fract(input.along * 3.4 - input.time * (0.58 + input.state * 0.32) + input.seed);
-  let flow = smoothstep(0.70, 0.9, wave) * (1.0 - smoothstep(0.9, 1.0, wave));
-  let core = 1.0 - smoothstep(0.2, 1.0, input.side);
-  let alpha = min(1.0, input.color.a * (0.46 + core * 0.42) + flow * (0.1 + input.state * 0.55));
-  let color = input.color.rgb + vec3f(0.32, 0.5, 0.62) * flow * (0.34 + input.state);
-  return vec4f(color, alpha);
+  let fade = smoothstep(0.02, 0.18, input.along) * (1.0 - smoothstep(0.82, 0.98, input.along));
+  let wave = fract(input.along * (5.2 + input.state * 1.4) - input.time * (0.42 + input.state * 0.34) + input.seed);
+  let bead = smoothstep(0.72, 0.88, wave) * (1.0 - smoothstep(0.88, 1.0, wave));
+  let core = 1.0 - smoothstep(0.06, 0.7, input.side);
+  let mist = (1.0 - smoothstep(0.18, 1.0, input.side)) * 0.13;
+  let alpha = fade * input.color.a * (mist + bead * core * (0.9 + input.state * 0.56));
+  if (alpha < 0.008) {
+    discard;
+  }
+  let color = input.color.rgb + vec3f(0.34, 0.52, 0.68) * bead * (0.28 + input.state * 0.42);
+  return vec4f(color, min(1.0, alpha));
 }
 `;
 </script>
@@ -1775,7 +1875,6 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
-      @dblclick="onDoubleClick"
       @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
@@ -1793,7 +1892,7 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
         class="webgpu-label"
         :class="{ active: label.active, up: label.heat === 'up', down: label.heat === 'down' }"
         :style="{ left: `${label.x}px`, top: `${label.y}px`, '--label-color': label.color }"
-        @click="emit('tagToggle', label.id)"
+        @click.stop="emit('tagToggle', label.id)"
       >
         {{ label.name }}
       </button>

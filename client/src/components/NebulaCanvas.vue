@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import type { GraphData, LogEntry } from '../types/domain';
 
 type PickNode =
@@ -60,8 +60,6 @@ const layoutHistory: LayoutSnapshot[] = [];
 const redoHistory: LayoutSnapshot[] = [];
 
 const layoutWorker = new Worker(new URL('../workers/layoutWorker.ts', import.meta.url), { type: 'module' });
-const activeIds = computed(() => [...props.activeTagIds]);
-
 layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
   const result = event.data;
   if (result.requestId !== latestLayoutRequestId) {
@@ -129,6 +127,7 @@ watch(
 
 defineExpose({
   focusTag,
+  focusLog,
   resetTagLayout,
   refreshLayout,
   saveLayout,
@@ -197,7 +196,7 @@ function draw() {
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.scale, transform.scale);
 
-  drawEdges();
+  drawRelationFlows();
   drawLogs();
   drawTags();
 
@@ -225,26 +224,59 @@ function drawBackground(width: number, height: number) {
   }
 }
 
-function drawEdges() {
+function drawRelationFlows() {
   if (!ctx) {
     return;
   }
+  if (!hasActiveRelationMode()) {
+    return;
+  }
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
   for (const edge of props.graph.edges) {
     const tag = tagPositions.get(edge.tagId);
     const log = logPositions.get(edge.logId);
     const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
-    if (!tag || !log || !logEntry) {
+    const tagEntry = props.graph.tags.find((item) => item.id === edge.tagId);
+    if (!tag || !log || !logEntry || !tagEntry) {
       continue;
     }
-    const selected = props.selectedLogId === edge.logId;
-    const highlighted = selected || isLogHighlighted(logEntry);
+    const relation = relationFlowState(edge.tagId, logEntry);
+    if (!relation.visible) {
+      continue;
+    }
+    const dx = log.x - tag.x;
+    const dy = log.y - tag.y;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const bend = (seeded(edge.tagId * 13 + edge.logId) - 0.5) * 72;
+    const control = {
+      x: (tag.x + log.x) / 2 + (-dy / length) * bend,
+      y: (tag.y + log.y) / 2 + (dx / length) * bend
+    };
+    const phase = seeded(edge.tagId * 31 + edge.logId);
+    const alpha = relation.selected ? 0.18 : 0.12;
+
     ctx.beginPath();
     ctx.moveTo(tag.x, tag.y);
-    ctx.lineTo(log.x, log.y);
-    ctx.strokeStyle = highlighted ? 'rgba(130, 218, 255, 0.42)' : 'rgba(136, 156, 178, 0.12)';
-    ctx.lineWidth = highlighted ? 1.5 / transform.scale : 0.7 / transform.scale;
+    ctx.quadraticCurveTo(control.x, control.y, log.x, log.y);
+    ctx.strokeStyle = hexToRgba(tagEntry.color, alpha);
+    ctx.lineWidth = (relation.selected ? 9 : 6) / transform.scale;
+    ctx.shadowColor = tagEntry.color;
+    ctx.shadowBlur = (relation.selected ? 18 : 12) / transform.scale;
     ctx.stroke();
+
+    for (let index = 0; index < (relation.selected ? 7 : 4); index += 1) {
+      const t = (frame * 0.012 + phase + index / 7) % 1;
+      const point = quadraticPoint(tag, control, log, t);
+      const pulse = 0.65 + Math.sin((t + phase) * Math.PI * 2) * 0.25;
+      ctx.beginPath();
+      ctx.fillStyle = hexToRgba(tagEntry.color, (relation.selected ? 0.72 : 0.48) * pulse);
+      ctx.shadowBlur = 14 / transform.scale;
+      ctx.arc(point.x, point.y, (1.7 + pulse * 1.4) / transform.scale, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
+  ctx.restore();
 }
 
 function drawTags() {
@@ -256,23 +288,41 @@ function drawTags() {
     if (!point) {
       continue;
     }
+    if (!isTagVisible(tag.id)) {
+      continue;
+    }
     const active = props.activeTagIds.has(tag.id);
-    const related = activeIds.value.length === 0 || active || props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
-    const glow = active ? 22 : related ? 12 : 4;
+    const relatedToSelected = isTagRelatedToSelectedLog(tag.id);
+    const related =
+      !hasActiveRelationMode() ||
+      active ||
+      relatedToSelected ||
+      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
+    const glow = active || relatedToSelected ? 24 : related ? 12 : 2;
     ctx.save();
     ctx.shadowColor = tag.color;
     ctx.shadowBlur = glow;
     ctx.beginPath();
-    ctx.fillStyle = active ? tag.color : `${tag.color}dd`;
-    const visualRadius = point.r * (active ? 1.08 : 1);
+    ctx.fillStyle = active || relatedToSelected ? tag.color : related ? `${tag.color}dd` : `${tag.color}55`;
+    const visualRadius = point.r * (active || relatedToSelected ? 1.12 : 1);
     ctx.arc(point.x, point.y, visualRadius, 0, Math.PI * 2);
     ctx.fill();
-    ctx.lineWidth = active ? 3 / transform.scale : 1.4 / transform.scale;
-    ctx.strokeStyle = active ? '#ffffff' : 'rgba(255, 255, 255, 0.55)';
+    ctx.lineWidth = active || relatedToSelected ? 3 / transform.scale : 1.4 / transform.scale;
+    ctx.strokeStyle = active || relatedToSelected ? '#ffffff' : 'rgba(255, 255, 255, 0.55)';
     ctx.stroke();
+
+    if (active || relatedToSelected) {
+      const pulse = 0.5 + 0.5 * Math.sin(frame * 0.045 + tag.id);
+      ctx.beginPath();
+      ctx.shadowBlur = 18 / transform.scale;
+      ctx.strokeStyle = hexToRgba(tag.color, 0.22 + pulse * 0.18);
+      ctx.lineWidth = 2 / transform.scale;
+      ctx.arc(point.x, point.y, visualRadius * (1.55 + pulse * 0.25), 0, Math.PI * 2);
+      ctx.stroke();
+    }
     ctx.restore();
 
-    ctx.fillStyle = active ? '#ffffff' : 'rgba(232, 243, 255, 0.86)';
+    ctx.fillStyle = active || relatedToSelected ? '#ffffff' : related ? 'rgba(232, 243, 255, 0.86)' : 'rgba(232, 243, 255, 0.42)';
     ctx.font = `${Math.max(12, 14 / transform.scale)}px "Microsoft YaHei", sans-serif`;
     ctx.textAlign = 'center';
     ctx.fillText(tag.name, point.x, point.y + visualRadius + 18 / transform.scale);
@@ -289,13 +339,18 @@ function drawLogs() {
     if (!point) {
       continue;
     }
-    const highlighted = isLogHighlighted(log);
+    if (!isLogVisible(log)) {
+      continue;
+    }
     const selected = props.selectedLogId === log.id;
+    const highlighted = isLogHighlighted(log);
+    const relationMode = hasActiveRelationMode();
+    const muted = props.activeTagIds.size === 0 && relationMode && !selected && !highlighted;
     ctx.save();
     ctx.shadowColor = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'transparent';
     ctx.shadowBlur = selected ? 14 : highlighted ? 8 : 0;
     ctx.beginPath();
-    ctx.fillStyle = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'rgba(151, 165, 182, 0.38)';
+    ctx.fillStyle = selected ? '#ffffff' : highlighted ? '#9ee7ff' : muted ? 'rgba(151, 165, 182, 0.16)' : 'rgba(151, 165, 182, 0.38)';
     const logRadius = selected ? 6.4 : highlighted ? 5.6 : point.r;
     ctx.moveTo(point.x, point.y - logRadius);
     ctx.lineTo(point.x + logRadius, point.y);
@@ -350,6 +405,59 @@ function isLogHighlighted(log: LogEntry) {
     return false;
   }
   return [...props.activeTagIds].every((id) => log.tags.some((tag) => tag.id === id));
+}
+
+function isLogVisible(log: LogEntry) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags = tagModeActive && isLogHighlighted(log);
+  const visibleBySelectedLog = logModeActive && props.selectedLogId === log.id;
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function isTagVisible(tagId: number) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags =
+    tagModeActive &&
+    (props.activeTagIds.has(tagId) ||
+      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((tag) => tag.id === tagId)));
+  const visibleBySelectedLog = logModeActive && isTagRelatedToSelectedLog(tagId);
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function hasActiveRelationMode() {
+  return props.activeTagIds.size > 0 || props.selectedLogId !== null;
+}
+
+function isTagRelatedToSelectedLog(tagId: number) {
+  const selectedLog = props.graph.logs.find((log) => log.id === props.selectedLogId);
+  return Boolean(selectedLog?.tags.some((tag) => tag.id === tagId));
+}
+
+function relationFlowState(tagId: number, log: LogEntry) {
+  const selected = props.selectedLogId === log.id;
+  const active = props.activeTagIds.has(tagId) && isLogHighlighted(log);
+  return { visible: (selected && isLogVisible(log) && isTagVisible(tagId)) || active, selected };
+}
+
+function quadraticPoint(
+  start: { x: number; y: number },
+  control: { x: number; y: number },
+  end: { x: number; y: number },
+  t: number
+) {
+  const inv = 1 - t;
+  return {
+    x: inv * inv * start.x + 2 * inv * t * control.x + t * t * end.x,
+    y: inv * inv * start.y + 2 * inv * t * control.y + t * t * end.y
+  };
 }
 
 function onPointerDown(event: PointerEvent) {
@@ -469,11 +577,17 @@ function onPointerUp(event: PointerEvent) {
   if (moved) {
     return;
   }
-  if (button !== 0) {
+  if (button !== 0 && button !== 2) {
     return;
   }
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (!picked) {
+    return;
+  }
+  if (button === 2) {
+    if (picked.kind === 'log') {
+      inspectLogAt(picked.id, event);
+    }
     return;
   }
   if (picked.kind === 'tag') {
@@ -511,18 +625,15 @@ function hideNebulaCursor() {
   nebulaCursor.visible = false;
 }
 
-function onDoubleClick(event: MouseEvent) {
-  const picked = pickNodeAt(event.offsetX, event.offsetY);
-  if (picked?.kind === 'log') {
-    const rect = canvas.value?.getBoundingClientRect();
-    emit('logInspect', {
-      logId: picked.id,
-      x: event.offsetX,
-      y: event.offsetY,
-      width: rect?.width ?? window.innerWidth,
-      height: rect?.height ?? window.innerHeight
-    });
-  }
+function inspectLogAt(logId: number, event: PointerEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('logInspect', {
+    logId,
+    x: event.offsetX,
+    y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
 }
 
 function focusTag(tagId: number) {
@@ -536,6 +647,29 @@ function focusTag(tagId: number) {
     return;
   }
   centerTag(tagId);
+}
+
+function focusLog(logId: number) {
+  if (!canvas.value) {
+    return null;
+  }
+  const point = logPositions.get(logId);
+  if (!point) {
+    requestLayout();
+    return null;
+  }
+  const rect = canvas.value.getBoundingClientRect();
+  transform.scale = Math.max(transform.scale, 1.12);
+  transform.x = rect.width / 2 - point.x * transform.scale;
+  transform.y = rect.height / 2 - point.y * transform.scale;
+  draw();
+  return {
+    logId,
+    x: rect.width / 2,
+    y: rect.height / 2,
+    width: rect.width,
+    height: rect.height
+  };
 }
 
 function centerTag(tagId: number) {
@@ -710,6 +844,15 @@ function screenToWorld(x: number, y: number) {
   };
 }
 
+function hexToRgba(hex: string, alpha: number) {
+  const clean = hex.replace('#', '');
+  const value = Number.parseInt(clean, 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 function seeded(input: number) {
   const x = Math.sin(input * 999.91) * 10000;
   return x - Math.floor(x);
@@ -726,7 +869,6 @@ function seeded(input: number) {
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
-      @dblclick="onDoubleClick"
       @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
