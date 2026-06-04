@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import type { GraphData, LogEntry } from '../types/domain';
 
 type PickNode =
@@ -7,6 +7,10 @@ type PickNode =
   | { kind: 'log'; id: number; x: number; y: number; r: number };
 
 type LayoutPoint = { x: number; y: number; r: number };
+type LayoutSnapshot = {
+  tags: Array<[number, { x: number; y: number }]>;
+  logs: Array<[number, { x: number; y: number }]>;
+};
 
 interface LayoutResponse {
   requestId: number;
@@ -23,10 +27,13 @@ const props = defineProps<{
 const emit = defineEmits<{
   tagToggle: [tagId: number];
   logOpen: [logId: number];
+  logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
+  layoutDirty: [dirty: boolean];
 }>();
 
 const canvas = ref<HTMLCanvasElement | null>(null);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2 });
 const pickNodes: PickNode[] = [];
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
@@ -44,12 +51,15 @@ let dragTagOffset = { x: 0, y: 0 };
 let dragLogOffset = { x: 0, y: 0 };
 let moved = false;
 let lastPointer = { x: 0, y: 0 };
+let dragButton = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
+let dragSnapshot: LayoutSnapshot | null = null;
+let lastPanInteractionAt = 0;
+const layoutHistory: LayoutSnapshot[] = [];
+const redoHistory: LayoutSnapshot[] = [];
 
 const layoutWorker = new Worker(new URL('../workers/layoutWorker.ts', import.meta.url), { type: 'module' });
-const activeIds = computed(() => [...props.activeTagIds]);
-
 layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
   const result = event.data;
   if (result.requestId !== latestLayoutRequestId) {
@@ -117,7 +127,12 @@ watch(
 
 defineExpose({
   focusTag,
-  resetTagLayout
+  focusLog,
+  resetTagLayout,
+  refreshLayout,
+  saveLayout,
+  undoLayout,
+  redoLayout
 });
 
 function resize() {
@@ -181,7 +196,7 @@ function draw() {
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.scale, transform.scale);
 
-  drawEdges();
+  drawRelationFlows();
   drawLogs();
   drawTags();
 
@@ -209,26 +224,59 @@ function drawBackground(width: number, height: number) {
   }
 }
 
-function drawEdges() {
+function drawRelationFlows() {
   if (!ctx) {
     return;
   }
+  if (!hasActiveRelationMode()) {
+    return;
+  }
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
   for (const edge of props.graph.edges) {
     const tag = tagPositions.get(edge.tagId);
     const log = logPositions.get(edge.logId);
     const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
-    if (!tag || !log || !logEntry) {
+    const tagEntry = props.graph.tags.find((item) => item.id === edge.tagId);
+    if (!tag || !log || !logEntry || !tagEntry) {
       continue;
     }
-    const selected = props.selectedLogId === edge.logId;
-    const highlighted = selected || isLogHighlighted(logEntry);
+    const relation = relationFlowState(edge.tagId, logEntry);
+    if (!relation.visible) {
+      continue;
+    }
+    const dx = log.x - tag.x;
+    const dy = log.y - tag.y;
+    const length = Math.max(1, Math.hypot(dx, dy));
+    const bend = (seeded(edge.tagId * 13 + edge.logId) - 0.5) * 72;
+    const control = {
+      x: (tag.x + log.x) / 2 + (-dy / length) * bend,
+      y: (tag.y + log.y) / 2 + (dx / length) * bend
+    };
+    const phase = seeded(edge.tagId * 31 + edge.logId);
+    const alpha = relation.selected ? 0.18 : 0.12;
+
     ctx.beginPath();
     ctx.moveTo(tag.x, tag.y);
-    ctx.lineTo(log.x, log.y);
-    ctx.strokeStyle = highlighted ? 'rgba(130, 218, 255, 0.42)' : 'rgba(136, 156, 178, 0.12)';
-    ctx.lineWidth = highlighted ? 1.5 / transform.scale : 0.7 / transform.scale;
+    ctx.quadraticCurveTo(control.x, control.y, log.x, log.y);
+    ctx.strokeStyle = hexToRgba(tagEntry.color, alpha);
+    ctx.lineWidth = (relation.selected ? 9 : 6) / transform.scale;
+    ctx.shadowColor = tagEntry.color;
+    ctx.shadowBlur = (relation.selected ? 18 : 12) / transform.scale;
     ctx.stroke();
+
+    for (let index = 0; index < (relation.selected ? 7 : 4); index += 1) {
+      const t = (frame * 0.012 + phase + index / 7) % 1;
+      const point = quadraticPoint(tag, control, log, t);
+      const pulse = 0.65 + Math.sin((t + phase) * Math.PI * 2) * 0.25;
+      ctx.beginPath();
+      ctx.fillStyle = hexToRgba(tagEntry.color, (relation.selected ? 0.72 : 0.48) * pulse);
+      ctx.shadowBlur = 14 / transform.scale;
+      ctx.arc(point.x, point.y, (1.7 + pulse * 1.4) / transform.scale, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
+  ctx.restore();
 }
 
 function drawTags() {
@@ -240,26 +288,45 @@ function drawTags() {
     if (!point) {
       continue;
     }
+    if (!isTagVisible(tag.id)) {
+      continue;
+    }
     const active = props.activeTagIds.has(tag.id);
-    const related = activeIds.value.length === 0 || active || props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
-    const glow = active ? 18 : related ? 9 : 3;
+    const relatedToSelected = isTagRelatedToSelectedLog(tag.id);
+    const related =
+      !hasActiveRelationMode() ||
+      active ||
+      relatedToSelected ||
+      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
+    const glow = active || relatedToSelected ? 24 : related ? 12 : 2;
     ctx.save();
     ctx.shadowColor = tag.color;
     ctx.shadowBlur = glow;
     ctx.beginPath();
-    ctx.fillStyle = active ? tag.color : `${tag.color}dd`;
-    ctx.arc(point.x, point.y, point.r, 0, Math.PI * 2);
+    ctx.fillStyle = active || relatedToSelected ? tag.color : related ? `${tag.color}dd` : `${tag.color}55`;
+    const visualRadius = point.r * (active || relatedToSelected ? 1.12 : 1);
+    ctx.arc(point.x, point.y, visualRadius, 0, Math.PI * 2);
     ctx.fill();
-    ctx.lineWidth = active ? 3 / transform.scale : 1.4 / transform.scale;
-    ctx.strokeStyle = active ? '#ffffff' : 'rgba(255, 255, 255, 0.55)';
+    ctx.lineWidth = active || relatedToSelected ? 3 / transform.scale : 1.4 / transform.scale;
+    ctx.strokeStyle = active || relatedToSelected ? '#ffffff' : 'rgba(255, 255, 255, 0.55)';
     ctx.stroke();
+
+    if (active || relatedToSelected) {
+      const pulse = 0.5 + 0.5 * Math.sin(frame * 0.045 + tag.id);
+      ctx.beginPath();
+      ctx.shadowBlur = 18 / transform.scale;
+      ctx.strokeStyle = hexToRgba(tag.color, 0.22 + pulse * 0.18);
+      ctx.lineWidth = 2 / transform.scale;
+      ctx.arc(point.x, point.y, visualRadius * (1.55 + pulse * 0.25), 0, Math.PI * 2);
+      ctx.stroke();
+    }
     ctx.restore();
 
-    ctx.fillStyle = active ? '#ffffff' : 'rgba(232, 243, 255, 0.86)';
+    ctx.fillStyle = active || relatedToSelected ? '#ffffff' : related ? 'rgba(232, 243, 255, 0.86)' : 'rgba(232, 243, 255, 0.42)';
     ctx.font = `${Math.max(12, 14 / transform.scale)}px "Microsoft YaHei", sans-serif`;
     ctx.textAlign = 'center';
-    ctx.fillText(tag.name, point.x, point.y + point.r + 18 / transform.scale);
-    pickNodes.push({ kind: 'tag', id: tag.id, x: point.x, y: point.y, r: point.r + 8 });
+    ctx.fillText(tag.name, point.x, point.y + visualRadius + 18 / transform.scale);
+    pickNodes.push({ kind: 'tag', id: tag.id, x: point.x, y: point.y, r: visualRadius + 10 });
   }
 }
 
@@ -272,20 +339,30 @@ function drawLogs() {
     if (!point) {
       continue;
     }
-    const highlighted = isLogHighlighted(log);
+    if (!isLogVisible(log)) {
+      continue;
+    }
     const selected = props.selectedLogId === log.id;
+    const highlighted = isLogHighlighted(log);
+    const relationMode = hasActiveRelationMode();
+    const muted = props.activeTagIds.size === 0 && relationMode && !selected && !highlighted;
     ctx.save();
     ctx.shadowColor = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'transparent';
-    ctx.shadowBlur = selected ? 16 : highlighted ? 9 : 0;
+    ctx.shadowBlur = selected ? 14 : highlighted ? 8 : 0;
     ctx.beginPath();
-    ctx.fillStyle = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'rgba(151, 165, 182, 0.38)';
-    ctx.arc(point.x, point.y, selected ? 8 : point.r, 0, Math.PI * 2);
+    ctx.fillStyle = selected ? '#ffffff' : highlighted ? '#9ee7ff' : muted ? 'rgba(151, 165, 182, 0.16)' : 'rgba(151, 165, 182, 0.38)';
+    const logRadius = selected ? 6.4 : highlighted ? 5.6 : point.r;
+    ctx.moveTo(point.x, point.y - logRadius);
+    ctx.lineTo(point.x + logRadius, point.y);
+    ctx.lineTo(point.x, point.y + logRadius);
+    ctx.lineTo(point.x - logRadius, point.y);
+    ctx.closePath();
     ctx.fill();
     ctx.lineWidth = selected ? 2 / transform.scale : 1 / transform.scale;
     ctx.strokeStyle = selected ? '#55d6ff' : 'rgba(255,255,255,0.28)';
     ctx.stroke();
     ctx.restore();
-    pickNodes.push({ kind: 'log', id: log.id, x: point.x, y: point.y, r: 10 });
+    pickNodes.push({ kind: 'log', id: log.id, x: point.x, y: point.y, r: 12 });
   }
 }
 
@@ -330,15 +407,76 @@ function isLogHighlighted(log: LogEntry) {
   return [...props.activeTagIds].every((id) => log.tags.some((tag) => tag.id === id));
 }
 
+function isLogVisible(log: LogEntry) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags = tagModeActive && isLogHighlighted(log);
+  const visibleBySelectedLog = logModeActive && props.selectedLogId === log.id;
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function isTagVisible(tagId: number) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags =
+    tagModeActive &&
+    (props.activeTagIds.has(tagId) ||
+      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((tag) => tag.id === tagId)));
+  const visibleBySelectedLog = logModeActive && isTagRelatedToSelectedLog(tagId);
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function hasActiveRelationMode() {
+  return props.activeTagIds.size > 0 || props.selectedLogId !== null;
+}
+
+function isTagRelatedToSelectedLog(tagId: number) {
+  const selectedLog = props.graph.logs.find((log) => log.id === props.selectedLogId);
+  return Boolean(selectedLog?.tags.some((tag) => tag.id === tagId));
+}
+
+function relationFlowState(tagId: number, log: LogEntry) {
+  const selected = props.selectedLogId === log.id;
+  const active = props.activeTagIds.has(tagId) && isLogHighlighted(log);
+  return { visible: (selected && isLogVisible(log) && isTagVisible(tagId)) || active, selected };
+}
+
+function quadraticPoint(
+  start: { x: number; y: number },
+  control: { x: number; y: number },
+  end: { x: number; y: number },
+  t: number
+) {
+  const inv = 1 - t;
+  return {
+    x: inv * inv * start.x + 2 * inv * t * control.x + t * t * end.x,
+    y: inv * inv * start.y + 2 * inv * t * control.y + t * t * end.y
+  };
+}
+
 function onPointerDown(event: PointerEvent) {
+  event.preventDefault();
+  updateNebulaCursor(event);
   isDragging = true;
-  dragMode = 'pan';
+  dragMode = event.button === 1 ? 'pan' : null;
+  if (dragMode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   dragTagId = null;
   dragLogId = null;
   moved = false;
+  dragButton = event.button;
+  dragSnapshot = null;
   lastPointer = { x: event.clientX, y: event.clientY };
   const picked = pickNodeAt(event.offsetX, event.offsetY);
-  if (picked?.kind === 'tag') {
+  if (event.button === 0 && picked?.kind === 'tag') {
+    dragSnapshot = captureManualPositions();
     const point = screenToWorld(event.offsetX, event.offsetY);
     dragMode = 'tag';
     dragTagId = picked.id;
@@ -346,7 +484,8 @@ function onPointerDown(event: PointerEvent) {
       x: picked.x - point.x,
       y: picked.y - point.y
     };
-  } else if (picked?.kind === 'log') {
+  } else if (event.button === 0 && picked?.kind === 'log') {
+    dragSnapshot = captureManualPositions();
     const point = screenToWorld(event.offsetX, event.offsetY);
     dragMode = 'log';
     dragLogId = picked.id;
@@ -359,6 +498,7 @@ function onPointerDown(event: PointerEvent) {
 }
 
 function onPointerMove(event: PointerEvent) {
+  updateNebulaCursor(event);
   if (!isDragging) {
     return;
   }
@@ -392,6 +532,7 @@ function onPointerMove(event: PointerEvent) {
       current.y = next.y;
     }
   } else {
+    lastPanInteractionAt = performance.now();
     transform.x += dx;
     transform.y += dy;
   }
@@ -399,17 +540,24 @@ function onPointerMove(event: PointerEvent) {
 }
 
 function onPointerUp(event: PointerEvent) {
+  updateNebulaCursor(event);
   canvas.value?.releasePointerCapture(event.pointerId);
   isDragging = false;
   const mode = dragMode;
   const tagId = dragTagId;
   const logId = dragLogId;
+  const button = dragButton;
   dragMode = null;
   dragTagId = null;
   dragLogId = null;
+  dragButton = 0;
+  if (mode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   if (mode === 'tag' && tagId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -418,7 +566,8 @@ function onPointerUp(event: PointerEvent) {
   }
   if (mode === 'log' && logId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -428,8 +577,17 @@ function onPointerUp(event: PointerEvent) {
   if (moved) {
     return;
   }
+  if (button !== 0 && button !== 2) {
+    return;
+  }
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (!picked) {
+    return;
+  }
+  if (button === 2) {
+    if (picked.kind === 'log') {
+      inspectLogAt(picked.id, event);
+    }
     return;
   }
   if (picked.kind === 'tag') {
@@ -441,12 +599,41 @@ function onPointerUp(event: PointerEvent) {
 
 function onWheel(event: WheelEvent) {
   event.preventDefault();
+  if (isDragging || performance.now() - lastPanInteractionAt < 220) {
+    return;
+  }
   const zoom = event.deltaY < 0 ? 1.08 : 0.92;
   const before = screenToWorld(event.offsetX, event.offsetY);
   transform.scale = Math.min(2.4, Math.max(0.45, transform.scale * zoom));
   const after = worldToScreen(before.x, before.y);
   transform.x += event.offsetX - after.x;
   transform.y += event.offsetY - after.y;
+}
+
+function updateNebulaCursor(event: PointerEvent) {
+  const dx = event.offsetX - nebulaCursor.x;
+  const dy = event.offsetY - nebulaCursor.y;
+  if (Math.abs(dx) + Math.abs(dy) > 1) {
+    nebulaCursor.angle = Math.atan2(dy, dx);
+  }
+  nebulaCursor.x = event.offsetX;
+  nebulaCursor.y = event.offsetY;
+  nebulaCursor.visible = true;
+}
+
+function hideNebulaCursor() {
+  nebulaCursor.visible = false;
+}
+
+function inspectLogAt(logId: number, event: PointerEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('logInspect', {
+    logId,
+    x: event.offsetX,
+    y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
 }
 
 function focusTag(tagId: number) {
@@ -460,6 +647,29 @@ function focusTag(tagId: number) {
     return;
   }
   centerTag(tagId);
+}
+
+function focusLog(logId: number) {
+  if (!canvas.value) {
+    return null;
+  }
+  const point = logPositions.get(logId);
+  if (!point) {
+    requestLayout();
+    return null;
+  }
+  const rect = canvas.value.getBoundingClientRect();
+  transform.scale = Math.max(transform.scale, 1.12);
+  transform.x = rect.width / 2 - point.x * transform.scale;
+  transform.y = rect.height / 2 - point.y * transform.scale;
+  draw();
+  return {
+    logId,
+    x: rect.width / 2,
+    y: rect.height / 2,
+    width: rect.width,
+    height: rect.height
+  };
 }
 
 function centerTag(tagId: number) {
@@ -492,6 +702,8 @@ function logPositionStorageKey() {
 function loadManualPositions() {
   manualTagPositions.clear();
   manualLogPositions.clear();
+  layoutHistory.length = 0;
+  redoHistory.length = 0;
   loadManualPointMap(tagPositionStorageKey(), new Set(props.graph.tags.map((tag) => tag.id)), manualTagPositions);
   loadManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
@@ -523,6 +735,77 @@ function saveManualPositions() {
   saveManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
 
+function saveLayout() {
+  if (manualTagPositions.size === 0 && manualLogPositions.size === 0) {
+    return false;
+  }
+  saveManualPositions();
+  emit('layoutDirty', false);
+  return true;
+}
+
+function undoLayout() {
+  const snapshot = layoutHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushRedoHistory(captureManualPositions());
+  restoreManualPositions(snapshot);
+  requestLayout();
+  draw();
+  return true;
+}
+
+function redoLayout() {
+  const snapshot = redoHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushLayoutHistory(captureManualPositions(), false);
+  restoreManualPositions(snapshot);
+  requestLayout();
+  draw();
+  return true;
+}
+
+function captureManualPositions(): LayoutSnapshot {
+  return {
+    tags: [...manualTagPositions.entries()].map(([id, point]) => [id, { ...point }]),
+    logs: [...manualLogPositions.entries()].map(([id, point]) => [id, { ...point }])
+  };
+}
+
+function restoreManualPositions(snapshot: LayoutSnapshot) {
+  manualTagPositions.clear();
+  manualLogPositions.clear();
+  for (const [id, point] of snapshot.tags) {
+    manualTagPositions.set(id, { ...point });
+  }
+  for (const [id, point] of snapshot.logs) {
+    manualLogPositions.set(id, { ...point });
+  }
+}
+
+function pushLayoutHistory(snapshot: LayoutSnapshot | null, clearRedo = true) {
+  if (!snapshot) {
+    return;
+  }
+  layoutHistory.push(snapshot);
+  if (layoutHistory.length > 30) {
+    layoutHistory.shift();
+  }
+  if (clearRedo) {
+    redoHistory.length = 0;
+  }
+}
+
+function pushRedoHistory(snapshot: LayoutSnapshot) {
+  redoHistory.push(snapshot);
+  if (redoHistory.length > 30) {
+    redoHistory.shift();
+  }
+}
+
 function saveManualPointMap(
   key: string,
   validIds: Set<number>,
@@ -533,11 +816,18 @@ function saveManualPointMap(
 }
 
 function resetTagLayout() {
+  pushLayoutHistory(captureManualPositions());
   manualTagPositions.clear();
   manualLogPositions.clear();
   window.localStorage.removeItem(tagPositionStorageKey());
   window.localStorage.removeItem(logPositionStorageKey());
+  emit('layoutDirty', false);
   requestLayout();
+}
+
+function refreshLayout() {
+  requestLayout();
+  draw();
 }
 
 function worldToScreen(x: number, y: number) {
@@ -554,6 +844,15 @@ function screenToWorld(x: number, y: number) {
   };
 }
 
+function hexToRgba(hex: string, alpha: number) {
+  const clean = hex.replace('#', '');
+  const value = Number.parseInt(clean, 16);
+  const r = (value >> 16) & 255;
+  const g = (value >> 8) & 255;
+  const b = value & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 function seeded(input: number) {
   const x = Math.sin(input * 999.91) * 10000;
   return x - Math.floor(x);
@@ -561,14 +860,23 @@ function seeded(input: number) {
 </script>
 
 <template>
-  <div class="canvas-wrap">
+  <div class="canvas-wrap nebula-interactive-surface">
     <canvas
       ref="canvas"
       class="nebula-canvas"
+      @pointerenter="updateNebulaCursor"
+      @pointerleave="hideNebulaCursor"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
+      @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
+    <div
+      class="nebula-star-cursor"
+      :class="{ visible: nebulaCursor.visible }"
+      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px) rotate(${nebulaCursor.angle}rad)` }"
+    ></div>
+    <slot name="overlay"></slot>
   </div>
 </template>

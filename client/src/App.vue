@@ -1,6 +1,29 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
-import { Cpu, Download, Edit3, FilePlus2, LogOut, Orbit, Plus, RefreshCw, RotateCcw, Trash2, UserRound } from 'lucide-vue-next';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import {
+  Cpu,
+  Download,
+  Edit3,
+  FilePlus2,
+  Layers,
+  Link2,
+  List,
+  LogOut,
+  Map as MapIcon,
+  Orbit,
+  PenLine,
+  Plus,
+  Redo2,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Sparkles,
+  Tags,
+  Trash2,
+  Undo2,
+  UserRound,
+  X
+} from 'lucide-vue-next';
 import AuthPanel from './components/AuthPanel.vue';
 import InsightPanel from './components/InsightPanel.vue';
 import LogEditor from './components/LogEditor.vue';
@@ -20,14 +43,31 @@ import {
   loadDraft,
   logout,
   saveDraft,
-  updateLog
+  updateLog,
+  updateMap
 } from './services/api';
 import type { DraftLog, GraphData, Insight, LogEntry, NebulaMap, TagNode, UserAccount } from './types/domain';
 
+type NebulaLogCard = {
+  logId: number;
+  x: number;
+  y: number;
+  width?: number;
+  height?: number;
+};
+
 type NebulaRenderer = {
   focusTag: (tagId: number) => void;
+  focusLog: (logId: number) => NebulaLogCard | null;
   resetTagLayout: () => void;
+  refreshLayout: () => void;
+  saveLayout: () => boolean;
+  undoLayout: () => boolean;
+  redoLayout: () => boolean;
 };
+
+type RightPanel = 'logs' | 'editor' | 'insight';
+type LeftPanel = 'maps' | 'active' | 'related' | 'manage';
 
 const maps = ref<NebulaMap[]>([]);
 const activeMapId = ref<number | null>(null);
@@ -35,6 +75,7 @@ const graph = ref<GraphData | null>(null);
 const insights = ref<Insight | null>(null);
 const activeTagIds = ref<Set<number>>(new Set());
 const selectedLogId = ref<number | null>(null);
+const nebulaLogCard = ref<NebulaLogCard | null>(null);
 const editorMode = ref<'new' | 'edit' | null>('new');
 const editingLog = ref<LogEntry | null>(null);
 const draft = ref<DraftLog | undefined>();
@@ -48,10 +89,20 @@ const isOnline = ref(typeof navigator === 'undefined' ? true : navigator.onLine)
 const draftSavedAt = ref('');
 const draftRestored = ref(false);
 const rendererMode = ref<'canvas' | 'webgpu'>(localStorage.getItem('nebula.rendererMode') === 'webgpu' ? 'webgpu' : 'canvas');
+const nebulaRenderKey = ref(0);
 const canvasRef = ref<NebulaRenderer | null>(null);
 const tagManagerRef = ref<InstanceType<typeof TagManager> | null>(null);
+const rightPanel = ref<RightPanel | null>(null);
+const leftPanel = ref<LeftPanel | null>(null);
+const layoutDirty = ref(false);
 
-const selectedLog = computed(() => graph.value?.logs.find((log) => log.id === selectedLogId.value) ?? null);
+const nebulaCardLog = computed(() => {
+  if (!graph.value || !nebulaLogCard.value) {
+    return null;
+  }
+  const log = graph.value.logs.find((item) => item.id === nebulaLogCard.value?.logId);
+  return log ? { log, x: nebulaLogCard.value.x, y: nebulaLogCard.value.y } : null;
+});
 
 const filteredLogs = computed(() => {
   if (!graph.value) {
@@ -102,12 +153,14 @@ const hasNoMaps = computed(() => currentUser.value !== null && maps.value.length
 onMounted(async () => {
   window.addEventListener('online', handleNetworkChange);
   window.addEventListener('offline', handleNetworkChange);
+  window.addEventListener('keydown', handleNebulaShortcut);
   await bootstrap();
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('online', handleNetworkChange);
   window.removeEventListener('offline', handleNetworkChange);
+  window.removeEventListener('keydown', handleNebulaShortcut);
 });
 
 async function bootstrap() {
@@ -150,6 +203,7 @@ async function loadWorkspace() {
   graph.value = null;
   insights.value = null;
   selectedLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = null;
 }
 
@@ -160,11 +214,15 @@ function resetWorkspace() {
   insights.value = null;
   activeTagIds.value = new Set();
   selectedLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = 'new';
   editingLog.value = null;
   draft.value = undefined;
   draftRestored.value = false;
   draftSavedAt.value = '';
+  layoutDirty.value = false;
+  leftPanel.value = null;
+  rightPanel.value = null;
   error.value = '';
   notice.value = '';
 }
@@ -179,8 +237,12 @@ async function selectMap(mapId: number) {
   localStorage.setItem('nebula.activeMapId', String(mapId));
   activeTagIds.value = new Set();
   selectedLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = 'new';
   editingLog.value = null;
+  layoutDirty.value = false;
+  leftPanel.value = null;
+  rightPanel.value = null;
   draft.value = await loadDraft(mapId).catch(() => undefined);
   draftRestored.value = hasDraftContent(draft.value);
   draftSavedAt.value = draftRestored.value ? '刚刚' : '';
@@ -204,6 +266,20 @@ async function refreshData() {
   } finally {
     loading.value = false;
   }
+}
+
+async function refreshNebulaView() {
+  if (!activeMapId.value) {
+    return;
+  }
+  activeTagIds.value = new Set();
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  rightPanel.value = null;
+  nebulaRenderKey.value += 1;
+  layoutDirty.value = false;
+  await nextTick();
+  showNotice('星云图已回到主视角');
 }
 
 async function handleGenerateAdvice() {
@@ -237,18 +313,53 @@ async function addMap() {
   showNotice('星云图已创建');
 }
 
-function startNewLog() {
-  selectedLogId.value = null;
-  editingLog.value = null;
-  editorMode.value = 'new';
-}
-
-function startEditLog() {
-  if (!selectedLog.value) {
+async function renameActiveMap(mapId = activeMapId.value) {
+  if (!mapId) {
     return;
   }
-  editingLog.value = selectedLog.value;
+  const target = maps.value.find((map) => map.id === mapId) ?? graph.value?.map;
+  if (!target) {
+    return;
+  }
+  const nextName = window.prompt('修改星云图名称', target.name);
+  if (!nextName?.trim() || nextName.trim() === target.name) {
+    return;
+  }
+  try {
+    const updated = await updateMap(mapId, {
+      name: nextName.trim(),
+      description: target.description ?? ''
+    });
+    maps.value = maps.value.map((map) => (map.id === updated.id ? updated : map));
+    if (graph.value?.map.id === updated.id) {
+      graph.value = {
+        ...graph.value,
+        map: updated
+      };
+    }
+    showNotice('星云图名称已更新');
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '更新星云图名称失败';
+  }
+}
+
+function startNewLog() {
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  editingLog.value = null;
+  editorMode.value = 'new';
+  rightPanel.value = 'editor';
+}
+
+function startEditLog(logId = selectedLogId.value) {
+  const log = logId === null ? null : graph.value?.logs.find((item) => item.id === logId) ?? null;
+  if (!log) {
+    return;
+  }
+  editingLog.value = log;
   editorMode.value = 'edit';
+  nebulaLogCard.value = null;
+  rightPanel.value = 'editor';
 }
 
 async function handleSaveLog(payload: DraftLog) {
@@ -280,8 +391,10 @@ async function handleSaveLog(payload: DraftLog) {
     draftRestored.value = false;
     draftSavedAt.value = '';
     selectedLogId.value = saved.id;
+    nebulaLogCard.value = null;
     editorMode.value = null;
     editingLog.value = null;
+    rightPanel.value = null;
     await refreshData();
     showNotice(wasEditing ? '日志已更新' : '日志已保存');
   } catch (err) {
@@ -294,26 +407,29 @@ async function handleSaveLog(payload: DraftLog) {
   }
 }
 
-async function removeSelectedLog() {
-  if (!selectedLog.value) {
+async function removeLog(logId = selectedLogId.value) {
+  const log = logId === null ? null : graph.value?.logs.find((item) => item.id === logId) ?? null;
+  if (!log) {
     return;
   }
-  const ok = window.confirm(`确认删除「${selectedLog.value.title}」吗？`);
+  const ok = window.confirm(`确认删除「${log.title}」吗？`);
   if (!ok) {
     return;
   }
-  await deleteLog(selectedLog.value.id);
+  await deleteLog(log.id);
   selectedLogId.value = null;
+  nebulaLogCard.value = null;
   editorMode.value = 'new';
+  rightPanel.value = null;
   await refreshData();
   showNotice('日志已删除');
 }
 
-function exportSelectedLog() {
-  if (!selectedLog.value) {
+function exportLog(logId = selectedLogId.value) {
+  const log = logId === null ? null : graph.value?.logs.find((item) => item.id === logId) ?? null;
+  if (!log) {
     return;
   }
-  const log = selectedLog.value;
   const markdown = [
     `# ${log.title}`,
     '',
@@ -341,16 +457,81 @@ async function toggleTag(tagId: number) {
   activeTagIds.value = next;
   await nextTick();
   tagManagerRef.value?.scrollToTag(tagId);
+  scrollFirstFilteredLogIntoView();
 }
 
-function openLog(logId: number) {
-  if (selectedLogId.value === logId && editorMode.value === null) {
+function selectLogOnly(logId: number, resetEditor = true) {
+  selectedLogId.value = logId;
+  nebulaLogCard.value = null;
+  if (resetEditor) {
+    editorMode.value = null;
+    editingLog.value = null;
+  }
+}
+
+async function selectLogFromList(logId: number) {
+  selectLogOnly(logId);
+  await nextTick();
+  let card = canvasRef.value?.focusLog(logId);
+  if (!card) {
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    card = canvasRef.value?.focusLog(logId);
+  }
+  if (card) {
+    inspectNebulaLog(card);
+  }
+}
+
+function selectNebulaLog(logId: number) {
+  if (selectedLogId.value === logId) {
     selectedLogId.value = null;
+    nebulaLogCard.value = null;
     return;
   }
-  selectedLogId.value = logId;
-  editorMode.value = null;
-  editingLog.value = null;
+  selectLogOnly(logId, rightPanel.value !== 'editor');
+  if (rightPanel.value === 'logs') {
+    nextTick(() => scrollLogIntoView(logId));
+  }
+}
+
+function scrollFirstFilteredLogIntoView() {
+  const first = filteredLogs.value[0];
+  if (!first) {
+    return;
+  }
+  scrollLogIntoView(first.id);
+}
+
+function scrollLogIntoView(logId: number) {
+  window.requestAnimationFrame(() => {
+    document.querySelector(`[data-log-id="${logId}"]`)?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'nearest'
+    });
+  });
+}
+
+function inspectNebulaLog(payload: NebulaLogCard) {
+  const width = payload.width ?? window.innerWidth;
+  const height = payload.height ?? window.innerHeight;
+  const maxX = Math.max(16, width - 356);
+  const maxY = Math.max(16, height - 300);
+  selectedLogId.value = payload.logId;
+  if (rightPanel.value !== 'editor') {
+    editorMode.value = null;
+    editingLog.value = null;
+  }
+  nebulaLogCard.value = {
+    logId: payload.logId,
+    x: Math.min(maxX, Math.max(16, payload.x + 16)),
+    y: Math.min(maxY, Math.max(16, payload.y - 16)),
+    width,
+    height
+  };
+}
+
+function closeNebulaCard() {
+  nebulaLogCard.value = null;
 }
 
 function focusTag(tagId: number) {
@@ -359,18 +540,96 @@ function focusTag(tagId: number) {
 
 function resetAiLayout() {
   canvasRef.value?.resetTagLayout();
-  showNotice('已清除手动位置，恢复自动布局');
+  showNotice('已清除手动位置，正在按标签关系重新布局');
+}
+
+function saveNebulaLayout() {
+  const saved = canvasRef.value?.saveLayout() ?? false;
+  if (saved) {
+    layoutDirty.value = false;
+  }
+  showNotice(saved ? '星云布局已保存' : '当前没有可保存的星云布局');
+}
+
+function undoNebulaLayout() {
+  const undone = canvasRef.value?.undoLayout() ?? false;
+  if (undone) {
+    layoutDirty.value = true;
+  }
+  showNotice(undone ? '已撤销上一次星云布局调整' : '没有可撤销的星云布局调整');
+}
+
+function redoNebulaLayout() {
+  const redone = canvasRef.value?.redoLayout() ?? false;
+  if (redone) {
+    layoutDirty.value = true;
+  }
+  showNotice(redone ? '已重做上一次星云布局调整' : '没有可重做的星云布局调整');
+}
+
+function handleLayoutDirty(dirty: boolean) {
+  layoutDirty.value = dirty;
+}
+
+function handleNebulaShortcut(event: KeyboardEvent) {
+  if (!graph.value || isTextInput(event.target)) {
+    return;
+  }
+  const key = event.key.toLowerCase();
+  if ((event.ctrlKey || event.metaKey) && key === 's') {
+    event.preventDefault();
+    saveNebulaLayout();
+  }
+  if ((event.ctrlKey || event.metaKey) && key === 'z') {
+    event.preventDefault();
+    undoNebulaLayout();
+  }
+  if ((event.ctrlKey || event.metaKey) && key === 'y') {
+    event.preventDefault();
+    redoNebulaLayout();
+  }
+}
+
+function isTextInput(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  return Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
+}
+
+function cancelEditor() {
+  editorMode.value = null;
+  editingLog.value = null;
+  rightPanel.value = null;
+}
+
+function toggleRightPanel(panel: RightPanel) {
+  if (rightPanel.value === panel) {
+    rightPanel.value = null;
+    return;
+  }
+  if (panel === 'editor' && !editorMode.value) {
+    startNewLog();
+    return;
+  }
+  rightPanel.value = panel;
+}
+
+function toggleLeftPanel(panel: LeftPanel) {
+  leftPanel.value = leftPanel.value === panel ? null : panel;
 }
 
 function switchRenderer(mode: 'canvas' | 'webgpu') {
   rendererMode.value = mode;
   localStorage.setItem('nebula.rendererMode', mode);
+  nebulaLogCard.value = null;
   showNotice(mode === 'webgpu' ? '已切换到 WebGPU 星云渲染' : '已切换到 Canvas 兼容渲染');
 }
 
 async function activateTagAndFocus(tagId: number) {
   activeTagIds.value = new Set([tagId]);
   selectedLogId.value = null;
+  nebulaLogCard.value = null;
   await nextTick();
   window.requestAnimationFrame(() => canvasRef.value?.focusTag(tagId));
 }
@@ -434,13 +693,37 @@ function formatTime(value: Date) {
         <div class="brand-mark">
           <Orbit :size="24" />
         </div>
-        <div>
+        <div class="brand-copy">
           <h1>星云洞察</h1>
           <p>个人日志知识图谱</p>
         </div>
       </section>
 
-      <section class="panel">
+      <div class="left-panel-tabs" aria-label="左侧信息面板">
+        <button :class="{ active: leftPanel === 'maps' }" title="星云图" @click="toggleLeftPanel('maps')">
+          <MapIcon :size="17" />
+          星图
+        </button>
+        <button :class="{ active: leftPanel === 'active' }" title="激活标签" @click="toggleLeftPanel('active')">
+          <Tags :size="17" />
+          标签
+        </button>
+        <button :class="{ active: leftPanel === 'related' }" title="相关标签" @click="toggleLeftPanel('related')">
+          <Link2 :size="17" />
+          相关
+        </button>
+        <button
+          :class="{ active: leftPanel === 'manage' }"
+          :disabled="!activeMapId || !graph"
+          title="标签管理"
+          @click="toggleLeftPanel('manage')"
+        >
+          <Layers :size="17" />
+          管理
+        </button>
+      </div>
+
+      <section v-if="leftPanel === 'maps'" class="panel">
         <div class="panel-title">
           <span>星云图</span>
           <button class="icon-button" title="新建星云图" @click="addMap">
@@ -448,20 +731,19 @@ function formatTime(value: Date) {
           </button>
         </div>
         <div class="map-list">
-          <button
-            v-for="map in maps"
-            :key="map.id"
-            class="map-item"
-            :class="{ active: map.id === activeMapId }"
-            @click="selectMap(map.id)"
-          >
-            <span>{{ map.name }}</span>
-            <small>{{ map.description || '无描述' }}</small>
-          </button>
+          <div v-for="map in maps" :key="map.id" class="map-row">
+            <button class="map-item" :class="{ active: map.id === activeMapId }" @click="selectMap(map.id)">
+              <span>{{ map.name }}{{ layoutDirty && map.id === activeMapId ? ' *' : '' }}</span>
+              <small>{{ map.description || '无描述' }}</small>
+            </button>
+            <button class="icon-button map-edit-button" title="修改星云图名称" @click="renameActiveMap(map.id)">
+              <Edit3 :size="15" />
+            </button>
+          </div>
         </div>
       </section>
 
-      <section class="panel">
+      <section v-if="leftPanel === 'active'" class="panel">
         <div class="panel-title">
           <span>激活标签</span>
           <button class="text-button compact" @click="activeTagIds = new Set()">清空</button>
@@ -480,7 +762,7 @@ function formatTime(value: Date) {
         <p v-else class="muted">点击星云中的恒星即可激活标签。</p>
       </section>
 
-      <section class="panel">
+      <section v-if="leftPanel === 'related'" class="panel">
         <div class="panel-title">
           <span>相关标签</span>
         </div>
@@ -494,7 +776,7 @@ function formatTime(value: Date) {
       </section>
 
       <TagManager
-        v-if="activeMapId && graph"
+        v-if="leftPanel === 'manage' && activeMapId && graph"
         ref="tagManagerRef"
         :map-id="activeMapId"
         :tags="graph.tags"
@@ -506,7 +788,12 @@ function formatTime(value: Date) {
     <section class="workspace">
       <header class="topbar">
         <div>
-          <h2>{{ graph?.map.name ?? (hasNoMaps ? '还没有星云图' : '加载中') }}</h2>
+          <div class="title-row">
+            <h2>{{ graph?.map.name ?? (hasNoMaps ? '还没有星云图' : '加载中') }}{{ layoutDirty ? ' *' : '' }}</h2>
+            <button v-if="activeMapId" class="icon-button compact-title-action" title="修改星云图名称" @click="renameActiveMap()">
+              <Edit3 :size="15" />
+            </button>
+          </div>
           <p>Canvas 实时渲染 · Web Worker 布局 · REST API · SQLite · Cookie Session · IndexedDB 草稿</p>
         </div>
         <div class="topbar-actions">
@@ -522,11 +809,20 @@ function formatTime(value: Date) {
           <div class="stat-pill">{{ stats.tags }} 标签</div>
           <div class="stat-pill">{{ stats.logs }} 日志</div>
           <div class="stat-pill highlight">{{ stats.filtered }} 命中</div>
-          <button class="icon-button" title="刷新" :disabled="!activeMapId" @click="refreshData">
+          <button class="icon-button" title="刷新星云图" :disabled="!activeMapId" @click="refreshNebulaView">
             <RefreshCw :size="17" />
           </button>
           <button class="icon-button" title="恢复 AI 布局" :disabled="!activeMapId" @click="resetAiLayout">
             <RotateCcw :size="17" />
+          </button>
+          <button class="icon-button" title="保存星云布局 Ctrl+S" :disabled="!activeMapId" @click="saveNebulaLayout">
+            <Save :size="17" />
+          </button>
+          <button class="icon-button" title="撤销星云布局 Ctrl+Z" :disabled="!activeMapId" @click="undoNebulaLayout">
+            <Undo2 :size="17" />
+          </button>
+          <button class="icon-button" title="重做星云布局 Ctrl+Y" :disabled="!activeMapId" @click="redoNebulaLayout">
+            <Redo2 :size="17" />
           </button>
           <button class="primary-button" :disabled="!activeMapId" @click="startNewLog">
             <FilePlus2 :size="17" />
@@ -548,22 +844,108 @@ function formatTime(value: Date) {
 
       <NebulaCanvas
         v-if="graph && rendererMode === 'canvas'"
+        :key="`canvas-${activeMapId ?? 'none'}-${nebulaRenderKey}`"
         ref="canvasRef"
         :graph="graph"
         :active-tag-ids="activeTagIds"
         :selected-log-id="selectedLogId"
         @tag-toggle="toggleTag"
-        @log-open="openLog"
-      />
+        @log-open="selectNebulaLog"
+        @log-inspect="inspectNebulaLog"
+        @layout-dirty="handleLayoutDirty"
+      >
+        <template #overlay>
+          <div
+            v-if="nebulaCardLog"
+            class="nebula-log-card"
+            :style="{ left: `${nebulaCardLog.x}px`, top: `${nebulaCardLog.y}px` }"
+          >
+            <div class="nebula-log-card-head">
+              <span>日志星卡</span>
+              <div class="nebula-log-card-actions">
+                <button class="icon-button" title="编辑" @click="startEditLog(nebulaCardLog.log.id)">
+                  <Edit3 :size="15" />
+                </button>
+                <button class="icon-button" title="导出 Markdown" @click="exportLog(nebulaCardLog.log.id)">
+                  <Download :size="15" />
+                </button>
+                <button class="icon-button danger" title="删除" @click="removeLog(nebulaCardLog.log.id)">
+                  <Trash2 :size="15" />
+                </button>
+                <button class="icon-button" title="关闭" @click="closeNebulaCard">
+                  <X :size="14" />
+                </button>
+              </div>
+            </div>
+            <h3>{{ nebulaCardLog.log.title }}</h3>
+            <p class="detail-time">{{ formatDate(nebulaCardLog.log.createdAt) }}</p>
+            <p class="nebula-log-card-content">{{ nebulaCardLog.log.content }}</p>
+            <div class="chip-list">
+              <button
+                v-for="tag in nebulaCardLog.log.tags"
+                :key="tag.id"
+                class="chip"
+                :style="{ borderColor: tag.color }"
+                @click="focusTag(tag.id)"
+              >
+                {{ tag.name }}
+              </button>
+            </div>
+          </div>
+        </template>
+      </NebulaCanvas>
       <WebGpuNebulaCanvas
         v-else-if="graph"
+        :key="`webgpu-${activeMapId ?? 'none'}-${nebulaRenderKey}`"
         ref="canvasRef"
         :graph="graph"
         :active-tag-ids="activeTagIds"
         :selected-log-id="selectedLogId"
         @tag-toggle="toggleTag"
-        @log-open="openLog"
-      />
+        @log-open="selectNebulaLog"
+        @log-inspect="inspectNebulaLog"
+        @layout-dirty="handleLayoutDirty"
+      >
+        <template #overlay>
+          <div
+            v-if="nebulaCardLog"
+            class="nebula-log-card"
+            :style="{ left: `${nebulaCardLog.x}px`, top: `${nebulaCardLog.y}px` }"
+          >
+            <div class="nebula-log-card-head">
+              <span>日志星卡</span>
+              <div class="nebula-log-card-actions">
+                <button class="icon-button" title="编辑" @click="startEditLog(nebulaCardLog.log.id)">
+                  <Edit3 :size="15" />
+                </button>
+                <button class="icon-button" title="导出 Markdown" @click="exportLog(nebulaCardLog.log.id)">
+                  <Download :size="15" />
+                </button>
+                <button class="icon-button danger" title="删除" @click="removeLog(nebulaCardLog.log.id)">
+                  <Trash2 :size="15" />
+                </button>
+                <button class="icon-button" title="关闭" @click="closeNebulaCard">
+                  <X :size="14" />
+                </button>
+              </div>
+            </div>
+            <h3>{{ nebulaCardLog.log.title }}</h3>
+            <p class="detail-time">{{ formatDate(nebulaCardLog.log.createdAt) }}</p>
+            <p class="nebula-log-card-content">{{ nebulaCardLog.log.content }}</p>
+            <div class="chip-list">
+              <button
+                v-for="tag in nebulaCardLog.log.tags"
+                :key="tag.id"
+                class="chip"
+                :style="{ borderColor: tag.color }"
+                @click="focusTag(tag.id)"
+              >
+                {{ tag.name }}
+              </button>
+            </div>
+          </div>
+        </template>
+      </WebGpuNebulaCanvas>
       <div v-else-if="hasNoMaps" class="empty-state">
         <div class="empty-state-content">
           <h3>这个账号还没有星云图</h3>
@@ -575,10 +957,31 @@ function formatTime(value: Date) {
         </div>
       </div>
       <div v-else class="empty-state">正在生成星云图...</div>
+
     </section>
 
     <aside class="right-rail">
-      <section class="panel log-list-panel">
+      <div class="right-panel-tabs" aria-label="右侧信息面板">
+        <button :class="{ active: rightPanel === 'logs' }" title="日志列表" @click="toggleRightPanel('logs')">
+          <List :size="17" />
+          日志
+        </button>
+        <button
+          :class="{ active: rightPanel === 'editor' }"
+          :disabled="!activeMapId"
+          title="新建或编辑日志"
+          @click="toggleRightPanel('editor')"
+        >
+          <PenLine :size="17" />
+          编辑
+        </button>
+        <button :class="{ active: rightPanel === 'insight' }" title="推荐建议" @click="toggleRightPanel('insight')">
+          <Sparkles :size="17" />
+          建议
+        </button>
+      </div>
+
+      <section v-if="rightPanel === 'logs'" class="panel log-list-panel">
         <div class="panel-title">
           <span>日志列表</span>
           <small>按时间倒序</small>
@@ -587,9 +990,10 @@ function formatTime(value: Date) {
           <button
             v-for="log in filteredLogs"
             :key="log.id"
+            :data-log-id="log.id"
             class="log-item"
             :class="{ active: log.id === selectedLogId }"
-            @click="openLog(log.id)"
+            @click="selectLogFromList(log.id)"
           >
             <span>{{ log.title }}</span>
             <small>{{ formatDate(log.createdAt) }}</small>
@@ -597,39 +1001,8 @@ function formatTime(value: Date) {
         </div>
       </section>
 
-      <section v-if="selectedLog && !editorMode" class="panel detail-panel">
-        <div class="panel-title">
-          <span>日志详情</span>
-          <div class="button-row">
-            <button class="icon-button" title="编辑" @click="startEditLog">
-              <Edit3 :size="16" />
-            </button>
-            <button class="icon-button" title="导出 Markdown" @click="exportSelectedLog">
-              <Download :size="16" />
-            </button>
-            <button class="icon-button danger" title="删除" @click="removeSelectedLog">
-              <Trash2 :size="16" />
-            </button>
-          </div>
-        </div>
-        <h3>{{ selectedLog.title }}</h3>
-        <p class="detail-time">{{ formatDate(selectedLog.createdAt) }}</p>
-        <div class="chip-list">
-          <button
-            v-for="tag in selectedLog.tags"
-            :key="tag.id"
-            class="chip"
-            :style="{ borderColor: tag.color }"
-            @click="focusTag(tag.id)"
-          >
-            {{ tag.name }}
-          </button>
-        </div>
-        <p class="log-content">{{ selectedLog.content }}</p>
-      </section>
-
       <LogEditor
-        v-if="activeMapId && editorMode"
+        v-if="rightPanel === 'editor' && activeMapId && editorMode"
         :map-id="activeMapId"
         :initial-log="editingLog"
         :draft="draft"
@@ -638,11 +1011,16 @@ function formatTime(value: Date) {
         :draft-saved-at="draftSavedAt"
         :draft-restored="draftRestored"
         @save="handleSaveLog"
-        @cancel="editorMode = null"
+        @cancel="cancelEditor"
         @draft-change="handleDraftChange"
       />
 
-      <InsightPanel :insight="insights" :advice-loading="adviceLoading" @generate-advice="handleGenerateAdvice" />
+      <InsightPanel
+        v-if="rightPanel === 'insight'"
+        :insight="insights"
+        :advice-loading="adviceLoading"
+        @generate-advice="handleGenerateAdvice"
+      />
     </aside>
   </main>
 

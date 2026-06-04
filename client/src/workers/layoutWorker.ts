@@ -31,14 +31,14 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
   const tagPositions = new Map<number, Point>();
   const logPositions = new Map<number, Point>();
   const tagCount = Math.max(tags.length, 1);
-  const baseRadius = Math.min(420, Math.max(170, 110 + tagCount * 24));
+  const baseRadius = Math.min(520, Math.max(230, 150 + tagCount * 30));
 
   tags.forEach((tag, index) => {
     const angle = (Math.PI * 2 * index) / tagCount - Math.PI / 2;
-    const ringOffset = (index % 3) * 34;
+    const ringOffset = (index % 3) * 48;
     const x = Math.cos(angle) * (baseRadius + ringOffset);
-    const y = Math.sin(angle) * (baseRadius + ringOffset) * 0.72;
-    const r = 18 + Math.log2(tag.count + 1) * 7;
+    const y = Math.sin(angle) * (baseRadius + ringOffset) * 0.78;
+    const r = 20 + Math.log2(tag.count + 1) * 5.8;
     const manual = manualTagPositions.get(tag.id);
     tagPositions.set(tag.id, { x: manual?.x ?? x, y: manual?.y ?? y, r });
   });
@@ -49,7 +49,7 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
     const related = log.tags.map((tag) => tagPositions.get(tag.id)).filter(Boolean) as Point[];
     const seed = seeded(log.id);
     const jitterAngle = seed * Math.PI * 2;
-    const jitterDistance = related.length <= 1 ? 64 + (seed % 1) * 38 : 18 + (seed % 1) * 20;
+    const jitterDistance = related.length <= 1 ? 112 + (seed % 1) * 68 : 58 + (seed % 1) * 54;
     const center =
       related.length > 0
         ? related.reduce(
@@ -67,7 +67,7 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
     logPositions.set(log.id, {
       x: manual?.x ?? autoX,
       y: manual?.y ?? autoY,
-      r: 6
+      r: 4.6
     });
   });
 
@@ -113,7 +113,7 @@ function applySimilarityLayout(
         const dx = b.x - a.x;
         const dy = b.y - a.y;
         const distance = Math.max(1, Math.hypot(dx, dy));
-        const minDistance = a.r + b.r + 42;
+        const minDistance = a.r + b.r + 74;
         if (distance < minDistance) {
           const push = (minDistance - distance) * 0.035;
           const ux = dx / distance;
@@ -136,7 +136,7 @@ function applySimilarityLayout(
       const dx = b.x - a.x;
       const dy = b.y - a.y;
       const distance = Math.max(1, Math.hypot(dx, dy));
-      const desired = 340 - Math.min(1, similarity.score) * 230;
+      const desired = 420 - Math.min(1, similarity.score) * 270;
       const force = (distance - desired) * (0.012 + similarity.score * 0.018);
       const ux = dx / distance;
       const uy = dy / distance;

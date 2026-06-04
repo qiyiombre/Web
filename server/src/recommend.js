@@ -60,7 +60,7 @@ ${String(content ?? '').slice(0, 1200)}`,
   });
 
   const existingNames = new Set(existingTags.map((tag) => tag.name));
-  return normalizeSuggestions(result.tags ?? [], existingNames, limit, 'DeepSeek 根据日志语义推荐');
+  return normalizeSuggestions(result.tags ?? [], existingNames, limit, 'DeepSeek 根据日志语义推荐', 'deepseek');
 }
 
 function suggestTagsLocal(existingTags, content, limit) {
@@ -83,7 +83,8 @@ function suggestTagsLocal(existingTags, content, limit) {
         name: tag.name,
         score: clamp01(score + Math.min(tag.count, 8) * 0.015),
         reason: '与已有标签名称或历史使用习惯相关',
-        existing: true
+        existing: true,
+        source: 'local'
       });
     }
   }
@@ -101,7 +102,8 @@ function suggestTagsLocal(existingTags, content, limit) {
       name: group.name,
       score: Math.max(previous?.score ?? 0, score),
       reason: `内容中出现了「${hits.slice(0, 3).join('、')}」等关键词`,
-      existing: Boolean(existing)
+      existing: Boolean(existing),
+      source: 'local'
     });
   }
 
@@ -110,14 +112,15 @@ function suggestTagsLocal(existingTags, content, limit) {
     .slice(0, limit);
 }
 
-function normalizeSuggestions(items, existingNames, limit, fallbackReason) {
+function normalizeSuggestions(items, existingNames, limit, fallbackReason, source) {
   const seen = new Set();
   return items
     .map((item) => ({
       name: String(item.name ?? '').trim().slice(0, 24),
       score: clamp01(Number(item.score ?? 0.6)),
       reason: String(item.reason ?? fallbackReason).trim().slice(0, 80),
-      existing: existingNames.has(String(item.name ?? '').trim())
+      existing: existingNames.has(String(item.name ?? '').trim()),
+      source
     }))
     .filter((item) => {
       if (!item.name || seen.has(item.name)) {

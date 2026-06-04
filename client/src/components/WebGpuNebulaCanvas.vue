@@ -9,7 +9,11 @@ type PickNode =
 
 type LayoutPoint = { x: number; y: number; r: number };
 type Point3D = { x: number; y: number; z: number };
-type CameraTarget = { scale: number; x: number; y: number; yaw?: number; pitch?: number };
+type CameraTarget = { scale: number; panX: number; panY: number; panZ: number; yaw?: number; pitch?: number };
+type LayoutSnapshot = {
+  tags: Array<[number, { x: number; y: number }]>;
+  logs: Array<[number, { x: number; y: number }]>;
+};
 
 interface LayoutResponse {
   requestId: number;
@@ -36,6 +40,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   tagToggle: [tagId: number];
   logOpen: [logId: number];
+  logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
+  layoutDirty: [dirty: boolean];
 }>();
 
 const FOCAL_LENGTH = 740;
@@ -50,14 +56,14 @@ const webgpuError = ref('');
 const heatMode = ref(false);
 const fullscreen = ref(false);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
-const camera = reactive({ yaw: -0.42, pitch: -0.32 });
+const camera = reactive({ yaw: -0.42, pitch: -0.32, panX: 0, panY: 0, panZ: 0 });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2 });
 
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
 const manualTagPositions = new Map<number, { x: number; y: number }>();
 const manualLogPositions = new Map<number, { x: number; y: number }>();
 const pickNodes: PickNode[] = [];
-const activeIds = computed(() => [...props.activeTagIds]);
 const tagTrendById = computed(() => {
   const now = Date.now();
   const week = 1000 * 60 * 60 * 24 * 7;
@@ -103,7 +109,7 @@ let raf = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
 let isDragging = false;
-let dragMode: 'orbit' | 'tag' | 'log' | null = null;
+let dragMode: 'orbit' | 'pan' | 'tag' | 'log' | null = null;
 let dragTagId: number | null = null;
 let dragLogId: number | null = null;
 let dragTagOffset = { x: 0, y: 0 };
@@ -111,9 +117,14 @@ let dragLogOffset = { x: 0, y: 0 };
 let dragWorldZ = 0;
 let moved = false;
 let lastPointer = { x: 0, y: 0 };
+let dragButton = 0;
 let stars: Array<{ x: number; y: number; z: number; r: number; alpha: number; seed: number }> = [];
 let cameraTarget: CameraTarget | null = null;
 let resizeObserver: ResizeObserver | null = null;
+let dragSnapshot: LayoutSnapshot | null = null;
+let lastPanInteractionAt = 0;
+const layoutHistory: LayoutSnapshot[] = [];
+const redoHistory: LayoutSnapshot[] = [];
 
 const layoutWorker = new Worker(new URL('../workers/layoutWorker.ts', import.meta.url), { type: 'module' });
 
@@ -190,7 +201,12 @@ watch(
 
 defineExpose({
   focusTag,
-  resetTagLayout
+  focusLog,
+  resetTagLayout,
+  refreshLayout,
+  saveLayout,
+  undoLayout,
+  redoLayout
 });
 
 async function initWebGpu() {
@@ -470,15 +486,15 @@ function render(timeMs: number) {
       rect.height,
       transform.scale,
       timeMs / 1000,
-      transform.x,
-      transform.y,
+      camera.panX,
+      camera.panY,
       camera.yaw,
       camera.pitch,
       FOCAL_LENGTH,
       VIEW_DISTANCE,
       1,
       0,
-      0,
+      camera.panZ,
       0,
       0,
       0
@@ -548,20 +564,25 @@ function updateGeometryBuffers() {
     if (!point) {
       continue;
     }
+    if (!isTagVisible(tag.id)) {
+      continue;
+    }
     const heat = heatState(tag.id);
     const color = heatMode.value ? heatColor(tag.color, heat) : hexToRgb(tag.color);
     const active = props.activeTagIds.has(tag.id);
+    const relatedToSelected = isTagRelatedToSelectedLog(tag.id);
     const related =
-      activeIds.value.length === 0 ||
+      !hasActiveRelationMode() ||
       active ||
+      relatedToSelected ||
       props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
-    const state = heatMode.value && heat !== 'flat' ? 1 : active ? 1 : related ? 0.62 : 0.28;
+    const state = heatMode.value && heat !== 'flat' ? 1 : active || relatedToSelected ? 1 : related ? 0.62 : 0.18;
     const depth = 0.92 + seeded(tag.id + 2200) * 0.22;
-    const activeScale = active ? 1.36 : 1;
-    const coreRadius = point.r * 1.86 * depth * activeScale;
+    const activeScale = active || relatedToSelected ? 1.22 : related ? 1 : 0.92;
+    const coreRadius = point.r * 1.38 * depth * activeScale;
     const world = tagPoint3D(tag.id, point);
-    pushNodeInstance(nodeRows, world, coreRadius * (active ? 1.46 : 1.24), 3, color, active ? 0.1 : 0.055, state, seeded(tag.id + 700), 0);
-    pushNodeInstance(nodeRows, world, coreRadius * (active ? 2.22 : 1.98), 1, color, active ? 1 : 0.96, state, seeded(tag.id + 800), 0);
+    pushNodeInstance(nodeRows, world, coreRadius * (active || relatedToSelected ? 1.44 : 1.12), 3, color, active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025, state, seeded(tag.id + 700), 0);
+    pushNodeInstance(nodeRows, world, coreRadius * (active || relatedToSelected ? 1.82 : 1.48), 1, color, active || relatedToSelected ? 1 : related ? 0.92 : 0.46, state, seeded(tag.id + 800), 0);
   }
 
   for (const log of props.graph.logs) {
@@ -569,13 +590,17 @@ function updateGeometryBuffers() {
     if (!point) {
       continue;
     }
+    if (!isLogVisible(log)) {
+      continue;
+    }
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
-    const state = selected ? 1 : highlighted ? 0.82 : 0.26;
-    const radius = highlighted ? 9.8 : selected ? 9.8 : 7.2;
-    const glowAlpha = selected ? 0.66 : highlighted ? 0.3 : 0.08;
-    const glowRadius = selected ? 3.75 : highlighted ? 2.9 : 2.25;
-    const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : 0.84;
+    const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !highlighted;
+    const state = selected ? 1 : highlighted ? 0.82 : muted ? 0.12 : 0.26;
+    const radius = selected ? 6.8 : highlighted ? 6.2 : 4.9;
+    const glowAlpha = selected ? 0.6 : highlighted ? 0.28 : 0.07;
+    const glowRadius = selected ? 3.4 : highlighted ? 2.75 : 2.1;
+    const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : muted ? 0.38 : 0.84;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
     const seed = seeded(log.id + 1900);
@@ -587,29 +612,36 @@ function updateGeometryBuffers() {
   writeDynamicBuffer('node', new Float32Array(nodeRows), 48);
 
   const lineRows: number[] = [];
-  for (const edge of props.graph.edges) {
-    const tagPoint = tagPositions.get(edge.tagId);
-    const logPoint = logPositions.get(edge.logId);
-    const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
-    if (!tagPoint || !logPoint || !logEntry) {
-      continue;
+  if (hasActiveRelationMode()) {
+    for (const edge of props.graph.edges) {
+      const tagPoint = tagPositions.get(edge.tagId);
+      const logPoint = logPositions.get(edge.logId);
+      const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
+      if (!tagPoint || !logPoint || !logEntry) {
+        continue;
+      }
+      const relation = relationFlowState(edge.tagId, logEntry);
+      if (!relation.visible) {
+        continue;
+      }
+      const tagMeta = props.graph.tags.find((item) => item.id === edge.tagId);
+      const tagColor = tagMeta ? hexToRgb(tagMeta.color) : { r: 0.38, g: 0.84, b: 1 };
+      const color = [
+        Math.min(1, tagColor.r + 0.18),
+        Math.min(1, tagColor.g + 0.28),
+        Math.min(1, tagColor.b + 0.28),
+        relation.selected ? 0.62 : 0.44
+      ];
+      pushLineInstance(
+        lineRows,
+        tagPoint3D(edge.tagId, tagPoint),
+        logPoint3D(logEntry, logPoint),
+        color,
+        relation.selected ? 4.8 : 3.4,
+        relation.selected ? 1 : 0.74,
+        seeded(edge.tagId * 31 + edge.logId)
+      );
     }
-    const selected = props.selectedLogId === edge.logId;
-    const highlighted = selected || isLogHighlighted(logEntry);
-    const tagMeta = props.graph.tags.find((item) => item.id === edge.tagId);
-    const tagColor = tagMeta ? hexToRgb(tagMeta.color) : { r: 0.38, g: 0.84, b: 1 };
-    const color = highlighted
-      ? [Math.min(1, tagColor.r + 0.18), Math.min(1, tagColor.g + 0.28), Math.min(1, tagColor.b + 0.28), 0.8]
-      : [tagColor.r * 0.7, tagColor.g * 0.82, Math.min(1, tagColor.b + 0.18), 0.2];
-    pushLineInstance(
-      lineRows,
-      tagPoint3D(edge.tagId, tagPoint),
-      logPoint3D(logEntry, logPoint),
-      color,
-      highlighted ? 3.4 : 1.25,
-      highlighted ? 1 : 0.18,
-      seeded(edge.tagId * 31 + edge.logId)
-    );
   }
   lineCount = lineRows.length / 16;
   writeDynamicBuffer('line', new Float32Array(lineRows), 64);
@@ -664,8 +696,9 @@ function animateCamera() {
   }
   const ease = 0.12;
   transform.scale += (cameraTarget.scale - transform.scale) * ease;
-  transform.x += (cameraTarget.x - transform.x) * ease;
-  transform.y += (cameraTarget.y - transform.y) * ease;
+  camera.panX += (cameraTarget.panX - camera.panX) * ease;
+  camera.panY += (cameraTarget.panY - camera.panY) * ease;
+  camera.panZ += (cameraTarget.panZ - camera.panZ) * ease;
   if (cameraTarget.yaw !== undefined) {
     camera.yaw += (cameraTarget.yaw - camera.yaw) * ease;
   }
@@ -674,14 +707,16 @@ function animateCamera() {
   }
   if (
     Math.abs(transform.scale - cameraTarget.scale) < 0.002 &&
-    Math.abs(transform.x - cameraTarget.x) < 0.5 &&
-    Math.abs(transform.y - cameraTarget.y) < 0.5 &&
+    Math.abs(camera.panX - cameraTarget.panX) < 0.5 &&
+    Math.abs(camera.panY - cameraTarget.panY) < 0.5 &&
+    Math.abs(camera.panZ - cameraTarget.panZ) < 0.5 &&
     (cameraTarget.yaw === undefined || Math.abs(camera.yaw - cameraTarget.yaw) < 0.003) &&
     (cameraTarget.pitch === undefined || Math.abs(camera.pitch - cameraTarget.pitch) < 0.003)
   ) {
     transform.scale = cameraTarget.scale;
-    transform.x = cameraTarget.x;
-    transform.y = cameraTarget.y;
+    camera.panX = cameraTarget.panX;
+    camera.panY = cameraTarget.panY;
+    camera.panZ = cameraTarget.panZ;
     if (cameraTarget.yaw !== undefined) {
       camera.yaw = cameraTarget.yaw;
     }
@@ -731,17 +766,65 @@ function isLogHighlighted(log: LogEntry) {
   return [...props.activeTagIds].every((id) => log.tags.some((tag) => tag.id === id));
 }
 
+function isLogVisible(log: LogEntry) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags = tagModeActive && isLogHighlighted(log);
+  const visibleBySelectedLog = logModeActive && props.selectedLogId === log.id;
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function isTagVisible(tagId: number) {
+  const tagModeActive = props.activeTagIds.size > 0;
+  const logModeActive = props.selectedLogId !== null;
+  if (!tagModeActive && !logModeActive) {
+    return true;
+  }
+  const visibleByTags =
+    tagModeActive &&
+    (props.activeTagIds.has(tagId) ||
+      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((tag) => tag.id === tagId)));
+  const visibleBySelectedLog = logModeActive && isTagRelatedToSelectedLog(tagId);
+  return visibleByTags || visibleBySelectedLog;
+}
+
+function hasActiveRelationMode() {
+  return props.activeTagIds.size > 0 || props.selectedLogId !== null;
+}
+
+function isTagRelatedToSelectedLog(tagId: number) {
+  const selectedLog = props.graph.logs.find((log) => log.id === props.selectedLogId);
+  return Boolean(selectedLog?.tags.some((tag) => tag.id === tagId));
+}
+
+function relationFlowState(tagId: number, log: LogEntry) {
+  const selected = props.selectedLogId === log.id;
+  const active = props.activeTagIds.has(tagId) && isLogHighlighted(log);
+  return { visible: (selected && isLogVisible(log) && isTagVisible(tagId)) || active, selected };
+}
+
 function onPointerDown(event: PointerEvent) {
+  event.preventDefault();
+  updateNebulaCursor(event);
   cameraTarget = null;
   isDragging = true;
-  dragMode = 'orbit';
+  dragMode = event.button === 1 ? 'pan' : 'orbit';
+  if (dragMode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   dragTagId = null;
   dragLogId = null;
   dragWorldZ = 0;
   moved = false;
+  dragButton = event.button;
+  dragSnapshot = null;
   lastPointer = { x: event.clientX, y: event.clientY };
   const picked = pickNodeAt(event.offsetX, event.offsetY);
-  if (picked?.kind === 'tag') {
+  if (event.button === 0 && picked?.kind === 'tag') {
+    dragSnapshot = captureManualPositions();
     const current = tagPositions.get(picked.id);
     dragWorldZ = tagDepth(picked.id);
     const point = screenToWorldAtDepth(event.offsetX, event.offsetY, dragWorldZ);
@@ -751,7 +834,8 @@ function onPointerDown(event: PointerEvent) {
       x: (current?.x ?? point.x) - point.x,
       y: (current?.y ?? point.y) - point.y
     };
-  } else if (picked?.kind === 'log') {
+  } else if (event.button === 0 && picked?.kind === 'log') {
+    dragSnapshot = captureManualPositions();
     const current = logPositions.get(picked.id);
     const log = props.graph.logs.find((item) => item.id === picked.id);
     dragWorldZ = log && current ? logPoint3D(log, current).z : 0;
@@ -767,6 +851,7 @@ function onPointerDown(event: PointerEvent) {
 }
 
 function onPointerMove(event: PointerEvent) {
+  updateNebulaCursor(event);
   if (!isDragging) {
     return;
   }
@@ -799,9 +884,9 @@ function onPointerMove(event: PointerEvent) {
       current.x = next.x;
       current.y = next.y;
     }
-  } else if (event.shiftKey) {
-    transform.x += dx;
-    transform.y += dy;
+  } else if (dragMode === 'pan') {
+    lastPanInteractionAt = performance.now();
+    panCameraByScreenDelta(dx, dy);
   } else {
     camera.yaw += dx * 0.004;
     camera.pitch = clamp(camera.pitch + dy * 0.003, -0.82, 0.58);
@@ -811,18 +896,25 @@ function onPointerMove(event: PointerEvent) {
 }
 
 function onPointerUp(event: PointerEvent) {
+  updateNebulaCursor(event);
   canvas.value?.releasePointerCapture(event.pointerId);
   isDragging = false;
   const mode = dragMode;
   const tagId = dragTagId;
   const logId = dragLogId;
+  const button = dragButton;
   dragMode = null;
   dragTagId = null;
   dragLogId = null;
   dragWorldZ = 0;
+  dragButton = 0;
+  if (mode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
   if (mode === 'tag' && tagId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -831,7 +923,8 @@ function onPointerUp(event: PointerEvent) {
   }
   if (mode === 'log' && logId !== null) {
     if (moved) {
-      saveManualPositions();
+      pushLayoutHistory(dragSnapshot);
+      emit('layoutDirty', true);
       requestLayout();
       return;
     }
@@ -841,8 +934,17 @@ function onPointerUp(event: PointerEvent) {
   if (moved) {
     return;
   }
+  if (button !== 0 && button !== 2) {
+    return;
+  }
   const picked = pickNodeAt(event.offsetX, event.offsetY);
   if (!picked) {
+    return;
+  }
+  if (button === 2) {
+    if (picked.kind === 'log') {
+      inspectLogAt(picked.id, event);
+    }
     return;
   }
   if (picked.kind === 'tag') {
@@ -854,14 +956,61 @@ function onPointerUp(event: PointerEvent) {
 
 function onWheel(event: WheelEvent) {
   event.preventDefault();
+  if (isDragging || performance.now() - lastPanInteractionAt < 220) {
+    return;
+  }
   cameraTarget = null;
   const zoom = event.deltaY < 0 ? 1.08 : 0.92;
   const before = screenToWorld(event.offsetX, event.offsetY);
   transform.scale = Math.min(2.55, Math.max(0.42, transform.scale * zoom));
-  const after = worldToScreen(before.x, before.y);
-  transform.x += event.offsetX - after.x;
-  transform.y += event.offsetY - after.y;
+  const after = screenToWorld(event.offsetX, event.offsetY);
+  camera.panX += before.x - after.x;
+  camera.panY += before.y - after.y;
   updateLabels();
+}
+
+function panCameraByScreenDelta(dx: number, dy: number) {
+  const delta = cameraPanDeltaForScreenShift(dx, dy, transform.scale, VIEW_DISTANCE);
+  camera.panX += delta.x;
+  camera.panY += delta.y;
+  camera.panZ += delta.z;
+}
+
+function cameraPanDeltaForScreenShift(dx: number, dy: number, scale: number, depth = VIEW_DISTANCE) {
+  const worldPerPixel = Math.max(170, depth) / (Math.max(0.001, scale) * FOCAL_LENGTH);
+  const right = inverseRotateWorld({ x: 1, y: 0, z: 0 });
+  const up = inverseRotateWorld({ x: 0, y: 1, z: 0 });
+  return {
+    x: (-dx * right.x - dy * up.x) * worldPerPixel,
+    y: (-dx * right.y - dy * up.y) * worldPerPixel,
+    z: (-dx * right.z - dy * up.z) * worldPerPixel
+  };
+}
+
+function updateNebulaCursor(event: PointerEvent) {
+  const dx = event.offsetX - nebulaCursor.x;
+  const dy = event.offsetY - nebulaCursor.y;
+  if (Math.abs(dx) + Math.abs(dy) > 1) {
+    nebulaCursor.angle = Math.atan2(dy, dx);
+  }
+  nebulaCursor.x = event.offsetX;
+  nebulaCursor.y = event.offsetY;
+  nebulaCursor.visible = true;
+}
+
+function hideNebulaCursor() {
+  nebulaCursor.visible = false;
+}
+
+function inspectLogAt(logId: number, event: PointerEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('logInspect', {
+    logId,
+    x: event.offsetX,
+    y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
 }
 
 async function toggleFullscreen() {
@@ -893,6 +1042,36 @@ function focusTag(tagId: number) {
   centerTag(tagId);
 }
 
+function focusLog(logId: number) {
+  if (!canvas.value) {
+    return null;
+  }
+  const point = logPositions.get(logId);
+  const log = props.graph.logs.find((item) => item.id === logId);
+  if (!point || !log) {
+    requestLayout();
+    return null;
+  }
+  const rect = canvas.value.getBoundingClientRect();
+  const nextScale = Math.max(transform.scale, 1.2);
+  const world = logPoint3D(log, point);
+  const base = projectWorldToScreen(world, nextScale);
+  const delta = cameraPanDeltaForScreenShift(rect.width / 2 - base.x, rect.height / 2 - base.y, nextScale, base.depth);
+  cameraTarget = null;
+  transform.scale = nextScale;
+  camera.panX += delta.x;
+  camera.panY += delta.y;
+  camera.panZ += delta.z;
+  updateLabels();
+  return {
+    logId,
+    x: rect.width / 2,
+    y: rect.height / 2,
+    width: rect.width,
+    height: rect.height
+  };
+}
+
 function centerTag(tagId: number) {
   if (!canvas.value) {
     return;
@@ -903,11 +1082,14 @@ function centerTag(tagId: number) {
   }
   const rect = canvas.value.getBoundingClientRect();
   const nextScale = Math.max(transform.scale, 1.18);
-  const base = projectWorldToScreen(tagPoint3D(tagId, point), nextScale, 0, 0);
+  const world = tagPoint3D(tagId, point);
+  const base = projectWorldToScreen(world, nextScale);
+  const delta = cameraPanDeltaForScreenShift(rect.width / 2 - base.x, rect.height / 2 - base.y, nextScale, base.depth);
   cameraTarget = {
     scale: nextScale,
-    x: rect.width / 2 - base.x,
-    y: rect.height / 2 - base.y
+    panX: camera.panX + delta.x,
+    panY: camera.panY + delta.y,
+    panZ: camera.panZ + delta.z
   };
 }
 
@@ -930,17 +1112,20 @@ function updateLabels() {
     if (!point) {
       continue;
     }
+    if (!isTagVisible(tag.id)) {
+      continue;
+    }
     const screen = projectWorldToScreen(tagPoint3D(tag.id, point));
     const heat = heatMode.value ? heatState(tag.id) : 'flat';
     const active = props.activeTagIds.has(tag.id);
-    const radius = Math.max(active ? 38 : 28, point.r * transform.scale * screen.perspective * (active ? 2.85 : 2.18));
+    const radius = Math.max(active ? 32 : 24, point.r * transform.scale * screen.perspective * (active ? 2.1 : 1.72));
     if (screen.x > -140 && screen.x < rect.width + 140 && screen.y > -140 && screen.y < rect.height + 140) {
       pickNodes.push({ kind: 'tag', id: tag.id, x: screen.x, y: screen.y, r: radius });
       nextLabels.push({
         id: tag.id,
         name: tag.name,
         x: screen.x,
-        y: screen.y + radius + 13,
+        y: screen.y + radius + 15,
         color: heatMode.value ? rgbToCss(heatColor(tag.color, heat)) : tag.color,
         active,
         heat
@@ -953,12 +1138,15 @@ function updateLabels() {
     if (!point) {
       continue;
     }
+    if (!isLogVisible(log)) {
+      continue;
+    }
     const screen = projectWorldToScreen(logPoint3D(log, point));
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
-    const radius = Math.max(11, (highlighted || selected ? 14 : 10) * transform.scale * screen.perspective);
+    const radius = Math.max(12, (highlighted || selected ? 11 : 8) * transform.scale * screen.perspective);
     if (screen.x > -90 && screen.x < rect.width + 90 && screen.y > -90 && screen.y < rect.height + 90) {
-      pickNodes.push({ kind: 'log', id: log.id, x: screen.x, y: screen.y, r: radius + 7 });
+      pickNodes.push({ kind: 'log', id: log.id, x: screen.x, y: screen.y, r: radius + 6 });
     }
   }
 
@@ -976,6 +1164,8 @@ function logPositionStorageKey() {
 function loadManualPositions() {
   manualTagPositions.clear();
   manualLogPositions.clear();
+  layoutHistory.length = 0;
+  redoHistory.length = 0;
   loadManualPointMap(tagPositionStorageKey(), new Set(props.graph.tags.map((tag) => tag.id)), manualTagPositions);
   loadManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
@@ -1007,6 +1197,77 @@ function saveManualPositions() {
   saveManualPointMap(logPositionStorageKey(), new Set(props.graph.logs.map((log) => log.id)), manualLogPositions);
 }
 
+function saveLayout() {
+  if (manualTagPositions.size === 0 && manualLogPositions.size === 0) {
+    return false;
+  }
+  saveManualPositions();
+  emit('layoutDirty', false);
+  return true;
+}
+
+function undoLayout() {
+  const snapshot = layoutHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushRedoHistory(captureManualPositions());
+  restoreManualPositions(snapshot);
+  requestLayout();
+  updateLabels();
+  return true;
+}
+
+function redoLayout() {
+  const snapshot = redoHistory.pop();
+  if (!snapshot) {
+    return false;
+  }
+  pushLayoutHistory(captureManualPositions(), false);
+  restoreManualPositions(snapshot);
+  requestLayout();
+  updateLabels();
+  return true;
+}
+
+function captureManualPositions(): LayoutSnapshot {
+  return {
+    tags: [...manualTagPositions.entries()].map(([id, point]) => [id, { ...point }]),
+    logs: [...manualLogPositions.entries()].map(([id, point]) => [id, { ...point }])
+  };
+}
+
+function restoreManualPositions(snapshot: LayoutSnapshot) {
+  manualTagPositions.clear();
+  manualLogPositions.clear();
+  for (const [id, point] of snapshot.tags) {
+    manualTagPositions.set(id, { ...point });
+  }
+  for (const [id, point] of snapshot.logs) {
+    manualLogPositions.set(id, { ...point });
+  }
+}
+
+function pushLayoutHistory(snapshot: LayoutSnapshot | null, clearRedo = true) {
+  if (!snapshot) {
+    return;
+  }
+  layoutHistory.push(snapshot);
+  if (layoutHistory.length > 30) {
+    layoutHistory.shift();
+  }
+  if (clearRedo) {
+    redoHistory.length = 0;
+  }
+}
+
+function pushRedoHistory(snapshot: LayoutSnapshot) {
+  redoHistory.push(snapshot);
+  if (redoHistory.length > 30) {
+    redoHistory.shift();
+  }
+}
+
 function saveManualPointMap(
   key: string,
   validIds: Set<number>,
@@ -1017,11 +1278,19 @@ function saveManualPointMap(
 }
 
 function resetTagLayout() {
+  pushLayoutHistory(captureManualPositions());
   manualTagPositions.clear();
   manualLogPositions.clear();
   window.localStorage.removeItem(tagPositionStorageKey());
   window.localStorage.removeItem(logPositionStorageKey());
+  emit('layoutDirty', false);
   requestLayout();
+}
+
+function refreshLayout() {
+  cameraTarget = null;
+  requestLayout();
+  updateLabels();
 }
 
 function worldToScreen(x: number, y: number) {
@@ -1033,39 +1302,57 @@ function screenToWorld(x: number, y: number) {
 }
 
 function screenToWorldAtDepth(x: number, y: number, worldZ: number) {
+  return screenToWorldAtDepthWithCamera(x, y, worldZ, transform.scale, camera.panX, camera.panY, camera.panZ);
+}
+
+function screenToWorldAtDepthWithCamera(
+  x: number,
+  y: number,
+  worldZ: number,
+  scaleValue: number,
+  panX: number,
+  panY: number,
+  panZ: number
+) {
   if (!canvas.value) {
     return { x: 0, y: 0 };
   }
   const rect = canvas.value.getBoundingClientRect();
-  const scale = Math.max(0.001, transform.scale);
-  const rayX = (x - rect.width / 2 - transform.x) / (scale * FOCAL_LENGTH);
-  const rayY = (y - rect.height / 2 - transform.y) / (scale * FOCAL_LENGTH);
+  const scale = Math.max(0.001, scaleValue);
+  const rayX = (x - rect.width / 2) / (scale * FOCAL_LENGTH);
+  const rayY = (y - rect.height / 2) / (scale * FOCAL_LENGTH);
   const worldAtDepth0 = inverseRotateWorld({ x: 0, y: 0, z: -VIEW_DISTANCE });
   const worldAtDepth1 = inverseRotateWorld({ x: rayX, y: rayY, z: 1 - VIEW_DISTANCE });
   const depthDelta = worldAtDepth1.z - worldAtDepth0.z;
   if (Math.abs(depthDelta) < 0.0001) {
-    return { x: worldAtDepth0.x, y: worldAtDepth0.y };
+    return { x: worldAtDepth0.x + panX, y: worldAtDepth0.y + panY };
   }
-  const depth = Math.max(170, (worldZ - worldAtDepth0.z) / depthDelta);
+  const depth = Math.max(170, (worldZ - panZ - worldAtDepth0.z) / depthDelta);
   const world = inverseRotateWorld({
     x: rayX * depth,
     y: rayY * depth,
     z: depth - VIEW_DISTANCE
   });
-  return { x: world.x, y: world.y };
+  return { x: world.x + panX, y: world.y + panY };
 }
 
-function projectWorldToScreen(point: Point3D, scale = transform.scale, panX = transform.x, panY = transform.y) {
+function projectWorldToScreen(
+  point: Point3D,
+  scale = transform.scale,
+  panX = camera.panX,
+  panY = camera.panY,
+  panZ = camera.panZ
+) {
   if (!canvas.value) {
     return { x: 0, y: 0, perspective: 1, depth: VIEW_DISTANCE };
   }
   const rect = canvas.value.getBoundingClientRect();
-  const rotated = rotateWorld(point);
+  const rotated = rotateWorld({ x: point.x - panX, y: point.y - panY, z: point.z - panZ });
   const depth = Math.max(170, VIEW_DISTANCE + rotated.z);
   const perspective = FOCAL_LENGTH / depth;
   return {
-    x: rect.width / 2 + panX + rotated.x * scale * perspective,
-    y: rect.height / 2 + panY + rotated.y * scale * perspective,
+    x: rect.width / 2 + rotated.x * scale * perspective,
+    y: rect.height / 2 + rotated.y * scale * perspective,
     perspective,
     depth
   };
@@ -1306,7 +1593,8 @@ fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 fn fs(input: VertexOut) -> @location(0) vec4f {
   let time = u.viewport.w;
   let aspect = max(0.4, u.viewport.x / max(1.0, u.viewport.y));
-  let screen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0);
+  let viewPan = vec2f(u.camera.x, -u.camera.y) / max(1.0, u.space.y) * 0.72;
+  let screen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0) + viewPan;
   let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
   let dir = rotateSky(viewDir);
   let lon = atan2(dir.x, dir.z);
@@ -1363,11 +1651,11 @@ fn rotateWorld(point: vec3f) -> vec3f {
 }
 
 fn projectWorld(point: vec3f) -> Projected {
-  let rotated = rotateWorld(point);
+  let rotated = rotateWorld(point - vec3f(u.camera.x, u.camera.y, u.extra.x));
   let depth = max(170.0, u.space.y + rotated.z);
   let perspective = u.space.x / depth;
   let center = u.viewport.xy * 0.5;
-  let screen = center + u.camera.xy + rotated.xy * u.viewport.z * perspective;
+  let screen = center + rotated.xy * u.viewport.z * perspective;
   return Projected(screen, perspective, depth);
 }
 `;
@@ -1562,26 +1850,40 @@ fn vs(input: LineIn, @builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
-  let wave = fract(input.along * 3.4 - input.time * (0.58 + input.state * 0.32) + input.seed);
-  let flow = smoothstep(0.70, 0.9, wave) * (1.0 - smoothstep(0.9, 1.0, wave));
-  let core = 1.0 - smoothstep(0.2, 1.0, input.side);
-  let alpha = min(1.0, input.color.a * (0.46 + core * 0.42) + flow * (0.1 + input.state * 0.55));
-  let color = input.color.rgb + vec3f(0.32, 0.5, 0.62) * flow * (0.34 + input.state);
-  return vec4f(color, alpha);
+  let fade = smoothstep(0.02, 0.18, input.along) * (1.0 - smoothstep(0.82, 0.98, input.along));
+  let wave = fract(input.along * (5.2 + input.state * 1.4) - input.time * (0.42 + input.state * 0.34) + input.seed);
+  let bead = smoothstep(0.72, 0.88, wave) * (1.0 - smoothstep(0.88, 1.0, wave));
+  let core = 1.0 - smoothstep(0.06, 0.7, input.side);
+  let mist = (1.0 - smoothstep(0.18, 1.0, input.side)) * 0.13;
+  let alpha = fade * input.color.a * (mist + bead * core * (0.9 + input.state * 0.56));
+  if (alpha < 0.008) {
+    discard;
+  }
+  let color = input.color.rgb + vec3f(0.34, 0.52, 0.68) * bead * (0.28 + input.state * 0.42);
+  return vec4f(color, min(1.0, alpha));
 }
 `;
 </script>
 
 <template>
-  <div ref="wrap" class="canvas-wrap webgpu-wrap" :class="{ fullscreen }">
+  <div ref="wrap" class="canvas-wrap webgpu-wrap nebula-interactive-surface" :class="{ fullscreen }">
     <canvas
       ref="canvas"
       class="nebula-canvas webgpu-canvas"
+      @pointerenter="updateNebulaCursor"
+      @pointerleave="hideNebulaCursor"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
       @pointerup="onPointerUp"
+      @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
+    <div
+      class="nebula-star-cursor"
+      :class="{ visible: nebulaCursor.visible }"
+      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px) rotate(${nebulaCursor.angle}rad)` }"
+    ></div>
+    <slot name="overlay"></slot>
 
     <div class="webgpu-label-layer">
       <button
@@ -1590,7 +1892,7 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
         class="webgpu-label"
         :class="{ active: label.active, up: label.heat === 'up', down: label.heat === 'down' }"
         :style="{ left: `${label.x}px`, top: `${label.y}px`, '--label-color': label.color }"
-        @click="emit('tagToggle', label.id)"
+        @click.stop="emit('tagToggle', label.id)"
       >
         {{ label.name }}
       </button>
@@ -1612,6 +1914,6 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
     <button class="webgpu-heat-toggle" :class="{ active: heatMode }" type="button" @click="heatMode = !heatMode">
       热力
     </button>
-    <div class="webgpu-hud">WebGPU 3D 星系 · Shader 星云 · GPU 恒星/行星 · 空间能量线 · 拖拽旋转 · Shift 拖拽平移</div>
+    <div class="webgpu-hud">WebGPU 3D 星系 · Shader 星云 · GPU 恒星/行星 · 空间能量线 · 左/右键旋转 · 中键平移</div>
   </div>
 </template>

@@ -22,6 +22,7 @@ import {
   listTags,
   normalizeTagNames,
   updateLog,
+  updateMap,
   updateTag,
   verifyUserCredentials
 } from './db.js';
@@ -116,6 +117,23 @@ app.post('/api/maps', (req, res, next) => {
       return;
     }
     res.status(201).json(createMap(name, String(req.body.description ?? ''), req.user.id));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch('/api/maps/:id', (req, res, next) => {
+  const mapId = Number(req.params.id);
+  try {
+    const updated = updateMap(mapId, req.user.id, {
+      name: req.body.name,
+      description: req.body.description
+    });
+    if (!updated) {
+      res.status(404).json({ message: '星云图不存在' });
+      return;
+    }
+    res.json(updated);
   } catch (error) {
     next(error);
   }

@@ -64,6 +64,7 @@ export interface TagSuggestion {
   score: number;
   reason: string;
   existing: boolean;
+  source?: 'deepseek' | 'local';
 }
 
 export interface Insight {

@@ -55,6 +55,13 @@ export function createMap(name: string, description = '') {
   });
 }
 
+export function updateMap(id: number, payload: { name: string; description?: string }) {
+  return request<NebulaMap>(`/maps/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload)
+  });
+}
+
 export function getGraph(mapId: number) {
   return request<GraphData>(`/maps/${mapId}/graph`);
 }
