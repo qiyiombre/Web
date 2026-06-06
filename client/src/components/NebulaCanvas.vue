@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import type { GraphData, LogEntry } from '../types/domain';
+import type { GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
 
 type PickNode =
   | { kind: 'tag'; id: number; x: number; y: number; r: number }
@@ -18,14 +18,28 @@ interface LayoutResponse {
   logPositions: Array<{ id: number; x: number; y: number; r: number }>;
 }
 
+type DrawState = {
+  logsById: Map<number, LogEntry>;
+  tagsById: Map<number, TagNode>;
+  selectedLogId: number | null;
+  activeRelationMode: boolean;
+  highlightedLogIds: Set<number>;
+  visibleLogIds: Set<number>;
+  visibleTagIds: Set<number>;
+  selectedLogTagIds: Set<number>;
+  relatedTagIds: Set<number>;
+};
+
 const props = defineProps<{
   graph: GraphData;
+  layoutMode: LayoutMode;
   activeTagIds: Set<number>;
   selectedLogId: number | null;
 }>();
 
 const emit = defineEmits<{
   tagToggle: [tagId: number];
+  tagContext: [payload: { tagId: number; x: number; y: number; width: number; height: number }];
   logOpen: [logId: number];
   logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
   layoutDirty: [dirty: boolean];
@@ -43,6 +57,9 @@ const layoutBusy = ref(false);
 let ctx: CanvasRenderingContext2D | null = null;
 let frame = 0;
 let raf = 0;
+let cursorRaf = 0;
+let pendingCursor: { x: number; y: number } | null = null;
+let lastDrawAt = 0;
 let isDragging = false;
 let dragMode: 'pan' | 'tag' | 'log' | null = null;
 let dragTagId: number | null = null;
@@ -101,11 +118,12 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resize);
   cancelAnimationFrame(raf);
+  cancelAnimationFrame(cursorRaf);
   layoutWorker.terminate();
 });
 
 watch(
-  () => props.graph.map.id,
+  () => [props.graph.map.id, props.layoutMode],
   () => {
     loadManualPositions();
     requestLayout();
@@ -114,7 +132,7 @@ watch(
 );
 
 watch(
-  () => [props.graph.tags, props.graph.logs, props.graph.tagSimilarities],
+  () => [props.graph.tags, props.graph.logs, props.graph.tagSimilarities, props.graph.tagGroups, props.layoutMode],
   () => requestLayout(),
   { deep: true }
 );
@@ -156,9 +174,13 @@ function resize() {
   draw();
 }
 
-function animate() {
-  frame += 1;
-  draw();
+function animate(timestamp = 0) {
+  const targetFrameMs = hasActiveRelationMode() && !isDragging ? 33 : 16;
+  if (lastDrawAt === 0 || timestamp - lastDrawAt >= targetFrameMs) {
+    frame += 1;
+    draw();
+    lastDrawAt = timestamp;
+  }
   raf = requestAnimationFrame(animate);
 }
 
@@ -178,6 +200,8 @@ function requestLayout() {
       tags: log.tags.map((tag) => ({ id: tag.id, name: tag.name, color: tag.color }))
     })),
     similarities: (props.graph.tagSimilarities ?? []).map((item) => ({ ...item })),
+    tagGroups: (props.graph.tagGroups ?? []).map((group) => ({ ...group, tagIds: [...group.tagIds] })),
+    layoutMode: props.layoutMode,
     manualTagPositions: [...manualTagPositions.entries()].map(([id, point]) => ({ id, x: point.x, y: point.y })),
     manualLogPositions: [...manualLogPositions.entries()].map(([id, point]) => ({ id, x: point.x, y: point.y }))
   });
@@ -188,6 +212,7 @@ function draw() {
     return;
   }
   const rect = canvas.value.getBoundingClientRect();
+  const state = buildDrawState();
   ctx.clearRect(0, 0, rect.width, rect.height);
   drawBackground(rect.width, rect.height);
   pickNodes.length = 0;
@@ -196,12 +221,89 @@ function draw() {
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.scale, transform.scale);
 
-  drawRelationFlows();
-  drawLogs();
-  drawTags();
+  drawRelationFlows(state);
+  drawLogs(state);
+  drawTags(state);
 
   ctx.restore();
   drawHud(rect.width, rect.height);
+}
+
+function buildDrawState(): DrawState {
+  const logsById = new Map(props.graph.logs.map((log) => [log.id, log]));
+  const tagsById = new Map(props.graph.tags.map((tag) => [tag.id, tag]));
+  const selectedLog = props.selectedLogId === null ? null : logsById.get(props.selectedLogId) ?? null;
+  const selectedLogTagIds = new Set(selectedLog?.tags.map((tag) => tag.id) ?? []);
+  const activeIds = [...props.activeTagIds];
+  const highlightedLogIds = new Set<number>();
+  const visibleLogIds = new Set<number>();
+  const visibleTagIds = new Set<number>();
+  const relatedTagIds = new Set<number>();
+  const activeRelationMode = activeIds.length > 0 || props.selectedLogId !== null;
+
+  for (const log of props.graph.logs) {
+    const tagIds = new Set(log.tags.map((tag) => tag.id));
+    if (activeIds.length > 0 && activeIds.every((id) => tagIds.has(id))) {
+      highlightedLogIds.add(log.id);
+    }
+  }
+
+  if (!activeRelationMode) {
+    for (const log of props.graph.logs) {
+      visibleLogIds.add(log.id);
+    }
+    for (const tag of props.graph.tags) {
+      visibleTagIds.add(tag.id);
+      relatedTagIds.add(tag.id);
+    }
+    return {
+      logsById,
+      tagsById,
+      selectedLogId: props.selectedLogId,
+      activeRelationMode,
+      highlightedLogIds,
+      visibleLogIds,
+      visibleTagIds,
+      selectedLogTagIds,
+      relatedTagIds
+    };
+  }
+
+  for (const tagId of activeIds) {
+    visibleTagIds.add(tagId);
+    relatedTagIds.add(tagId);
+  }
+
+  for (const log of props.graph.logs) {
+    if (!highlightedLogIds.has(log.id)) {
+      continue;
+    }
+    visibleLogIds.add(log.id);
+    for (const tag of log.tags) {
+      visibleTagIds.add(tag.id);
+      relatedTagIds.add(tag.id);
+    }
+  }
+
+  if (selectedLog) {
+    visibleLogIds.add(selectedLog.id);
+    for (const tag of selectedLog.tags) {
+      visibleTagIds.add(tag.id);
+      relatedTagIds.add(tag.id);
+    }
+  }
+
+  return {
+    logsById,
+    tagsById,
+    selectedLogId: props.selectedLogId,
+    activeRelationMode,
+    highlightedLogIds,
+    visibleLogIds,
+    visibleTagIds,
+    selectedLogTagIds,
+    relatedTagIds
+  };
 }
 
 function drawBackground(width: number, height: number) {
@@ -224,11 +326,11 @@ function drawBackground(width: number, height: number) {
   }
 }
 
-function drawRelationFlows() {
+function drawRelationFlows(state: DrawState) {
   if (!ctx) {
     return;
   }
-  if (!hasActiveRelationMode()) {
+  if (!state.activeRelationMode) {
     return;
   }
   ctx.save();
@@ -236,12 +338,12 @@ function drawRelationFlows() {
   for (const edge of props.graph.edges) {
     const tag = tagPositions.get(edge.tagId);
     const log = logPositions.get(edge.logId);
-    const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
-    const tagEntry = props.graph.tags.find((item) => item.id === edge.tagId);
+    const logEntry = state.logsById.get(edge.logId);
+    const tagEntry = state.tagsById.get(edge.tagId);
     if (!tag || !log || !logEntry || !tagEntry) {
       continue;
     }
-    const relation = relationFlowState(edge.tagId, logEntry);
+    const relation = relationFlowState(edge.tagId, logEntry, state);
     if (!relation.visible) {
       continue;
     }
@@ -260,18 +362,19 @@ function drawRelationFlows() {
     ctx.moveTo(tag.x, tag.y);
     ctx.quadraticCurveTo(control.x, control.y, log.x, log.y);
     ctx.strokeStyle = hexToRgba(tagEntry.color, alpha);
-    ctx.lineWidth = (relation.selected ? 9 : 6) / transform.scale;
+    ctx.lineWidth = (relation.selected ? 7 : 4.5) / transform.scale;
     ctx.shadowColor = tagEntry.color;
-    ctx.shadowBlur = (relation.selected ? 18 : 12) / transform.scale;
+    ctx.shadowBlur = (relation.selected ? 9 : 4) / transform.scale;
     ctx.stroke();
 
-    for (let index = 0; index < (relation.selected ? 7 : 4); index += 1) {
-      const t = (frame * 0.012 + phase + index / 7) % 1;
+    const particleCount = relation.selected ? 4 : 2;
+    for (let index = 0; index < particleCount; index += 1) {
+      const t = (frame * 0.018 + phase + index / particleCount) % 1;
       const point = quadraticPoint(tag, control, log, t);
       const pulse = 0.65 + Math.sin((t + phase) * Math.PI * 2) * 0.25;
       ctx.beginPath();
       ctx.fillStyle = hexToRgba(tagEntry.color, (relation.selected ? 0.72 : 0.48) * pulse);
-      ctx.shadowBlur = 14 / transform.scale;
+      ctx.shadowBlur = 3 / transform.scale;
       ctx.arc(point.x, point.y, (1.7 + pulse * 1.4) / transform.scale, 0, Math.PI * 2);
       ctx.fill();
     }
@@ -279,7 +382,7 @@ function drawRelationFlows() {
   ctx.restore();
 }
 
-function drawTags() {
+function drawTags(state: DrawState) {
   if (!ctx) {
     return;
   }
@@ -288,17 +391,13 @@ function drawTags() {
     if (!point) {
       continue;
     }
-    if (!isTagVisible(tag.id)) {
+    if (!state.visibleTagIds.has(tag.id)) {
       continue;
     }
     const active = props.activeTagIds.has(tag.id);
-    const relatedToSelected = isTagRelatedToSelectedLog(tag.id);
-    const related =
-      !hasActiveRelationMode() ||
-      active ||
-      relatedToSelected ||
-      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
-    const glow = active || relatedToSelected ? 24 : related ? 12 : 2;
+    const relatedToSelected = state.selectedLogTagIds.has(tag.id);
+    const related = !state.activeRelationMode || active || relatedToSelected || state.relatedTagIds.has(tag.id);
+    const glow = active || relatedToSelected ? 16 : related ? 7 : 0;
     ctx.save();
     ctx.shadowColor = tag.color;
     ctx.shadowBlur = glow;
@@ -314,7 +413,7 @@ function drawTags() {
     if (active || relatedToSelected) {
       const pulse = 0.5 + 0.5 * Math.sin(frame * 0.045 + tag.id);
       ctx.beginPath();
-      ctx.shadowBlur = 18 / transform.scale;
+      ctx.shadowBlur = 8 / transform.scale;
       ctx.strokeStyle = hexToRgba(tag.color, 0.22 + pulse * 0.18);
       ctx.lineWidth = 2 / transform.scale;
       ctx.arc(point.x, point.y, visualRadius * (1.55 + pulse * 0.25), 0, Math.PI * 2);
@@ -330,7 +429,7 @@ function drawTags() {
   }
 }
 
-function drawLogs() {
+function drawLogs(state: DrawState) {
   if (!ctx) {
     return;
   }
@@ -339,16 +438,15 @@ function drawLogs() {
     if (!point) {
       continue;
     }
-    if (!isLogVisible(log)) {
+    if (!state.visibleLogIds.has(log.id)) {
       continue;
     }
     const selected = props.selectedLogId === log.id;
-    const highlighted = isLogHighlighted(log);
-    const relationMode = hasActiveRelationMode();
-    const muted = props.activeTagIds.size === 0 && relationMode && !selected && !highlighted;
+    const highlighted = state.highlightedLogIds.has(log.id);
+    const muted = props.activeTagIds.size === 0 && state.activeRelationMode && !selected && !highlighted;
     ctx.save();
     ctx.shadowColor = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'transparent';
-    ctx.shadowBlur = selected ? 14 : highlighted ? 8 : 0;
+    ctx.shadowBlur = selected ? 8 : highlighted ? 4 : 0;
     ctx.beginPath();
     ctx.fillStyle = selected ? '#ffffff' : highlighted ? '#9ee7ff' : muted ? 'rgba(151, 165, 182, 0.16)' : 'rgba(151, 165, 182, 0.38)';
     const logRadius = selected ? 6.4 : highlighted ? 5.6 : point.r;
@@ -400,51 +498,19 @@ function drawHud(width: number, height: number) {
   */
 }
 
-function isLogHighlighted(log: LogEntry) {
-  if (props.activeTagIds.size === 0) {
-    return false;
-  }
-  return [...props.activeTagIds].every((id) => log.tags.some((tag) => tag.id === id));
-}
-
-function isLogVisible(log: LogEntry) {
-  const tagModeActive = props.activeTagIds.size > 0;
-  const logModeActive = props.selectedLogId !== null;
-  if (!tagModeActive && !logModeActive) {
-    return true;
-  }
-  const visibleByTags = tagModeActive && isLogHighlighted(log);
-  const visibleBySelectedLog = logModeActive && props.selectedLogId === log.id;
-  return visibleByTags || visibleBySelectedLog;
-}
-
-function isTagVisible(tagId: number) {
-  const tagModeActive = props.activeTagIds.size > 0;
-  const logModeActive = props.selectedLogId !== null;
-  if (!tagModeActive && !logModeActive) {
-    return true;
-  }
-  const visibleByTags =
-    tagModeActive &&
-    (props.activeTagIds.has(tagId) ||
-      props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((tag) => tag.id === tagId)));
-  const visibleBySelectedLog = logModeActive && isTagRelatedToSelectedLog(tagId);
-  return visibleByTags || visibleBySelectedLog;
-}
-
 function hasActiveRelationMode() {
   return props.activeTagIds.size > 0 || props.selectedLogId !== null;
 }
 
-function isTagRelatedToSelectedLog(tagId: number) {
-  const selectedLog = props.graph.logs.find((log) => log.id === props.selectedLogId);
-  return Boolean(selectedLog?.tags.some((tag) => tag.id === tagId));
-}
-
-function relationFlowState(tagId: number, log: LogEntry) {
-  const selected = props.selectedLogId === log.id;
-  const active = props.activeTagIds.has(tagId) && isLogHighlighted(log);
-  return { visible: (selected && isLogVisible(log) && isTagVisible(tagId)) || active, selected };
+function relationFlowState(tagId: number, log: LogEntry, state: DrawState) {
+  const selected = state.selectedLogId === log.id;
+  const active = props.activeTagIds.has(tagId) && state.highlightedLogIds.has(log.id);
+  return {
+    visible:
+      (selected && state.visibleLogIds.has(log.id) && state.visibleTagIds.has(tagId)) ||
+      active,
+    selected
+  };
 }
 
 function quadraticPoint(
@@ -587,6 +653,8 @@ function onPointerUp(event: PointerEvent) {
   if (button === 2) {
     if (picked.kind === 'log') {
       inspectLogAt(picked.id, event);
+    } else {
+      inspectTagAt(picked.id, event);
     }
     return;
   }
@@ -611,14 +679,26 @@ function onWheel(event: WheelEvent) {
 }
 
 function updateNebulaCursor(event: PointerEvent) {
-  const dx = event.offsetX - nebulaCursor.x;
-  const dy = event.offsetY - nebulaCursor.y;
+  pendingCursor = { x: event.offsetX, y: event.offsetY };
+  if (cursorRaf) {
+    return;
+  }
+  cursorRaf = requestAnimationFrame(() => {
+    cursorRaf = 0;
+    if (!pendingCursor) {
+      return;
+    }
+    const next = pendingCursor;
+    pendingCursor = null;
+    const dx = next.x - nebulaCursor.x;
+    const dy = next.y - nebulaCursor.y;
   if (Math.abs(dx) + Math.abs(dy) > 1) {
     nebulaCursor.angle = Math.atan2(dy, dx);
   }
-  nebulaCursor.x = event.offsetX;
-  nebulaCursor.y = event.offsetY;
-  nebulaCursor.visible = true;
+    nebulaCursor.x = next.x;
+    nebulaCursor.y = next.y;
+    nebulaCursor.visible = true;
+  });
 }
 
 function hideNebulaCursor() {
@@ -629,6 +709,17 @@ function inspectLogAt(logId: number, event: PointerEvent) {
   const rect = canvas.value?.getBoundingClientRect();
   emit('logInspect', {
     logId,
+    x: event.offsetX,
+    y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
+}
+
+function inspectTagAt(tagId: number, event: PointerEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('tagContext', {
+    tagId,
     x: event.offsetX,
     y: event.offsetY,
     width: rect?.width ?? window.innerWidth,
@@ -692,11 +783,11 @@ function pickNodeAt(screenX: number, screenY: number) {
 }
 
 function tagPositionStorageKey() {
-  return `nebula.tagPositions.${props.graph.map.id}`;
+  return `nebula.tagPositions.${props.graph.map.id}.${props.layoutMode}`;
 }
 
 function logPositionStorageKey() {
-  return `nebula.logPositions.${props.graph.map.id}`;
+  return `nebula.logPositions.${props.graph.map.id}.${props.layoutMode}`;
 }
 
 function loadManualPositions() {

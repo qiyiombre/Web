@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref } from 'vue';
-import { Check, Edit3, Plus, Search, Trash2, X } from 'lucide-vue-next';
-import { createTag, deleteTag, updateTag } from '../services/api';
-import type { TagNode } from '../types/domain';
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
+import { Check, Edit3, Plus, Search, Sparkles, Trash2, X } from 'lucide-vue-next';
+import { createTag, searchExistingTags, updateTag } from '../services/api';
+import type { TagNode, TagSearchMatch } from '../types/domain';
 
 const props = defineProps<{
   mapId: number;
@@ -12,6 +12,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   changed: [];
   focus: [tagId: number];
+  deleteRequest: [tag: TagNode];
 }>();
 
 const newName = ref('');
@@ -24,16 +25,55 @@ const error = ref('');
 const listRef = ref<HTMLElement | null>(null);
 const locatedId = ref<number | null>(null);
 const searchTerm = ref('');
+const deepSearchEnabled = ref(false);
+const deepSearchBusy = ref(false);
+const deepSearchError = ref('');
+const deepSearchHint = ref('');
+const deepSearchMatches = ref<TagSearchMatch[]>([]);
+const deepSearchQuery = ref('');
 let locatedTimer = 0;
+let deepSearchTimer = 0;
+let deepSearchRequestId = 0;
 
 const normalizedSearch = computed(() => searchTerm.value.trim().toLowerCase());
-const filteredTags = computed(() => {
+const tagSignature = computed(() => props.tags.map((tag) => `${tag.id}:${tag.name}:${tag.count}`).join('|'));
+const localFilteredTags = computed(() => {
   if (!normalizedSearch.value) {
     return props.tags;
   }
   return props.tags.filter((tag) => tag.name.toLowerCase().includes(normalizedSearch.value));
 });
+const deepSearchActive = computed(() => deepSearchEnabled.value && Boolean(normalizedSearch.value));
+const deepSearchReady = computed(() => deepSearchQuery.value === normalizedSearch.value);
+const filteredTags = computed(() => {
+  if (!deepSearchActive.value) {
+    return localFilteredTags.value;
+  }
+  if (!deepSearchReady.value) {
+    return localFilteredTags.value;
+  }
+  const tagsById = new Map(props.tags.map((tag) => [tag.id, tag]));
+  return deepSearchMatches.value.map((match) => tagsById.get(match.id)).filter(Boolean) as TagNode[];
+});
 const countLabel = computed(() => (normalizedSearch.value ? `${filteredTags.value.length}/${props.tags.length}` : String(props.tags.length)));
+const searchStatus = computed(() => {
+  if (!deepSearchEnabled.value) {
+    return '';
+  }
+  if (!normalizedSearch.value) {
+    return 'DeepSeek 模糊搜索已开启';
+  }
+  if (deepSearchBusy.value) {
+    return 'DeepSeek 模糊搜索中...';
+  }
+  if (deepSearchError.value) {
+    return deepSearchError.value;
+  }
+  if (!deepSearchReady.value) {
+    return '';
+  }
+  return deepSearchHint.value || (deepSearchMatches.value.length > 0 ? 'DeepSeek 模糊搜索已完成' : 'DeepSeek 没有找到相近标签');
+});
 
 defineExpose({
   scrollToTag
@@ -41,7 +81,14 @@ defineExpose({
 
 onBeforeUnmount(() => {
   window.clearTimeout(locatedTimer);
+  window.clearTimeout(deepSearchTimer);
 });
+
+watch(
+  () => [normalizedSearch.value, deepSearchEnabled.value, tagSignature.value],
+  () => scheduleDeepSearch(),
+  { immediate: true }
+);
 
 async function addTag() {
   error.value = '';
@@ -94,23 +141,68 @@ async function saveEdit(tag: TagNode) {
   }
 }
 
-async function removeTag(tag: TagNode) {
-  const ok = window.confirm(`确认删除「${tag.name}」吗？已关联多篇日志的标签可能无法删除。`);
-  if (!ok) {
+function removeTag(tag: TagNode) {
+  error.value = '';
+  emit('deleteRequest', tag);
+}
+
+function toggleDeepSearch() {
+  deepSearchEnabled.value = !deepSearchEnabled.value;
+  if (!deepSearchEnabled.value) {
+    window.clearTimeout(deepSearchTimer);
+    deepSearchBusy.value = false;
+    deepSearchError.value = '';
+    deepSearchHint.value = '';
+    deepSearchMatches.value = [];
+    deepSearchQuery.value = '';
     return;
   }
-  error.value = '';
-  busy.value = true;
+  scheduleDeepSearch(0);
+}
+
+function scheduleDeepSearch(delay = 360) {
+  window.clearTimeout(deepSearchTimer);
+  if (!deepSearchEnabled.value || !normalizedSearch.value) {
+    deepSearchBusy.value = false;
+    deepSearchError.value = '';
+    deepSearchHint.value = '';
+    deepSearchMatches.value = [];
+    deepSearchQuery.value = '';
+    return;
+  }
+  deepSearchTimer = window.setTimeout(() => {
+    void runDeepSearch();
+  }, delay);
+}
+
+async function runDeepSearch() {
+  const query = normalizedSearch.value;
+  if (!query) {
+    return;
+  }
+  const requestId = ++deepSearchRequestId;
+  deepSearchBusy.value = true;
+  deepSearchError.value = '';
   try {
-    await deleteTag(tag.id);
-    if (editingId.value === tag.id) {
-      cancelEdit();
+    const result = await searchExistingTags(props.mapId, query);
+    if (requestId !== deepSearchRequestId || query !== normalizedSearch.value) {
+      return;
     }
-    emit('changed');
+    deepSearchMatches.value = result.matches ?? [];
+    deepSearchQuery.value = query;
+    deepSearchHint.value = result.aiMeta?.message ?? 'DeepSeek 模糊搜索已完成';
   } catch (err) {
-    error.value = err instanceof Error ? err.message : '删除标签失败';
+    if (requestId !== deepSearchRequestId) {
+      return;
+    }
+    deepSearchMatches.value = [];
+    deepSearchQuery.value = '';
+    deepSearchHint.value = '';
+    deepSearchError.value = err instanceof Error ? err.message : 'DeepSeek 模糊搜索失败';
   } finally {
-    busy.value = false;
+    if (requestId === deepSearchRequestId) {
+      deepSearchBusy.value = false;
+    }
   }
 }
 
@@ -151,11 +243,21 @@ async function scrollToTag(tagId: number) {
 
     <div class="tag-search-row">
       <Search :size="15" />
+      <button
+        class="icon-button deep-search-toggle"
+        :class="{ active: deepSearchEnabled }"
+        title="DeepSeek 模糊搜索"
+        @click="toggleDeepSearch"
+      >
+        <Sparkles :size="14" />
+      </button>
       <input v-model="searchTerm" type="search" placeholder="搜索标签" @keydown.escape.prevent="searchTerm = ''" />
       <button v-if="searchTerm" class="icon-button" title="清空搜索" @click="searchTerm = ''">
         <X :size="14" />
       </button>
     </div>
+
+    <p v-if="searchStatus" class="tag-search-status" :class="{ error: deepSearchError }">{{ searchStatus }}</p>
 
     <div ref="listRef" class="tag-manage-list">
       <div v-for="tag in filteredTags" :key="tag.id" class="tag-manage-item" :class="{ located: locatedId === tag.id }" :data-tag-id="tag.id">

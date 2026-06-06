@@ -1,3 +1,4 @@
+import './env.js';
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -10,6 +11,43 @@ const dataDir = path.resolve(__dirname, '../../local-data');
 const configuredDbPath = process.env.NEBULA_DB_PATH;
 const dbPath = configuredDbPath ? path.resolve(configuredDbPath) : path.join(dataDir, 'nebula-memory.sqlite');
 const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 7;
+export const DEFAULT_DOMAIN_CATEGORIES = [
+  {
+    name: '学习',
+    color: '#b99cff',
+    keywords: ['学习', '复习', '考试', '课程', '英语', '阅读', '笔记', '刷题', '研究', '课堂']
+  },
+  {
+    name: '技术',
+    color: '#62d6ff',
+    keywords: ['Web', '前端', '后端', '数据库', '算法', '代码', '编程', '数据可视化', 'Canvas', 'API']
+  },
+  {
+    name: '项目',
+    color: '#ffb86b',
+    keywords: ['项目', '作业', '任务', 'ddl', '进度', '需求', '设计', '时间管理']
+  },
+  {
+    name: '健康',
+    color: '#8cf0b4',
+    keywords: ['健康', '运动', '跑步', '健身', '睡眠', '休息', '饮食', '熬夜']
+  },
+  {
+    name: '情绪',
+    color: '#ff8fa3',
+    keywords: ['情绪', '压力', '焦虑', '开心', '低落', '放松', '复盘', '状态']
+  },
+  {
+    name: '生活',
+    color: '#f7d774',
+    keywords: ['生活', '美食', '午饭', '晚饭', '旅行', '摄影', '音乐', '写作', '理财']
+  },
+  {
+    name: '社交',
+    color: '#7dd3fc',
+    keywords: ['社交', '朋友', '同学', '小组', '合作', '家庭', '沟通', '聊天']
+  }
+];
 
 if (!existsSync(dataDir)) {
   mkdirSync(dataDir, { recursive: true });
@@ -80,20 +118,44 @@ export function initializeDatabase() {
     CREATE TABLE IF NOT EXISTS ai_cache (
       cache_key TEXT PRIMARY KEY,
       value_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_used_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS domain_category_state (
+      map_id INTEGER PRIMARY KEY,
+      initialized INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (map_id) REFERENCES nebula_maps(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS domain_categories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      map_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      color TEXT NOT NULL,
+      keywords_json TEXT NOT NULL DEFAULT '[]',
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE (map_id, name),
+      FOREIGN KEY (map_id) REFERENCES nebula_maps(id) ON DELETE CASCADE
     );
   `);
 
   migrateMapsUserColumn();
+  migrateAiCacheLastUsedColumn();
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_nebula_maps_user_id ON nebula_maps(user_id);
     CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_logs_map_id ON logs(map_id);
     CREATE INDEX IF NOT EXISTS idx_tags_map_id ON tags(map_id);
+    CREATE INDEX IF NOT EXISTS idx_domain_categories_map_id ON domain_categories(map_id);
   `);
 
   seedIfEmpty();
   deleteExpiredSessions();
+  deleteStaleAiCache();
 }
 
 function migrateMapsUserColumn() {
@@ -104,6 +166,14 @@ function migrateMapsUserColumn() {
 
   const demo = ensureDemoUser();
   db.prepare('UPDATE nebula_maps SET user_id = ? WHERE user_id IS NULL').run(demo.id);
+}
+
+function migrateAiCacheLastUsedColumn() {
+  const columns = db.prepare('PRAGMA table_info(ai_cache)').all();
+  if (!columns.some((column) => column.name === 'last_used_at')) {
+    db.exec('ALTER TABLE ai_cache ADD COLUMN last_used_at TEXT;');
+    db.prepare('UPDATE ai_cache SET last_used_at = COALESCE(updated_at, datetime(\'now\')) WHERE last_used_at IS NULL OR last_used_at = ""').run();
+  }
 }
 
 function seedIfEmpty() {
@@ -204,6 +274,10 @@ export function deleteSession(token) {
 
 function deleteExpiredSessions() {
   db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
+}
+
+function deleteStaleAiCache() {
+  db.prepare("DELETE FROM ai_cache WHERE datetime(COALESCE(last_used_at, updated_at)) < datetime('now', '-30 days')").run();
 }
 
 function getUserById(id) {
@@ -349,6 +423,102 @@ export function listTags(mapId) {
     .all(mapId);
 }
 
+export function listDomainCategories(mapId) {
+  ensureDomainCategoriesInitialized(mapId);
+  return db
+    .prepare(
+      `SELECT
+        id,
+        map_id AS mapId,
+        name,
+        color,
+        keywords_json AS keywordsJson,
+        sort_order AS sortOrder
+       FROM domain_categories
+       WHERE map_id = ?
+       ORDER BY sort_order ASC, id ASC`
+    )
+    .all(mapId)
+    .map(parseDomainCategoryRow);
+}
+
+export function getDomainCategoryById(id) {
+  const row = db
+    .prepare(
+      `SELECT
+        id,
+        map_id AS mapId,
+        name,
+        color,
+        keywords_json AS keywordsJson,
+        sort_order AS sortOrder
+       FROM domain_categories
+       WHERE id = ?`
+    )
+    .get(id);
+  return row ? parseDomainCategoryRow(row) : null;
+}
+
+export function createDomainCategory({ mapId, name, color, keywords }) {
+  ensureDomainCategoriesInitialized(mapId);
+  const cleanName = normalizeDomainCategoryName(name);
+  const cleanColor = normalizeColor(color) ?? colorForTag(cleanName);
+  const cleanKeywords = normalizeKeywords(keywords);
+  if (!cleanName) {
+    throw new Error('领域大类名称不能为空');
+  }
+  const duplicate = db.prepare('SELECT id FROM domain_categories WHERE map_id = ? AND name = ?').get(mapId, cleanName);
+  if (duplicate) {
+    throw new Error('同一星云图下已有这个领域大类');
+  }
+  const nextOrder =
+    Number(db.prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 AS nextOrder FROM domain_categories WHERE map_id = ?').get(mapId).nextOrder) || 0;
+  const result = db
+    .prepare(
+      `INSERT INTO domain_categories (map_id, name, color, keywords_json, sort_order, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))`
+    )
+    .run(mapId, cleanName, cleanColor, JSON.stringify(cleanKeywords), nextOrder);
+  touchDomainCategoryState(mapId);
+  return getDomainCategoryById(Number(result.lastInsertRowid));
+}
+
+export function updateDomainCategory(id, { name, color, keywords }) {
+  const existing = getDomainCategoryById(id);
+  if (!existing) {
+    return null;
+  }
+  const cleanName = normalizeDomainCategoryName(name);
+  const cleanColor = normalizeColor(color) ?? existing.color;
+  const cleanKeywords = normalizeKeywords(keywords);
+  if (!cleanName) {
+    throw new Error('领域大类名称不能为空');
+  }
+  const duplicate = db
+    .prepare('SELECT id FROM domain_categories WHERE map_id = ? AND name = ? AND id <> ?')
+    .get(existing.mapId, cleanName, id);
+  if (duplicate) {
+    throw new Error('同一星云图下已有这个领域大类');
+  }
+  db.prepare(
+    `UPDATE domain_categories
+     SET name = ?, color = ?, keywords_json = ?, updated_at = datetime('now')
+     WHERE id = ?`
+  ).run(cleanName, cleanColor, JSON.stringify(cleanKeywords), id);
+  touchDomainCategoryState(existing.mapId);
+  return getDomainCategoryById(id);
+}
+
+export function deleteDomainCategory(id) {
+  const existing = getDomainCategoryById(id);
+  if (!existing) {
+    return { deleted: false, reason: 'not-found' };
+  }
+  const result = db.prepare('DELETE FROM domain_categories WHERE id = ?').run(id);
+  touchDomainCategoryState(existing.mapId);
+  return { deleted: result.changes > 0 };
+}
+
 export function getTagById(id) {
   return db
     .prepare(
@@ -437,7 +607,9 @@ export function getAiCache(cacheKey) {
     return null;
   }
   try {
-    return JSON.parse(row.valueJson);
+    const value = JSON.parse(row.valueJson);
+    db.prepare("UPDATE ai_cache SET last_used_at = datetime('now') WHERE cache_key = ?").run(cacheKey);
+    return value;
   } catch {
     db.prepare('DELETE FROM ai_cache WHERE cache_key = ?').run(cacheKey);
     return null;
@@ -446,11 +618,12 @@ export function getAiCache(cacheKey) {
 
 export function setAiCache(cacheKey, value) {
   db.prepare(
-    `INSERT INTO ai_cache (cache_key, value_json, updated_at)
-     VALUES (?, ?, datetime('now'))
+    `INSERT INTO ai_cache (cache_key, value_json, updated_at, last_used_at)
+     VALUES (?, ?, datetime('now'), datetime('now'))
      ON CONFLICT(cache_key) DO UPDATE SET
        value_json = excluded.value_json,
-       updated_at = datetime('now')`
+       updated_at = datetime('now'),
+       last_used_at = datetime('now')`
   ).run(cacheKey, JSON.stringify(value));
 }
 
@@ -488,6 +661,62 @@ export function updateLog(id, { title, content, tagNames }) {
 export function deleteLog(id) {
   const result = db.prepare('DELETE FROM logs WHERE id = ?').run(id);
   return result.changes > 0;
+}
+
+export function restoreLogSnapshot(snapshot) {
+  const logId = Number(snapshot?.id);
+  const mapId = Number(snapshot?.mapId);
+  const title = String(snapshot?.title ?? '').trim();
+  const content = String(snapshot?.content ?? '').trim();
+  const tags = Array.isArray(snapshot?.tags) ? snapshot.tags : [];
+  if (!Number.isFinite(logId) || logId <= 0 || !Number.isFinite(mapId) || mapId <= 0) {
+    throw new Error('日志快照无效');
+  }
+  if (!title) {
+    throw new Error('标题不能为空');
+  }
+  if (!content) {
+    throw new Error('内容不能为空');
+  }
+  if (tags.length === 0) {
+    throw new Error('日志至少需要关联一个标签');
+  }
+
+  const existing = getLogById(logId);
+  if (existing) {
+    if (existing.mapId !== mapId) {
+      throw new Error('日志 ID 已被其他星云图使用');
+    }
+    return existing;
+  }
+
+  const now = currentTimestamp();
+  const createdAt = restoredTimestamp(snapshot?.createdAt, now);
+  const updatedAt = restoredTimestamp(snapshot?.updatedAt, createdAt);
+  db.exec('BEGIN');
+  try {
+    db.prepare('INSERT INTO logs (id, map_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)').run(
+      logId,
+      mapId,
+      title,
+      content,
+      createdAt,
+      updatedAt
+    );
+    const attachedTagIds = new Set();
+    for (const tagSnapshot of tags) {
+      const tag = ensureRestoredTag(mapId, tagSnapshot);
+      if (!attachedTagIds.has(tag.id)) {
+        db.prepare('INSERT OR IGNORE INTO log_tags (log_id, tag_id, weight) VALUES (?, ?, 1)').run(logId, tag.id);
+        attachedTagIds.add(tag.id);
+      }
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  return getLogById(logId);
 }
 
 export function createTag({ mapId, name, color }) {
@@ -549,6 +778,34 @@ export function deleteTag(id) {
   return { deleted: true };
 }
 
+export function restoreTagSnapshot(snapshot) {
+  const mapId = Number(snapshot?.mapId);
+  if (!Number.isFinite(mapId) || mapId <= 0) {
+    throw new Error('标签快照无效');
+  }
+
+  db.exec('BEGIN');
+  try {
+    const tag = ensureRestoredTag(mapId, snapshot);
+    const logIds = Array.isArray(snapshot?.logIds) ? snapshot.logIds : [];
+    for (const rawLogId of logIds) {
+      const logId = Number(rawLogId);
+      if (!Number.isFinite(logId) || logId <= 0) {
+        continue;
+      }
+      const log = getLogById(logId);
+      if (log?.mapId === mapId) {
+        db.prepare('INSERT OR IGNORE INTO log_tags (log_id, tag_id, weight) VALUES (?, ?, 1)').run(logId, tag.id);
+      }
+    }
+    db.exec('COMMIT');
+    return getTagById(tag.id);
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function normalizeTagNames(tagNames) {
   return [...new Set((tagNames ?? []).map(normalizeTagName).filter(Boolean))].slice(0, 12);
 }
@@ -557,9 +814,70 @@ function normalizeTagName(name) {
   return String(name ?? '').trim().replace(/\s+/g, ' ').slice(0, 24);
 }
 
+function normalizeDomainCategoryName(name) {
+  return String(name ?? '').trim().replace(/\s+/g, ' ').slice(0, 12);
+}
+
+function normalizeKeywords(keywords) {
+  const source = Array.isArray(keywords) ? keywords : String(keywords ?? '').split(/[\s,，、]+/);
+  return [...new Set(source.map((keyword) => String(keyword ?? '').trim().replace(/\s+/g, ' ')).filter(Boolean))]
+    .slice(0, 18)
+    .map((keyword) => keyword.slice(0, 18));
+}
+
 function normalizeColor(color) {
   const clean = String(color ?? '').trim();
   return /^#[0-9a-fA-F]{6}$/.test(clean) ? clean : null;
+}
+
+function ensureDomainCategoriesInitialized(mapId) {
+  const state = db.prepare('SELECT initialized FROM domain_category_state WHERE map_id = ?').get(mapId);
+  if (state?.initialized) {
+    return;
+  }
+
+  const existing = db.prepare('SELECT COUNT(*) AS count FROM domain_categories WHERE map_id = ?').get(mapId);
+  if (existing.count === 0) {
+    DEFAULT_DOMAIN_CATEGORIES.forEach((category, index) => {
+      db.prepare(
+        `INSERT OR IGNORE INTO domain_categories (map_id, name, color, keywords_json, sort_order)
+         VALUES (?, ?, ?, ?, ?)`
+      ).run(mapId, category.name, category.color, JSON.stringify(category.keywords), index);
+    });
+  }
+  db.prepare(
+    `INSERT INTO domain_category_state (map_id, initialized, updated_at)
+     VALUES (?, 1, datetime('now'))
+     ON CONFLICT(map_id) DO UPDATE SET initialized = 1, updated_at = datetime('now')`
+  ).run(mapId);
+}
+
+function touchDomainCategoryState(mapId) {
+  db.prepare(
+    `INSERT INTO domain_category_state (map_id, initialized, updated_at)
+     VALUES (?, 1, datetime('now'))
+     ON CONFLICT(map_id) DO UPDATE SET initialized = 1, updated_at = datetime('now')`
+  ).run(mapId);
+}
+
+function parseDomainCategoryRow(row) {
+  return {
+    id: row.id,
+    mapId: row.mapId,
+    name: row.name,
+    color: row.color,
+    keywords: parseKeywordsJson(row.keywordsJson),
+    sortOrder: row.sortOrder
+  };
+}
+
+function parseKeywordsJson(value) {
+  try {
+    const parsed = JSON.parse(value);
+    return normalizeKeywords(parsed);
+  } catch {
+    return [];
+  }
 }
 
 function attachTagsToLog(mapId, logId, tagNames) {
@@ -567,6 +885,46 @@ function attachTagsToLog(mapId, logId, tagNames) {
     const tag = findOrCreateTag(mapId, tagName);
     db.prepare('INSERT OR IGNORE INTO log_tags (log_id, tag_id, weight) VALUES (?, ?, 1)').run(logId, tag.id);
   }
+}
+
+function ensureRestoredTag(mapId, snapshot) {
+  const tagId = Number(snapshot?.id);
+  const cleanName = normalizeTagName(snapshot?.name);
+  const cleanColor = normalizeColor(snapshot?.color) ?? colorForTag(cleanName);
+  if (!cleanName) {
+    throw new Error('标签名称不能为空');
+  }
+
+  if (Number.isFinite(tagId) && tagId > 0) {
+    const existingById = getTagById(tagId);
+    if (existingById) {
+      if (existingById.mapId !== mapId) {
+        throw new Error('标签 ID 已被其他星云图使用');
+      }
+      return existingById;
+    }
+  }
+
+  const duplicate = db.prepare('SELECT id FROM tags WHERE map_id = ? AND name = ?').get(mapId, cleanName);
+  if (duplicate) {
+    return getTagById(duplicate.id);
+  }
+
+  if (Number.isFinite(tagId) && tagId > 0) {
+    db.prepare('INSERT INTO tags (id, map_id, name, color) VALUES (?, ?, ?, ?)').run(tagId, mapId, cleanName, cleanColor);
+    return getTagById(tagId);
+  }
+
+  const result = db.prepare('INSERT INTO tags (map_id, name, color) VALUES (?, ?, ?)').run(mapId, cleanName, cleanColor);
+  return getTagById(Number(result.lastInsertRowid));
+}
+
+function currentTimestamp() {
+  return db.prepare("SELECT datetime('now') AS value").get().value;
+}
+
+function restoredTimestamp(value, fallback) {
+  return String(value ?? '').trim() || fallback;
 }
 
 export function findOrCreateTag(mapId, name) {

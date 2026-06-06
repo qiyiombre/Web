@@ -4,10 +4,24 @@ import { callDeepSeekJson, hasDeepSeekKey } from './deepseek.js';
 export function buildInsights(mapId) {
   const stats = buildInsightStats(mapId);
   const recentLogs = buildRecentLogs(mapId);
+  const cached = getCachedAdvice(mapId, stats, recentLogs);
 
   return {
     ...stats,
-    suggestions: getCachedAdvice(mapId, stats, recentLogs)
+    suggestions: cached,
+    adviceMeta: cached.length > 0
+      ? {
+          feature: 'advice',
+          source: 'cache',
+          attempted: false,
+          message: '行为建议使用 DeepSeek 缓存结果'
+        }
+      : {
+          feature: 'advice',
+          source: 'none',
+          attempted: false,
+          message: '尚未生成 AI 建议'
+        }
   };
 }
 
@@ -19,14 +33,26 @@ export async function generateAdvice(mapId) {
   if (cached.length > 0) {
     return {
       cached: true,
-      suggestions: cached
+      suggestions: cached,
+      aiMeta: {
+        feature: 'advice',
+        source: 'cache',
+        attempted: false,
+        message: '行为建议使用 DeepSeek 缓存结果'
+      }
     };
   }
 
   if (!hasDeepSeekKey()) {
     return {
       cached: false,
-      suggestions: ['未配置 DeepSeek API Key，暂不生成 AI 建议。']
+      suggestions: ['未配置 DeepSeek API Key，暂不生成 AI 建议。'],
+      aiMeta: {
+        feature: 'advice',
+        source: 'local',
+        attempted: false,
+        message: '未配置 DeepSeek Key，无法生成 AI 建议'
+      }
     };
   }
 
@@ -60,13 +86,25 @@ ${JSON.stringify(recentLogs)}`,
 
     return {
       cached: false,
-      suggestions: value.suggestions
+      suggestions: value.suggestions,
+      aiMeta: {
+        feature: 'advice',
+        source: 'deepseek',
+        attempted: true,
+        message: 'DeepSeek 行为建议调用成功'
+      }
     };
   } catch (error) {
     console.warn(`DeepSeek advice unavailable: ${error.message}`);
     return {
       cached: false,
-      suggestions: ['DeepSeek 建议生成失败，请检查 API Key 或网络后重试。']
+      suggestions: ['DeepSeek 建议生成失败，请检查 API Key 或网络后重试。'],
+      aiMeta: {
+        feature: 'advice',
+        source: 'local',
+        attempted: true,
+        message: `DeepSeek 行为建议调用失败：${error.message}`
+      }
     };
   }
 }

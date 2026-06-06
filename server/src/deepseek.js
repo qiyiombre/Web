@@ -1,3 +1,5 @@
+import './env.js';
+
 const DEEPSEEK_ENDPOINT = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/chat/completions';
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-v4-flash';
 
@@ -5,7 +7,7 @@ export function hasDeepSeekKey() {
   return Boolean(process.env.DEEPSEEK_API_KEY);
 }
 
-export async function callDeepSeekJson({ system, user, temperature = 0.2, maxTokens = 900 }) {
+export async function callDeepSeekJson({ system, user, temperature = 0.2, maxTokens = 900, thinking = 'disabled' }) {
   if (!hasDeepSeekKey()) {
     throw new Error('DEEPSEEK_API_KEY is not configured');
   }
@@ -23,6 +25,7 @@ export async function callDeepSeekJson({ system, user, temperature = 0.2, maxTok
         { role: 'user', content: user }
       ],
       response_format: { type: 'json_object' },
+      thinking: { type: thinking },
       temperature,
       max_tokens: maxTokens,
       stream: false
@@ -35,9 +38,12 @@ export async function callDeepSeekJson({ system, user, temperature = 0.2, maxTok
   }
 
   const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content;
   if (!content) {
-    throw new Error('DeepSeek returned empty content');
+    const finishReason = choice?.finish_reason ?? 'unknown';
+    const reasoningTokens = data.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+    throw new Error(`DeepSeek returned empty content (finish_reason=${finishReason}, reasoning_tokens=${reasoningTokens})`);
   }
 
   try {

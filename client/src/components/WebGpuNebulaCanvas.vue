@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { Maximize2, Minimize2 } from 'lucide-vue-next';
-import type { GraphData, LogEntry } from '../types/domain';
+import type { GraphData, LayoutMode, LogEntry } from '../types/domain';
 
 type PickNode =
   | { kind: 'tag'; id: number; x: number; y: number; r: number }
@@ -29,16 +29,19 @@ interface LabelItem {
   color: string;
   active: boolean;
   heat: 'up' | 'down' | 'flat';
+  heatFlat: boolean;
 }
 
 const props = defineProps<{
   graph: GraphData;
+  layoutMode: LayoutMode;
   activeTagIds: Set<number>;
   selectedLogId: number | null;
 }>();
 
 const emit = defineEmits<{
   tagToggle: [tagId: number];
+  tagContext: [payload: { tagId: number; x: number; y: number; width: number; height: number }];
   logOpen: [logId: number];
   logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
   layoutDirty: [dirty: boolean];
@@ -56,7 +59,7 @@ const webgpuError = ref('');
 const heatMode = ref(false);
 const fullscreen = ref(false);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
-const camera = reactive({ yaw: -0.42, pitch: -0.32, panX: 0, panY: 0, panZ: 0 });
+const camera = reactive({ yaw: 0, pitch: 0, panX: 0, panY: 0, panZ: 0 });
 const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2 });
 
 const tagPositions = new Map<number, LayoutPoint>();
@@ -123,6 +126,7 @@ let cameraTarget: CameraTarget | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let dragSnapshot: LayoutSnapshot | null = null;
 let lastPanInteractionAt = 0;
+let pendingFitAllFrontView = true;
 const layoutHistory: LayoutSnapshot[] = [];
 const redoHistory: LayoutSnapshot[] = [];
 
@@ -146,6 +150,8 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
     const tagId = pendingFocusTagId;
     pendingFocusTagId = null;
     centerTag(tagId);
+  } else if (pendingFitAllFrontView) {
+    pendingFitAllFrontView = !fitAllTagsFrontView();
   }
   updateLabels();
 };
@@ -177,8 +183,9 @@ onBeforeUnmount(() => {
 });
 
 watch(
-  () => props.graph.map.id,
+  () => [props.graph.map.id, props.layoutMode],
   () => {
+    pendingFitAllFrontView = true;
     loadManualPositions();
     requestLayout();
   },
@@ -186,7 +193,7 @@ watch(
 );
 
 watch(
-  () => [props.graph.tags, props.graph.logs, props.graph.tagSimilarities],
+  () => [props.graph.tags, props.graph.logs, props.graph.tagSimilarities, props.graph.tagGroups, props.layoutMode],
   () => requestLayout(),
   { deep: true }
 );
@@ -463,6 +470,8 @@ function requestLayout() {
       tags: log.tags.map((tag) => ({ id: tag.id, name: tag.name, color: tag.color }))
     })),
     similarities: (props.graph.tagSimilarities ?? []).map((item) => ({ ...item })),
+    tagGroups: (props.graph.tagGroups ?? []).map((group) => ({ ...group, tagIds: [...group.tagIds] })),
+    layoutMode: props.layoutMode,
     manualTagPositions: [...manualTagPositions.entries()].map(([id, point]) => ({ id, x: point.x, y: point.y })),
     manualLogPositions: [...manualLogPositions.entries()].map(([id, point]) => ({ id, x: point.x, y: point.y }))
   });
@@ -568,7 +577,8 @@ function updateGeometryBuffers() {
       continue;
     }
     const heat = heatState(tag.id);
-    const color = heatMode.value ? heatColor(tag.color, heat) : hexToRgb(tag.color);
+    const heatPower = heatIntensity(tag.id);
+    const color = heatMode.value ? heatColor(heat, heatPower) : hexToRgb(tag.color);
     const active = props.activeTagIds.has(tag.id);
     const relatedToSelected = isTagRelatedToSelectedLog(tag.id);
     const related =
@@ -576,13 +586,34 @@ function updateGeometryBuffers() {
       active ||
       relatedToSelected ||
       props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
-    const state = heatMode.value && heat !== 'flat' ? 1 : active || relatedToSelected ? 1 : related ? 0.62 : 0.18;
+    const flatHeat = heatMode.value && heat === 'flat';
+    const state = heatMode.value ? (flatHeat ? 0.28 : 1) : active || relatedToSelected ? 1 : related ? 0.62 : 0.18;
     const depth = 0.92 + seeded(tag.id + 2200) * 0.22;
     const activeScale = active || relatedToSelected ? 1.22 : related ? 1 : 0.92;
     const coreRadius = point.r * 1.38 * depth * activeScale;
     const world = tagPoint3D(tag.id, point);
-    pushNodeInstance(nodeRows, world, coreRadius * (active || relatedToSelected ? 1.44 : 1.12), 3, color, active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025, state, seeded(tag.id + 700), 0);
-    pushNodeInstance(nodeRows, world, coreRadius * (active || relatedToSelected ? 1.82 : 1.48), 1, color, active || relatedToSelected ? 1 : related ? 0.92 : 0.46, state, seeded(tag.id + 800), 0);
+    pushNodeInstance(
+      nodeRows,
+      world,
+      coreRadius * (active || relatedToSelected ? 1.44 : 1.12),
+      3,
+      color,
+      flatHeat ? (active || relatedToSelected ? 0.08 : related ? 0.035 : 0.018) : active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025,
+      state,
+      seeded(tag.id + 700),
+      0
+    );
+    pushNodeInstance(
+      nodeRows,
+      world,
+      coreRadius * (active || relatedToSelected ? 1.82 : 1.48),
+      1,
+      color,
+      flatHeat ? (active || relatedToSelected ? 0.56 : related ? 0.38 : 0.24) : active || relatedToSelected ? 1 : related ? 0.92 : 0.46,
+      state,
+      seeded(tag.id + 800),
+      0
+    );
   }
 
   for (const log of props.graph.logs) {
@@ -597,16 +628,16 @@ function updateGeometryBuffers() {
     const highlighted = isLogHighlighted(log);
     const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !highlighted;
     const state = selected ? 1 : highlighted ? 0.82 : muted ? 0.12 : 0.26;
-    const radius = selected ? 6.8 : highlighted ? 6.2 : 4.9;
-    const glowAlpha = selected ? 0.6 : highlighted ? 0.28 : 0.07;
-    const glowRadius = selected ? 3.4 : highlighted ? 2.75 : 2.1;
+    const radius = selected ? 8.2 : highlighted ? 7.4 : 6.1;
+    const glowAlpha = selected ? 0.68 : highlighted ? 0.34 : 0.1;
+    const glowRadius = selected ? 3.7 : highlighted ? 3 : 2.35;
     const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : muted ? 0.38 : 0.84;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
     const seed = seeded(log.id + 1900);
     const tilt = seeded(log.id + 341) * 1.1 - 0.55;
     pushNodeInstance(nodeRows, world, radius * glowRadius, 3.25, logColor, glowAlpha, state, seeded(log.id + 1600), 0);
-    pushNodeInstance(nodeRows, world, radius * 1.1, 2, mixColor(logColor, { r: 1, g: 1, b: 1 }, 0.16), bodyAlpha, state, seed, tilt);
+    pushNodeInstance(nodeRows, world, radius * 1.18, 2, mixColor(logColor, { r: 1, g: 1, b: 1 }, 0.16), bodyAlpha, state, seed, tilt);
   }
   nodeCount = Math.max(0, nodeRows.length / 12 - starCount);
   writeDynamicBuffer('node', new Float32Array(nodeRows), 48);
@@ -630,15 +661,15 @@ function updateGeometryBuffers() {
         Math.min(1, tagColor.r + 0.18),
         Math.min(1, tagColor.g + 0.28),
         Math.min(1, tagColor.b + 0.28),
-        relation.selected ? 0.62 : 0.44
+        relation.selected ? 0.74 : 0.56
       ];
       pushLineInstance(
         lineRows,
         tagPoint3D(edge.tagId, tagPoint),
         logPoint3D(logEntry, logPoint),
         color,
-        relation.selected ? 4.8 : 3.4,
-        relation.selected ? 1 : 0.74,
+        relation.selected ? 6.3 : 4.6,
+        relation.selected ? 1 : 0.84,
         seeded(edge.tagId * 31 + edge.logId)
       );
     }
@@ -822,24 +853,26 @@ function onPointerDown(event: PointerEvent) {
   dragButton = event.button;
   dragSnapshot = null;
   lastPointer = { x: event.clientX, y: event.clientY };
-  const picked = pickNodeAt(event.offsetX, event.offsetY);
-  if (event.button === 0 && picked?.kind === 'tag') {
+  const cursor = canvasPointFromPointer(event);
+  const picked = pickNodeAt(cursor.x, cursor.y);
+  const canDragNode = event.button === 0;
+  if (canDragNode && picked?.kind === 'tag') {
     dragSnapshot = captureManualPositions();
     const current = tagPositions.get(picked.id);
     dragWorldZ = tagDepth(picked.id);
-    const point = screenToWorldAtDepth(event.offsetX, event.offsetY, dragWorldZ);
+    const point = screenToWorldAtDepth(cursor.x, cursor.y, dragWorldZ);
     dragMode = 'tag';
     dragTagId = picked.id;
     dragTagOffset = {
       x: (current?.x ?? point.x) - point.x,
       y: (current?.y ?? point.y) - point.y
     };
-  } else if (event.button === 0 && picked?.kind === 'log') {
+  } else if (canDragNode && picked?.kind === 'log') {
     dragSnapshot = captureManualPositions();
     const current = logPositions.get(picked.id);
     const log = props.graph.logs.find((item) => item.id === picked.id);
     dragWorldZ = log && current ? logPoint3D(log, current).z : 0;
-    const point = screenToWorldAtDepth(event.offsetX, event.offsetY, dragWorldZ);
+    const point = screenToWorldAtDepth(cursor.x, cursor.y, dragWorldZ);
     dragMode = 'log';
     dragLogId = picked.id;
     dragLogOffset = {
@@ -861,7 +894,8 @@ function onPointerMove(event: PointerEvent) {
     moved = true;
   }
   if (dragMode === 'tag' && dragTagId !== null) {
-    const point = screenToWorldAtDepth(event.offsetX, event.offsetY, dragWorldZ);
+    const cursor = canvasPointFromPointer(event);
+    const point = screenToWorldAtDepth(cursor.x, cursor.y, dragWorldZ);
     const next = {
       x: point.x + dragTagOffset.x,
       y: point.y + dragTagOffset.y
@@ -873,7 +907,8 @@ function onPointerMove(event: PointerEvent) {
       current.y = next.y;
     }
   } else if (dragMode === 'log' && dragLogId !== null) {
-    const point = screenToWorldAtDepth(event.offsetX, event.offsetY, dragWorldZ);
+    const cursor = canvasPointFromPointer(event);
+    const point = screenToWorldAtDepth(cursor.x, cursor.y, dragWorldZ);
     const next = {
       x: point.x + dragLogOffset.x,
       y: point.y + dragLogOffset.y
@@ -888,8 +923,7 @@ function onPointerMove(event: PointerEvent) {
     lastPanInteractionAt = performance.now();
     panCameraByScreenDelta(dx, dy);
   } else {
-    camera.yaw += dx * 0.004;
-    camera.pitch = clamp(camera.pitch + dy * 0.003, -0.82, 0.58);
+    orbitCameraByScreenDelta(dx, dy);
   }
   lastPointer = { x: event.clientX, y: event.clientY };
   updateLabels();
@@ -937,13 +971,16 @@ function onPointerUp(event: PointerEvent) {
   if (button !== 0 && button !== 2) {
     return;
   }
-  const picked = pickNodeAt(event.offsetX, event.offsetY);
+  const cursor = canvasPointFromPointer(event);
+  const picked = pickNodeAt(cursor.x, cursor.y);
   if (!picked) {
     return;
   }
   if (button === 2) {
     if (picked.kind === 'log') {
       inspectLogAt(picked.id, event);
+    } else {
+      inspectTagAt(picked.id, event);
     }
     return;
   }
@@ -954,26 +991,102 @@ function onPointerUp(event: PointerEvent) {
   }
 }
 
+function onLabelPointerDown(tagId: number, event: PointerEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  updateNebulaCursor(event);
+  cameraTarget = null;
+  isDragging = true;
+  dragMode = event.button === 1 ? 'pan' : 'tag';
+  if (dragMode === 'pan') {
+    lastPanInteractionAt = performance.now();
+  }
+  dragTagId = null;
+  dragLogId = null;
+  dragWorldZ = 0;
+  moved = false;
+  dragButton = event.button;
+  dragSnapshot = null;
+  lastPointer = { x: event.clientX, y: event.clientY };
+  if (event.button === 0) {
+    dragSnapshot = captureManualPositions();
+    const cursor = canvasPointFromPointer(event);
+    const current = tagPositions.get(tagId);
+    dragWorldZ = tagDepth(tagId);
+    const point = screenToWorldAtDepth(cursor.x, cursor.y, dragWorldZ);
+    dragMode = 'tag';
+    dragTagId = tagId;
+    dragTagOffset = {
+      x: (current?.x ?? point.x) - point.x,
+      y: (current?.y ?? point.y) - point.y
+    };
+  }
+  (event.currentTarget as HTMLElement | null)?.setPointerCapture?.(event.pointerId);
+}
+
+function onLabelPointerUp(tagId: number, event: PointerEvent, cancelled = false) {
+  event.preventDefault();
+  event.stopPropagation();
+  updateNebulaCursor(event);
+  (event.currentTarget as HTMLElement | null)?.releasePointerCapture?.(event.pointerId);
+  const button = dragButton;
+  const didMove = moved;
+  isDragging = false;
+  dragMode = null;
+  dragTagId = null;
+  dragLogId = null;
+  dragWorldZ = 0;
+  dragButton = 0;
+  if (!cancelled && !didMove && button === 0) {
+    emit('tagToggle', tagId);
+  } else if (!cancelled && didMove && button === 0) {
+    pushLayoutHistory(dragSnapshot);
+    emit('layoutDirty', true);
+    requestLayout();
+  }
+}
+
 function onWheel(event: WheelEvent) {
   event.preventDefault();
   if (isDragging || performance.now() - lastPanInteractionAt < 220) {
     return;
   }
   cameraTarget = null;
-  const zoom = event.deltaY < 0 ? 1.08 : 0.92;
-  const before = screenToWorld(event.offsetX, event.offsetY);
+  const wheelDelta = normalizeWheelDelta(event);
+  const zoom = clamp(Math.exp(-wheelDelta * 0.0012), 0.76, 1.32);
   transform.scale = Math.min(2.55, Math.max(0.42, transform.scale * zoom));
-  const after = screenToWorld(event.offsetX, event.offsetY);
-  camera.panX += before.x - after.x;
-  camera.panY += before.y - after.y;
   updateLabels();
 }
 
 function panCameraByScreenDelta(dx: number, dy: number) {
-  const delta = cameraPanDeltaForScreenShift(dx, dy, transform.scale, VIEW_DISTANCE);
+  const focus = worldFocusAtCanvasCenter();
+  const depth = focus ? projectWorldToScreen(focus).depth : VIEW_DISTANCE;
+  const delta = cameraPanDeltaForScreenShift(dx, dy, transform.scale, depth);
   camera.panX += delta.x;
   camera.panY += delta.y;
   camera.panZ += delta.z;
+}
+
+function orbitCameraByScreenDelta(dx: number, dy: number) {
+  camera.yaw += dx * 0.004;
+  camera.pitch = clamp(camera.pitch + dy * 0.003, -0.82, 0.58);
+}
+
+function worldFocusAtCanvasCenter(): Point3D | null {
+  if (!canvas.value) {
+    return null;
+  }
+  return { x: camera.panX, y: camera.panY, z: camera.panZ };
+}
+
+function normalizeWheelDelta(event: WheelEvent) {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+    return event.deltaY * 16;
+  }
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+    return event.deltaY * 240;
+  }
+  return event.deltaY;
 }
 
 function cameraPanDeltaForScreenShift(dx: number, dy: number, scale: number, depth = VIEW_DISTANCE) {
@@ -988,14 +1101,26 @@ function cameraPanDeltaForScreenShift(dx: number, dy: number, scale: number, dep
 }
 
 function updateNebulaCursor(event: PointerEvent) {
-  const dx = event.offsetX - nebulaCursor.x;
-  const dy = event.offsetY - nebulaCursor.y;
+  const point = canvasPointFromPointer(event);
+  const dx = point.x - nebulaCursor.x;
+  const dy = point.y - nebulaCursor.y;
   if (Math.abs(dx) + Math.abs(dy) > 1) {
     nebulaCursor.angle = Math.atan2(dy, dx);
   }
-  nebulaCursor.x = event.offsetX;
-  nebulaCursor.y = event.offsetY;
+  nebulaCursor.x = point.x;
+  nebulaCursor.y = point.y;
   nebulaCursor.visible = true;
+}
+
+function canvasPointFromPointer(event: PointerEvent | MouseEvent) {
+  if (!canvas.value) {
+    return { x: 'offsetX' in event ? event.offsetX : 0, y: 'offsetY' in event ? event.offsetY : 0 };
+  }
+  const rect = canvas.value.getBoundingClientRect();
+  return {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top
+  };
 }
 
 function hideNebulaCursor() {
@@ -1008,6 +1133,28 @@ function inspectLogAt(logId: number, event: PointerEvent) {
     logId,
     x: event.offsetX,
     y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
+}
+
+function inspectTagAt(tagId: number, event: PointerEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('tagContext', {
+    tagId,
+    x: event.offsetX,
+    y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
+}
+
+function inspectTagLabel(tagId: number, event: MouseEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('tagContext', {
+    tagId,
+    x: rect ? event.clientX - rect.left : event.clientX,
+    y: rect ? event.clientY - rect.top : event.clientY,
     width: rect?.width ?? window.innerWidth,
     height: rect?.height ?? window.innerHeight
   });
@@ -1126,9 +1273,10 @@ function updateLabels() {
         name: tag.name,
         x: screen.x,
         y: screen.y + radius + 15,
-        color: heatMode.value ? rgbToCss(heatColor(tag.color, heat)) : tag.color,
+        color: heatMode.value ? heatLabelColor(heat, heatIntensity(tag.id)) : tag.color,
         active,
-        heat
+        heat,
+        heatFlat: heatMode.value && heat === 'flat'
       });
     }
   }
@@ -1144,9 +1292,9 @@ function updateLabels() {
     const screen = projectWorldToScreen(logPoint3D(log, point));
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
-    const radius = Math.max(12, (highlighted || selected ? 11 : 8) * transform.scale * screen.perspective);
+    const radius = Math.max(15, (highlighted || selected ? 13 : 10) * transform.scale * screen.perspective);
     if (screen.x > -90 && screen.x < rect.width + 90 && screen.y > -90 && screen.y < rect.height + 90) {
-      pickNodes.push({ kind: 'log', id: log.id, x: screen.x, y: screen.y, r: radius + 6 });
+      pickNodes.push({ kind: 'log', id: log.id, x: screen.x, y: screen.y, r: radius + 8 });
     }
   }
 
@@ -1154,11 +1302,11 @@ function updateLabels() {
 }
 
 function tagPositionStorageKey() {
-  return `nebula.tagPositions.${props.graph.map.id}`;
+  return `nebula.tagPositions.${props.graph.map.id}.${props.layoutMode}`;
 }
 
 function logPositionStorageKey() {
-  return `nebula.logPositions.${props.graph.map.id}`;
+  return `nebula.logPositions.${props.graph.map.id}.${props.layoutMode}`;
 }
 
 function loadManualPositions() {
@@ -1284,17 +1432,55 @@ function resetTagLayout() {
   window.localStorage.removeItem(tagPositionStorageKey());
   window.localStorage.removeItem(logPositionStorageKey());
   emit('layoutDirty', false);
+  pendingFitAllFrontView = true;
   requestLayout();
 }
 
 function refreshLayout() {
-  cameraTarget = null;
+  pendingFitAllFrontView = true;
   requestLayout();
   updateLabels();
 }
 
 function worldToScreen(x: number, y: number) {
   return projectWorldToScreen({ x, y, z: 0 });
+}
+
+function fitAllTagsFrontView() {
+  if (!canvas.value || tagPositions.size === 0) {
+    if (tagPositions.size === 0) {
+      cameraTarget = null;
+      transform.scale = 1;
+      camera.yaw = 0;
+      camera.pitch = 0;
+      camera.panX = 0;
+      camera.panY = 0;
+      camera.panZ = 0;
+    }
+    return Boolean(canvas.value);
+  }
+
+  const rect = canvas.value.getBoundingClientRect();
+  const points = [...tagPositions.values()];
+  const minX = Math.min(...points.map((point) => point.x - point.r * 2.2));
+  const maxX = Math.max(...points.map((point) => point.x + point.r * 2.2));
+  const minY = Math.min(...points.map((point) => point.y - point.r * 3.1));
+  const maxY = Math.max(...points.map((point) => point.y + point.r * 3.4));
+  const worldWidth = Math.max(1, maxX - minX);
+  const worldHeight = Math.max(1, maxY - minY);
+  const projection = FOCAL_LENGTH / VIEW_DISTANCE;
+  const availableWidth = Math.max(240, rect.width - 128);
+  const availableHeight = Math.max(180, rect.height - 112);
+  const nextScale = Math.min(1.18, Math.max(0.38, Math.min(availableWidth / (worldWidth * projection), availableHeight / (worldHeight * projection))));
+
+  cameraTarget = null;
+  transform.scale = nextScale;
+  camera.yaw = 0;
+  camera.pitch = 0;
+  camera.panX = (minX + maxX) / 2;
+  camera.panY = (minY + maxY) / 2;
+  camera.panZ = 0;
+  return true;
 }
 
 function screenToWorld(x: number, y: number) {
@@ -1442,15 +1628,41 @@ function heatState(tagId: number): 'up' | 'down' | 'flat' {
   return 'flat';
 }
 
-function heatColor(baseHex: string, heat: 'up' | 'down' | 'flat') {
-  const base = hexToRgb(baseHex);
+function heatIntensity(tagId: number) {
+  const item = tagTrendById.value.get(tagId);
+  if (!item) {
+    return 0;
+  }
+  const delta = item.current - item.previous;
+  if (!(delta > 0 || (item.previous > 0 && delta < 0))) {
+    return 0;
+  }
+  const absoluteDelta = Math.abs(delta);
+  if (absoluteDelta >= 4) {
+    return 1;
+  }
+  if (absoluteDelta >= 2) {
+    return 0.66;
+  }
+  return 0.32;
+}
+
+function heatColor(heat: 'up' | 'down' | 'flat', intensity = 0) {
+  const power = 0.32 + intensity * 0.68;
   if (heat === 'up') {
-    return mixColor(base, { r: 1, g: 0.46, b: 0.18 }, 0.62);
+    return mixColor({ r: 1, g: 0.76, b: 0.54 }, { r: 1, g: 0.24, b: 0.08 }, power);
   }
   if (heat === 'down') {
-    return mixColor(base, { r: 0.28, g: 0.62, b: 1 }, 0.62);
+    return mixColor({ r: 0.58, g: 0.84, b: 1 }, { r: 0.04, g: 0.34, b: 1 }, power);
   }
-  return base;
+  return { r: 0.9, g: 0.95, b: 1 };
+}
+
+function heatLabelColor(heat: 'up' | 'down' | 'flat', intensity = 0) {
+  if (heat === 'flat') {
+    return 'rgba(232, 243, 255, 0.56)';
+  }
+  return rgbToCss(heatColor(heat, intensity));
 }
 
 function rgbToCss(color: { r: number; g: number; b: number }) {
@@ -1593,8 +1805,9 @@ fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 fn fs(input: VertexOut) -> @location(0) vec4f {
   let time = u.viewport.w;
   let aspect = max(0.4, u.viewport.x / max(1.0, u.viewport.y));
+  let backgroundZoom = clamp(1.0 + (u.viewport.z - 1.0) * 0.18, 0.86, 1.28);
   let viewPan = vec2f(u.camera.x, -u.camera.y) / max(1.0, u.space.y) * 0.72;
-  let screen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0) + viewPan;
+  let screen = ((input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0) + viewPan) / backgroundZoom;
   let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
   let dir = rotateSky(viewDir);
   let lon = atan2(dir.x, dir.z);
@@ -1612,9 +1825,10 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   let violet = vec3f(0.12, 0.055, 0.22) * smoothstep(0.32, 0.96, swirlB * 0.5 + 0.5) * cloud * 0.12;
   let amber = vec3f(0.22, 0.12, 0.045) * smoothstep(0.5, 0.98, swirlA * 0.5 + 0.5) * cloud * 0.05;
 
-  let uvTiny = sky * vec2f(520.0, 220.0);
-  let uvFine = sky * vec2f(340.0, 148.0);
-  let uvBright = sky * vec2f(150.0, 68.0) + vec2f(time * 0.0012, 0.0);
+  let starSky = (sky - vec2f(0.5)) / backgroundZoom + vec2f(0.5);
+  let uvTiny = starSky * vec2f(520.0, 220.0);
+  let uvFine = starSky * vec2f(340.0, 148.0);
+  let uvBright = starSky * vec2f(150.0, 68.0) + vec2f(time * 0.0012, 0.0);
   let starTiny = softStar(uvTiny, 520.0, 0.955, 0.09, 0.46);
   let starFine = softStar(uvFine, 340.0, 0.965, 0.12, 0.76);
   let starBright = softStar(uvBright, 150.0, 0.982, 0.16, 0.95);
@@ -1853,8 +2067,9 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   let fade = smoothstep(0.02, 0.18, input.along) * (1.0 - smoothstep(0.82, 0.98, input.along));
   let wave = fract(input.along * (5.2 + input.state * 1.4) - input.time * (0.42 + input.state * 0.34) + input.seed);
   let bead = smoothstep(0.72, 0.88, wave) * (1.0 - smoothstep(0.88, 1.0, wave));
-  let core = 1.0 - smoothstep(0.06, 0.7, input.side);
-  let mist = (1.0 - smoothstep(0.18, 1.0, input.side)) * 0.13;
+  let side = abs(input.side);
+  let core = 1.0 - smoothstep(0.05, 0.82, side);
+  let mist = (1.0 - smoothstep(0.22, 1.0, side)) * 0.18;
   let alpha = fade * input.color.a * (mist + bead * core * (0.9 + input.state * 0.56));
   if (alpha < 0.008) {
     discard;
@@ -1890,9 +2105,13 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
         v-for="label in labels"
         :key="label.id"
         class="webgpu-label"
-        :class="{ active: label.active, up: label.heat === 'up', down: label.heat === 'down' }"
+        :class="{ active: label.active, up: label.heat === 'up', down: label.heat === 'down', heatFlat: label.heatFlat }"
         :style="{ left: `${label.x}px`, top: `${label.y}px`, '--label-color': label.color }"
-        @click.stop="emit('tagToggle', label.id)"
+        @pointerdown.stop="onLabelPointerDown(label.id, $event)"
+        @pointermove.stop="onPointerMove"
+        @pointerup.stop="onLabelPointerUp(label.id, $event)"
+        @pointercancel.stop="onLabelPointerUp(label.id, $event, true)"
+        @contextmenu.prevent.stop="inspectTagLabel(label.id, $event)"
       >
         {{ label.name }}
       </button>

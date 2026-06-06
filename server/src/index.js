@@ -1,34 +1,42 @@
+import './env.js';
 import express from 'express';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
+  createDomainCategory,
   createLog,
   createMap,
   createSession,
   createTag,
   createUser,
+  deleteDomainCategory,
   deleteLog,
   deleteSession,
   deleteTag,
   getEdges,
+  getDomainCategoryById,
   getLogById,
   getMapById,
   getSessionUser,
   getTagById,
   initializeDatabase,
+  listDomainCategories,
   listLogs,
   listMaps,
   listTags,
   normalizeTagNames,
+  restoreLogSnapshot,
+  restoreTagSnapshot,
+  updateDomainCategory,
   updateLog,
   updateMap,
   updateTag,
   verifyUserCredentials
 } from './db.js';
 import { buildInsights, generateAdvice } from './insights.js';
-import { suggestTags } from './recommend.js';
-import { buildTagSimilarities } from './semantic.js';
+import { searchTags, suggestTags } from './recommend.js';
+import { buildTagGroups, buildTagSimilarities } from './semantic.js';
 
 initializeDatabase();
 
@@ -148,12 +156,19 @@ app.get('/api/maps/:id/graph', async (req, res, next) => {
       return;
     }
 
+    const [tagSimilarityResult, tagGroupResult] = await Promise.all([buildTagSimilarities(mapId), buildTagGroups(mapId)]);
     res.json({
       map,
       tags: listTags(mapId),
       logs: listLogs(mapId),
       edges: getEdges(mapId),
-      tagSimilarities: await buildTagSimilarities(mapId)
+      tagSimilarities: tagSimilarityResult.relations,
+      tagGroups: tagGroupResult.groups,
+      domainCategories: listDomainCategories(mapId),
+      aiMeta: {
+        tagRelations: tagSimilarityResult.aiMeta,
+        tagGroups: tagGroupResult.aiMeta
+      }
     });
   } catch (error) {
     next(error);
@@ -181,6 +196,39 @@ app.post('/api/maps/:id/advice', async (req, res, next) => {
       return;
     }
     res.json(await generateAdvice(mapId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/maps/:id/domain-categories', (req, res, next) => {
+  const mapId = Number(req.params.id);
+  try {
+    if (!getOwnedMap(mapId, req.user.id)) {
+      res.status(404).json({ message: '星云图不存在' });
+      return;
+    }
+    res.json(listDomainCategories(mapId));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/maps/:id/domain-categories', (req, res, next) => {
+  const mapId = Number(req.params.id);
+  try {
+    if (!getOwnedMap(mapId, req.user.id)) {
+      res.status(404).json({ message: '星云图不存在' });
+      return;
+    }
+    res.status(201).json(
+      createDomainCategory({
+        mapId,
+        name: req.body.name,
+        color: req.body.color,
+        keywords: req.body.keywords
+      })
+    );
   } catch (error) {
     next(error);
   }
@@ -234,6 +282,59 @@ app.delete('/api/logs/:id', (req, res) => {
     return;
   }
   res.json({ ok: true });
+});
+
+app.post('/api/logs/restore', (req, res, next) => {
+  try {
+    const mapId = Number(req.body?.mapId);
+    if (!getOwnedMap(mapId, req.user.id)) {
+      res.status(404).json({ message: '星云图不存在' });
+      return;
+    }
+    res.status(201).json(restoreLogSnapshot(req.body));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/api/domain-categories/:id', (req, res, next) => {
+  try {
+    const category = getOwnedDomainCategory(Number(req.params.id), req.user.id);
+    if (!category) {
+      res.status(404).json({ message: '领域大类不存在' });
+      return;
+    }
+    const updated = updateDomainCategory(category.id, {
+      name: req.body.name,
+      color: req.body.color,
+      keywords: req.body.keywords
+    });
+    if (!updated) {
+      res.status(404).json({ message: '领域大类不存在' });
+      return;
+    }
+    res.json(updated);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/domain-categories/:id', (req, res, next) => {
+  try {
+    const category = getOwnedDomainCategory(Number(req.params.id), req.user.id);
+    if (!category) {
+      res.status(404).json({ message: '领域大类不存在' });
+      return;
+    }
+    const result = deleteDomainCategory(category.id);
+    if (!result.deleted) {
+      res.status(404).json({ message: '领域大类不存在' });
+      return;
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/api/tags', (req, res, next) => {
@@ -296,6 +397,19 @@ app.delete('/api/tags/:id', (req, res, next) => {
   }
 });
 
+app.post('/api/tags/restore', (req, res, next) => {
+  try {
+    const mapId = Number(req.body?.mapId);
+    if (!getOwnedMap(mapId, req.user.id)) {
+      res.status(404).json({ message: '星云图不存在' });
+      return;
+    }
+    res.status(201).json(restoreTagSnapshot(req.body));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post('/api/tags/suggest', async (req, res, next) => {
   const mapId = Number(req.body.mapId);
   const content = String(req.body.content ?? '');
@@ -305,6 +419,20 @@ app.post('/api/tags/suggest', async (req, res, next) => {
       return;
     }
     res.json(await suggestTags(mapId, content));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/tags/search', async (req, res, next) => {
+  const mapId = Number(req.body.mapId);
+  const query = String(req.body.query ?? '');
+  try {
+    if (!getOwnedMap(mapId, req.user.id)) {
+      res.status(404).json({ message: '鏄熶簯鍥句笉瀛樺湪' });
+      return;
+    }
+    res.json(await searchTags(mapId, query));
   } catch (error) {
     next(error);
   }
@@ -350,6 +478,17 @@ function getOwnedTag(tagId, userId) {
     return null;
   }
   return tag;
+}
+
+function getOwnedDomainCategory(categoryId, userId) {
+  if (!Number.isFinite(categoryId)) {
+    return null;
+  }
+  const category = getDomainCategoryById(categoryId);
+  if (!category || !getOwnedMap(category.mapId, userId)) {
+    return null;
+  }
+  return category;
 }
 
 function normalizeLogPayload(body, { requireMapId }) {

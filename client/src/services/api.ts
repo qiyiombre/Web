@@ -1,4 +1,17 @@
-import type { DraftLog, GraphData, Insight, LogEntry, NebulaMap, TagNode, TagSuggestion, UserAccount } from '../types/domain';
+import type {
+  AdviceResponse,
+  DomainCategory,
+  DraftLog,
+  GraphData,
+  Insight,
+  LogEntry,
+  NebulaMap,
+  TagNode,
+  TagSearchResponse,
+  TagSuggestion,
+  TagSuggestionResponse,
+  UserAccount
+} from '../types/domain';
 
 const API_BASE = '/api';
 
@@ -66,6 +79,30 @@ export function getGraph(mapId: number) {
   return request<GraphData>(`/maps/${mapId}/graph`);
 }
 
+export function listDomainCategories(mapId: number) {
+  return request<DomainCategory[]>(`/maps/${mapId}/domain-categories`);
+}
+
+export function createDomainCategory(mapId: number, payload: { name: string; color?: string; keywords: string[] }) {
+  return request<DomainCategory>(`/maps/${mapId}/domain-categories`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
+export function updateDomainCategory(id: number, payload: { name: string; color?: string; keywords: string[] }) {
+  return request<DomainCategory>(`/domain-categories/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload)
+  });
+}
+
+export function deleteDomainCategory(id: number) {
+  return request<{ ok: true }>(`/domain-categories/${id}`, {
+    method: 'DELETE'
+  });
+}
+
 export function createLog(payload: { mapId: number; title: string; content: string; tagNames: string[] }) {
   return request<LogEntry>('/logs', {
     method: 'POST',
@@ -86,10 +123,24 @@ export function deleteLog(id: number) {
   });
 }
 
+export function restoreLog(payload: LogEntry) {
+  return request<LogEntry>('/logs/restore', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
 export function suggestTags(mapId: number, content: string) {
-  return request<TagSuggestion[]>('/tags/suggest', {
+  return request<TagSuggestionResponse | TagSuggestion[]>('/tags/suggest', {
     method: 'POST',
     body: JSON.stringify({ mapId, content })
+  });
+}
+
+export function searchExistingTags(mapId: number, query: string) {
+  return request<TagSearchResponse>('/tags/search', {
+    method: 'POST',
+    body: JSON.stringify({ mapId, query })
   });
 }
 
@@ -113,12 +164,19 @@ export function deleteTag(id: number) {
   });
 }
 
+export function restoreTag(payload: { id: number; mapId: number; name: string; color: string; logIds: number[] }) {
+  return request<TagNode>('/tags/restore', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
 export function getInsights(mapId: number) {
   return request<Insight>(`/maps/${mapId}/insights`);
 }
 
 export function generateAdvice(mapId: number) {
-  return request<{ cached: boolean; suggestions: string[] }>(`/maps/${mapId}/advice`, {
+  return request<AdviceResponse>(`/maps/${mapId}/advice`, {
     method: 'POST'
   });
 }

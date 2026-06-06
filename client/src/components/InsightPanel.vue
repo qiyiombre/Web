@@ -68,6 +68,7 @@ const emit = defineEmits<{
           </button>
         </div>
         <p v-if="!insight.suggestions.length" class="muted">默认不调用大模型，点击后才生成并缓存建议。</p>
+        <p v-if="insight.adviceMeta?.message" class="muted">{{ insight.adviceMeta.message }}</p>
         <p v-for="text in insight.suggestions" :key="text" class="advice">{{ text }}</p>
       </div>
     </template>
