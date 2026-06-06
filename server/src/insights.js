@@ -1,34 +1,33 @@
-import { db, getAiCache, listLogs, listTags, setAiCache } from './db.js';
+import { getAiCache, listLogs, listTagTrends, listTags, listTopTagPairs, setAiCache } from './db.js';
 import { callDeepSeekJson, hasDeepSeekKey } from './deepseek.js';
 
-export function buildInsights(mapId) {
-  const stats = buildInsightStats(mapId);
-  const recentLogs = buildRecentLogs(mapId);
-  const cached = getCachedAdvice(mapId, stats, recentLogs);
+export async function buildInsights(mapId) {
+  const [stats, recentLogs] = await Promise.all([buildInsightStats(mapId), buildRecentLogs(mapId)]);
+  const cached = await getCachedAdvice(mapId, stats, recentLogs);
 
   return {
     ...stats,
     suggestions: cached,
-    adviceMeta: cached.length > 0
-      ? {
-          feature: 'advice',
-          source: 'cache',
-          attempted: false,
-          message: '行为建议使用 DeepSeek 缓存结果'
-        }
-      : {
-          feature: 'advice',
-          source: 'none',
-          attempted: false,
-          message: '尚未生成 AI 建议'
-        }
+    adviceMeta:
+      cached.length > 0
+        ? {
+            feature: 'advice',
+            source: 'cache',
+            attempted: false,
+            message: '行为建议使用 DeepSeek 缓存结果'
+          }
+        : {
+            feature: 'advice',
+            source: 'none',
+            attempted: false,
+            message: '尚未生成 AI 建议'
+          }
   };
 }
 
 export async function generateAdvice(mapId) {
-  const stats = buildInsightStats(mapId);
-  const recentLogs = buildRecentLogs(mapId);
-  const cached = getCachedAdvice(mapId, stats, recentLogs);
+  const [stats, recentLogs] = await Promise.all([buildInsightStats(mapId), buildRecentLogs(mapId)]);
+  const cached = await getCachedAdvice(mapId, stats, recentLogs);
 
   if (cached.length > 0) {
     return {
@@ -59,7 +58,7 @@ export async function generateAdvice(mapId) {
   try {
     const result = await callDeepSeekJson({
       system:
-        '你是一个谨慎、实用的个人行为洞察助手。你只能基于给定统计和日志摘要提出建议，不要诊断疾病，不要夸大结论。只返回合法 JSON。',
+        '你是一个谨慎、实用的个人行为观察助手。你只能基于给定统计和日志摘要提出建议，不要诊断疾病，不要夸大结论。只返回合法 JSON。',
       user: `请根据个人日志统计生成行为建议。
 
 要求：
@@ -82,7 +81,7 @@ ${JSON.stringify(recentLogs)}`,
     const value = {
       suggestions: suggestions.length > 0 ? suggestions : ['DeepSeek 暂未生成有效建议，请继续记录更多日志。']
     };
-    setAiCache(buildAdviceCacheKey(mapId, stats, recentLogs), value);
+    await setAiCache(buildAdviceCacheKey(mapId, stats, recentLogs), value);
 
     return {
       cached: false,
@@ -109,13 +108,13 @@ ${JSON.stringify(recentLogs)}`,
   }
 }
 
-function getCachedAdvice(mapId, stats, recentLogs) {
-  const cached = getAiCache(buildAdviceCacheKey(mapId, stats, recentLogs));
+async function getCachedAdvice(mapId, stats, recentLogs) {
+  const cached = await getAiCache(buildAdviceCacheKey(mapId, stats, recentLogs));
   return normalizeSuggestions(cached?.suggestions);
 }
 
-function buildRecentLogs(mapId) {
-  return listLogs(mapId)
+async function buildRecentLogs(mapId) {
+  return (await listLogs(mapId))
     .slice(0, 8)
     .map((log) => ({
       title: log.title,
@@ -125,28 +124,12 @@ function buildRecentLogs(mapId) {
     }));
 }
 
-function buildInsightStats(mapId) {
-  const topTags = listTags(mapId).slice(0, 6);
-  const trendRows = db
-    .prepare(
-      `SELECT
-        t.id,
-        t.name,
-        t.color,
-        SUM(CASE WHEN datetime(l.created_at) >= datetime('now', '-7 days') THEN 1 ELSE 0 END) AS current,
-        SUM(CASE WHEN datetime(l.created_at) < datetime('now', '-7 days')
-              AND datetime(l.created_at) >= datetime('now', '-14 days') THEN 1 ELSE 0 END) AS previous
-       FROM tags t
-       LEFT JOIN log_tags lt ON lt.tag_id = t.id
-       LEFT JOIN logs l ON l.id = lt.log_id
-       WHERE t.map_id = ?
-       GROUP BY t.id`
-    )
-    .all(mapId)
-    .map((row) => ({
-      ...row,
-      delta: Number(row.current ?? 0) - Number(row.previous ?? 0)
-    }));
+async function buildInsightStats(mapId) {
+  const [topTags, trendRows, cooccurrence] = await Promise.all([
+    listTags(mapId).then((tags) => tags.slice(0, 6)),
+    listTagTrends(mapId),
+    listTopTagPairs(mapId)
+  ]);
 
   const risingTags = trendRows
     .filter((row) => row.delta > 0)
@@ -157,24 +140,6 @@ function buildInsightStats(mapId) {
     .filter((row) => row.previous > 0 && row.delta < 0)
     .sort((a, b) => a.delta - b.delta)
     .slice(0, 4);
-
-  const cooccurrence = db
-    .prepare(
-      `SELECT
-        ta.name AS tagA,
-        tb.name AS tagB,
-        COUNT(*) AS count
-       FROM log_tags a
-       JOIN log_tags b ON a.log_id = b.log_id AND a.tag_id < b.tag_id
-       JOIN tags ta ON ta.id = a.tag_id
-       JOIN tags tb ON tb.id = b.tag_id
-       JOIN logs l ON l.id = a.log_id
-       WHERE l.map_id = ?
-       GROUP BY a.tag_id, b.tag_id
-       ORDER BY count DESC, tagA ASC
-       LIMIT 6`
-    )
-    .all(mapId);
 
   return {
     topTags,
