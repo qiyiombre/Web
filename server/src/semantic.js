@@ -15,9 +15,11 @@ const OTHER_GROUP = {
 };
 
 export async function buildTagSimilarities(mapId) {
-  const tags = listTags(mapId);
-  const cooccurrence = getTagCooccurrence(mapId);
-  const domainCategories = listDomainCategories(mapId);
+  const [tags, cooccurrence, domainCategories] = await Promise.all([
+    listTags(mapId),
+    getTagCooccurrence(mapId),
+    listDomainCategories(mapId)
+  ]);
   const local = buildLocalSimilarities(tags, cooccurrence, domainCategories);
 
   if (!hasDeepSeekKey() || tags.length < 2) {
@@ -33,7 +35,7 @@ export async function buildTagSimilarities(mapId) {
   }
 
   const cacheKey = buildRelationCacheKey(mapId, tags, cooccurrence);
-  const cached = getAiCache(cacheKey);
+  const cached = await getAiCache(cacheKey);
   if (Array.isArray(cached) && cached.length > 0) {
     return {
       relations: mergeAiAndLocal(cached, local),
@@ -62,7 +64,7 @@ export async function buildTagSimilarities(mapId) {
   try {
     const aiRelations = await requestDeepSeekRelations(tags, cooccurrence);
     if (aiRelations.length > 0) {
-      setAiCache(cacheKey, aiRelations);
+      await setAiCache(cacheKey, aiRelations);
       recentRelationFailures.delete(cacheKey);
     } else {
       recentRelationFailures.set(cacheKey, {
@@ -98,8 +100,7 @@ export async function buildTagSimilarities(mapId) {
 }
 
 export async function buildTagGroups(mapId) {
-  const tags = listTags(mapId);
-  const domainCategories = listDomainCategories(mapId);
+  const [tags, domainCategories] = await Promise.all([listTags(mapId), listDomainCategories(mapId)]);
   const local = buildLocalTagGroups(tags, domainCategories);
 
   if (!hasDeepSeekKey() || tags.length < 2) {
@@ -115,7 +116,7 @@ export async function buildTagGroups(mapId) {
   }
 
   const cacheKey = buildGroupCacheKey(mapId, tags, domainCategories);
-  const cached = getAiCache(cacheKey);
+  const cached = await getAiCache(cacheKey);
   if (Array.isArray(cached) && cached.length > 0) {
     return {
       groups: normalizeTagGroups(cached, tags, 'deepseek', domainCategories),
@@ -144,7 +145,7 @@ export async function buildTagGroups(mapId) {
   try {
     const aiGroups = await requestDeepSeekTagGroups(tags, domainCategories);
     if (aiGroups.length > 0) {
-      setAiCache(cacheKey, aiGroups);
+      await setAiCache(cacheKey, aiGroups);
       recentGroupFailures.delete(cacheKey);
     } else {
       recentGroupFailures.set(cacheKey, {

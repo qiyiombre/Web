@@ -2,6 +2,9 @@
   "name": "nebula-insight",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22"
+  },
   "description": "星云洞察：个人日志知识图谱与行为分析系统",
   "workspaces": [
     "client",

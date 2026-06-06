@@ -1,6 +1,15 @@
-import { createLog, db, initializeDatabase } from '../server/src/db.js';
+import {
+  clearAiCache,
+  countLogsForMap,
+  countTagsForMap,
+  createLog,
+  initializeDatabase,
+  listAllMaps,
+  logExists,
+  updateLogTimestamps
+} from '../server/src/db.js';
 
-initializeDatabase();
+await initializeDatabase();
 
 const samples = [
   {
@@ -125,38 +134,38 @@ const samples = [
   }
 ];
 
-const maps = db.prepare('SELECT id, name FROM nebula_maps ORDER BY id').all();
-const existingLog = db.prepare('SELECT id FROM logs WHERE map_id = ? AND title = ?');
-const updateCreatedAt = db.prepare('UPDATE logs SET created_at = ?, updated_at = ? WHERE id = ?');
+const maps = await listAllMaps();
 let inserted = 0;
 let skipped = 0;
 
 for (const map of maps) {
   for (const sample of samples) {
-    if (existingLog.get(map.id, sample.title)) {
+    if (await logExists(map.id, sample.title)) {
       skipped += 1;
       continue;
     }
 
-    const created = createLog({
+    const created = await createLog({
       mapId: map.id,
       title: sample.title,
       content: sample.content,
       tagNames: sample.tags
     });
     const createdAt = new Date(Date.now() - sample.daysAgo * 86400000 - (map.id % 5) * 3600000).toISOString();
-    updateCreatedAt.run(createdAt, createdAt, created.id);
+    await updateLogTimestamps(created.id, createdAt);
     inserted += 1;
   }
 }
 
-db.prepare('DELETE FROM ai_cache').run();
+await clearAiCache();
 
-const summary = maps.map((map) => ({
-  id: map.id,
-  name: map.name,
-  logs: db.prepare('SELECT COUNT(*) AS count FROM logs WHERE map_id = ?').get(map.id).count,
-  tags: db.prepare('SELECT COUNT(*) AS count FROM tags WHERE map_id = ?').get(map.id).count
-}));
+const summary = await Promise.all(
+  maps.map(async (map) => ({
+    id: map.id,
+    name: map.name,
+    logs: await countLogsForMap(map.id),
+    tags: await countTagsForMap(map.id)
+  }))
+);
 
 console.log(JSON.stringify({ inserted, skipped, summary }, null, 2));

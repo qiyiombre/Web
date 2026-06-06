@@ -20,7 +20,7 @@ const keywordGroups = [
 ];
 
 export async function suggestTags(mapId, content, limit = 8) {
-  const existingTags = listTags(mapId);
+  const existingTags = await listTags(mapId);
 
   if (hasDeepSeekKey()) {
     try {
@@ -72,7 +72,7 @@ export async function suggestTags(mapId, content, limit = 8) {
 }
 
 export async function searchTags(mapId, query, limit = 30) {
-  const existingTags = listTags(mapId);
+  const existingTags = await listTags(mapId);
   const cleanQuery = String(query ?? '').trim().slice(0, 80);
   if (!cleanQuery) {
     return {
@@ -100,7 +100,7 @@ export async function searchTags(mapId, query, limit = 30) {
   }
 
   const cacheKey = buildTagSearchCacheKey(mapId, existingTags, cleanQuery, limit);
-  const cached = getAiCache(cacheKey);
+  const cached = await getAiCache(cacheKey);
   if (Array.isArray(cached)) {
     return {
       matches: mergeTagSearchMatches(normalizeTagSearchMatches(cached, existingTags, limit, 'cache'), local, limit),
@@ -115,7 +115,7 @@ export async function searchTags(mapId, query, limit = 30) {
 
   try {
     const aiMatches = await searchTagsWithDeepSeek(existingTags, cleanQuery, limit);
-    setAiCache(cacheKey, aiMatches);
+    await setAiCache(cacheKey, aiMatches);
     return {
       matches: mergeTagSearchMatches(aiMatches, local, limit),
       aiMeta: {

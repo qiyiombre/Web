@@ -38,7 +38,7 @@ import { buildInsights, generateAdvice } from './insights.js';
 import { searchTags, suggestTags } from './recommend.js';
 import { buildTagGroups, buildTagSimilarities } from './semantic.js';
 
-initializeDatabase();
+await initializeDatabase();
 
 const app = express();
 const port = Number(process.env.PORT ?? 3001);
@@ -47,6 +47,7 @@ const __dirname = path.dirname(__filename);
 const clientDist = path.resolve(__dirname, '../../client/dist');
 const COOKIE_NAME = 'nebula_session';
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
+const secureCookies = process.env.NODE_ENV === 'production' || process.env.COOKIE_SECURE === 'true';
 
 app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
@@ -55,7 +56,7 @@ app.use((req, res, next) => {
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') {
     res.sendStatus(204);
     return;
@@ -63,12 +64,14 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use((req, res, next) => {
-  const cookies = parseCookies(req.headers.cookie ?? '');
-  req.user = getSessionUser(cookies[COOKIE_NAME]);
-  req.sessionToken = cookies[COOKIE_NAME] ?? '';
-  next();
-});
+app.use(
+  asyncRoute(async (req, res, next) => {
+    const cookies = parseCookies(req.headers.cookie ?? '');
+    req.user = await getSessionUser(cookies[COOKIE_NAME]);
+    req.sessionToken = cookies[COOKIE_NAME] ?? '';
+    next();
+  })
+);
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, name: 'nebula-insight-server' });
@@ -82,58 +85,66 @@ app.get('/api/auth/me', (req, res) => {
   res.json({ user: req.user });
 });
 
-app.post('/api/auth/register', (req, res, next) => {
-  try {
-    const user = createUser(req.body.username, req.body.password);
-    const session = createSession(user.id);
+app.post(
+  '/api/auth/register',
+  asyncRoute(async (req, res) => {
+    const user = await createUser(req.body.username, req.body.password);
+    const session = await createSession(user.id);
     setSessionCookie(res, session.token);
     res.status(201).json({ user });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.post('/api/auth/login', (req, res) => {
-  const user = verifyUserCredentials(req.body.username, req.body.password);
-  if (!user) {
-    res.status(401).json({ message: '用户名或密码不正确' });
-    return;
-  }
+app.post(
+  '/api/auth/login',
+  asyncRoute(async (req, res) => {
+    const user = await verifyUserCredentials(req.body.username, req.body.password);
+    if (!user) {
+      res.status(401).json({ message: '用户名或密码不正确' });
+      return;
+    }
 
-  const session = createSession(user.id);
-  setSessionCookie(res, session.token);
-  res.json({ user });
-});
+    const session = await createSession(user.id);
+    setSessionCookie(res, session.token);
+    res.json({ user });
+  })
+);
 
-app.post('/api/auth/logout', (req, res) => {
-  deleteSession(req.sessionToken);
-  clearSessionCookie(res);
-  res.json({ ok: true });
-});
+app.post(
+  '/api/auth/logout',
+  asyncRoute(async (req, res) => {
+    await deleteSession(req.sessionToken);
+    clearSessionCookie(res);
+    res.json({ ok: true });
+  })
+);
 
 app.use('/api', requireAuth);
 
-app.get('/api/maps', (req, res) => {
-  res.json(listMaps(req.user.id));
-});
+app.get(
+  '/api/maps',
+  asyncRoute(async (req, res) => {
+    res.json(await listMaps(req.user.id));
+  })
+);
 
-app.post('/api/maps', (req, res, next) => {
-  try {
+app.post(
+  '/api/maps',
+  asyncRoute(async (req, res) => {
     const name = String(req.body.name ?? '').trim();
     if (!name) {
       res.status(400).json({ message: '星云图名称不能为空' });
       return;
     }
-    res.status(201).json(createMap(name, String(req.body.description ?? ''), req.user.id));
-  } catch (error) {
-    next(error);
-  }
-});
+    res.status(201).json(await createMap(name, String(req.body.description ?? ''), req.user.id));
+  })
+);
 
-app.patch('/api/maps/:id', (req, res, next) => {
-  const mapId = Number(req.params.id);
-  try {
-    const updated = updateMap(mapId, req.user.id, {
+app.patch(
+  '/api/maps/:id',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.params.id);
+    const updated = await updateMap(mapId, req.user.id, {
       name: req.body.name,
       description: req.body.description
     });
@@ -142,169 +153,170 @@ app.patch('/api/maps/:id', (req, res, next) => {
       return;
     }
     res.json(updated);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.get('/api/maps/:id/graph', async (req, res, next) => {
-  const mapId = Number(req.params.id);
-  try {
-    const map = getOwnedMap(mapId, req.user.id);
+app.get(
+  '/api/maps/:id/graph',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.params.id);
+    const map = await getOwnedMap(mapId, req.user.id);
     if (!map) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
 
-    const [tagSimilarityResult, tagGroupResult] = await Promise.all([buildTagSimilarities(mapId), buildTagGroups(mapId)]);
+    const [tagSimilarityResult, tagGroupResult, tags, logs, edges, domainCategories] = await Promise.all([
+      buildTagSimilarities(mapId),
+      buildTagGroups(mapId),
+      listTags(mapId),
+      listLogs(mapId),
+      getEdges(mapId),
+      listDomainCategories(mapId)
+    ]);
     res.json({
       map,
-      tags: listTags(mapId),
-      logs: listLogs(mapId),
-      edges: getEdges(mapId),
+      tags,
+      logs,
+      edges,
       tagSimilarities: tagSimilarityResult.relations,
       tagGroups: tagGroupResult.groups,
-      domainCategories: listDomainCategories(mapId),
+      domainCategories,
       aiMeta: {
         tagRelations: tagSimilarityResult.aiMeta,
         tagGroups: tagGroupResult.aiMeta
       }
     });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.get('/api/maps/:id/insights', async (req, res, next) => {
-  const mapId = Number(req.params.id);
-  try {
-    if (!getOwnedMap(mapId, req.user.id)) {
+app.get(
+  '/api/maps/:id/insights',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.params.id);
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
     res.json(await buildInsights(mapId));
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.post('/api/maps/:id/advice', async (req, res, next) => {
-  const mapId = Number(req.params.id);
-  try {
-    if (!getOwnedMap(mapId, req.user.id)) {
+app.post(
+  '/api/maps/:id/advice',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.params.id);
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
     res.json(await generateAdvice(mapId));
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.get('/api/maps/:id/domain-categories', (req, res, next) => {
-  const mapId = Number(req.params.id);
-  try {
-    if (!getOwnedMap(mapId, req.user.id)) {
+app.get(
+  '/api/maps/:id/domain-categories',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.params.id);
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
-    res.json(listDomainCategories(mapId));
-  } catch (error) {
-    next(error);
-  }
-});
+    res.json(await listDomainCategories(mapId));
+  })
+);
 
-app.post('/api/maps/:id/domain-categories', (req, res, next) => {
-  const mapId = Number(req.params.id);
-  try {
-    if (!getOwnedMap(mapId, req.user.id)) {
+app.post(
+  '/api/maps/:id/domain-categories',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.params.id);
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
     res.status(201).json(
-      createDomainCategory({
+      await createDomainCategory({
         mapId,
         name: req.body.name,
         color: req.body.color,
         keywords: req.body.keywords
       })
     );
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.post('/api/logs', (req, res, next) => {
-  try {
+app.post(
+  '/api/logs',
+  asyncRoute(async (req, res) => {
     const payload = normalizeLogPayload(req.body, { requireMapId: true });
-    if (!getOwnedMap(payload.mapId, req.user.id)) {
+    if (!(await getOwnedMap(payload.mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
-    res.status(201).json(createLog(payload));
-  } catch (error) {
-    next(error);
-  }
-});
+    res.status(201).json(await createLog(payload));
+  })
+);
 
-app.put('/api/logs/:id', (req, res, next) => {
-  try {
+app.put(
+  '/api/logs/:id',
+  asyncRoute(async (req, res) => {
     const logId = Number(req.params.id);
-    const existing = getLogById(logId);
-    if (!existing || !getOwnedMap(existing.mapId, req.user.id)) {
+    const existing = await getLogById(logId);
+    if (!existing || !(await getOwnedMap(existing.mapId, req.user.id))) {
       res.status(404).json({ message: '日志不存在' });
       return;
     }
 
     const payload = normalizeLogPayload(req.body, { requireMapId: false });
-    const updated = updateLog(logId, payload);
+    const updated = await updateLog(logId, payload);
     if (!updated) {
       res.status(404).json({ message: '日志不存在' });
       return;
     }
     res.json(updated);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.delete('/api/logs/:id', (req, res) => {
-  const logId = Number(req.params.id);
-  const existing = getLogById(logId);
-  if (!existing || !getOwnedMap(existing.mapId, req.user.id)) {
-    res.status(404).json({ message: '日志不存在' });
-    return;
-  }
+app.delete(
+  '/api/logs/:id',
+  asyncRoute(async (req, res) => {
+    const logId = Number(req.params.id);
+    const existing = await getLogById(logId);
+    if (!existing || !(await getOwnedMap(existing.mapId, req.user.id))) {
+      res.status(404).json({ message: '日志不存在' });
+      return;
+    }
 
-  const deleted = deleteLog(logId);
-  if (!deleted) {
-    res.status(404).json({ message: '日志不存在' });
-    return;
-  }
-  res.json({ ok: true });
-});
+    const deleted = await deleteLog(logId);
+    if (!deleted) {
+      res.status(404).json({ message: '日志不存在' });
+      return;
+    }
+    res.json({ ok: true });
+  })
+);
 
-app.post('/api/logs/restore', (req, res, next) => {
-  try {
+app.post(
+  '/api/logs/restore',
+  asyncRoute(async (req, res) => {
     const mapId = Number(req.body?.mapId);
-    if (!getOwnedMap(mapId, req.user.id)) {
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
-    res.status(201).json(restoreLogSnapshot(req.body));
-  } catch (error) {
-    next(error);
-  }
-});
+    res.status(201).json(await restoreLogSnapshot(req.body));
+  })
+);
 
-app.put('/api/domain-categories/:id', (req, res, next) => {
-  try {
-    const category = getOwnedDomainCategory(Number(req.params.id), req.user.id);
+app.put(
+  '/api/domain-categories/:id',
+  asyncRoute(async (req, res) => {
+    const category = await getOwnedDomainCategory(Number(req.params.id), req.user.id);
     if (!category) {
       res.status(404).json({ message: '领域大类不存在' });
       return;
     }
-    const updated = updateDomainCategory(category.id, {
+    const updated = await updateDomainCategory(category.id, {
       name: req.body.name,
       color: req.body.color,
       keywords: req.body.keywords
@@ -314,57 +326,54 @@ app.put('/api/domain-categories/:id', (req, res, next) => {
       return;
     }
     res.json(updated);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.delete('/api/domain-categories/:id', (req, res, next) => {
-  try {
-    const category = getOwnedDomainCategory(Number(req.params.id), req.user.id);
+app.delete(
+  '/api/domain-categories/:id',
+  asyncRoute(async (req, res) => {
+    const category = await getOwnedDomainCategory(Number(req.params.id), req.user.id);
     if (!category) {
       res.status(404).json({ message: '领域大类不存在' });
       return;
     }
-    const result = deleteDomainCategory(category.id);
+    const result = await deleteDomainCategory(category.id);
     if (!result.deleted) {
       res.status(404).json({ message: '领域大类不存在' });
       return;
     }
     res.json({ ok: true });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.post('/api/tags', (req, res, next) => {
-  try {
+app.post(
+  '/api/tags',
+  asyncRoute(async (req, res) => {
     const mapId = Number(req.body.mapId);
-    if (!getOwnedMap(mapId, req.user.id)) {
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
     res.status(201).json(
-      createTag({
+      await createTag({
         mapId,
         name: req.body.name,
         color: req.body.color
       })
     );
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.put('/api/tags/:id', (req, res, next) => {
-  try {
-    const tag = getOwnedTag(Number(req.params.id), req.user.id);
+app.put(
+  '/api/tags/:id',
+  asyncRoute(async (req, res) => {
+    const tag = await getOwnedTag(Number(req.params.id), req.user.id);
     if (!tag) {
       res.status(404).json({ message: '标签不存在' });
       return;
     }
 
-    const updated = updateTag(tag.id, {
+    const updated = await updateTag(tag.id, {
       name: req.body.name,
       color: req.body.color
     });
@@ -373,70 +382,64 @@ app.put('/api/tags/:id', (req, res, next) => {
       return;
     }
     res.json(updated);
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.delete('/api/tags/:id', (req, res, next) => {
-  try {
-    const tag = getOwnedTag(Number(req.params.id), req.user.id);
+app.delete(
+  '/api/tags/:id',
+  asyncRoute(async (req, res) => {
+    const tag = await getOwnedTag(Number(req.params.id), req.user.id);
     if (!tag) {
       res.status(404).json({ message: '标签不存在' });
       return;
     }
 
-    const result = deleteTag(tag.id);
+    const result = await deleteTag(tag.id);
     if (!result.deleted) {
       res.status(404).json({ message: '标签不存在' });
       return;
     }
     res.json({ ok: true });
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.post('/api/tags/restore', (req, res, next) => {
-  try {
+app.post(
+  '/api/tags/restore',
+  asyncRoute(async (req, res) => {
     const mapId = Number(req.body?.mapId);
-    if (!getOwnedMap(mapId, req.user.id)) {
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
-    res.status(201).json(restoreTagSnapshot(req.body));
-  } catch (error) {
-    next(error);
-  }
-});
+    res.status(201).json(await restoreTagSnapshot(req.body));
+  })
+);
 
-app.post('/api/tags/suggest', async (req, res, next) => {
-  const mapId = Number(req.body.mapId);
-  const content = String(req.body.content ?? '');
-  try {
-    if (!getOwnedMap(mapId, req.user.id)) {
+app.post(
+  '/api/tags/suggest',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.body.mapId);
+    const content = String(req.body.content ?? '');
+    if (!(await getOwnedMap(mapId, req.user.id))) {
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
     res.json(await suggestTags(mapId, content));
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
-app.post('/api/tags/search', async (req, res, next) => {
-  const mapId = Number(req.body.mapId);
-  const query = String(req.body.query ?? '');
-  try {
-    if (!getOwnedMap(mapId, req.user.id)) {
-      res.status(404).json({ message: '鏄熶簯鍥句笉瀛樺湪' });
+app.post(
+  '/api/tags/search',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.body.mapId);
+    const query = String(req.body.query ?? '');
+    if (!(await getOwnedMap(mapId, req.user.id))) {
+      res.status(404).json({ message: '星云图不存在' });
       return;
     }
     res.json(await searchTags(mapId, query));
-  } catch (error) {
-    next(error);
-  }
-});
+  })
+);
 
 if (existsSync(clientDist)) {
   app.use(express.static(clientDist));
@@ -462,30 +465,30 @@ function requireAuth(req, res, next) {
   next();
 }
 
-function getOwnedMap(mapId, userId) {
+async function getOwnedMap(mapId, userId) {
   if (!Number.isFinite(mapId)) {
     return null;
   }
   return getMapById(mapId, userId);
 }
 
-function getOwnedTag(tagId, userId) {
+async function getOwnedTag(tagId, userId) {
   if (!Number.isFinite(tagId)) {
     return null;
   }
-  const tag = getTagById(tagId);
-  if (!tag || !getOwnedMap(tag.mapId, userId)) {
+  const tag = await getTagById(tagId);
+  if (!tag || !(await getOwnedMap(tag.mapId, userId))) {
     return null;
   }
   return tag;
 }
 
-function getOwnedDomainCategory(categoryId, userId) {
+async function getOwnedDomainCategory(categoryId, userId) {
   if (!Number.isFinite(categoryId)) {
     return null;
   }
-  const category = getDomainCategoryById(categoryId);
-  if (!category || !getOwnedMap(category.mapId, userId)) {
+  const category = await getDomainCategoryById(categoryId);
+  if (!category || !(await getOwnedMap(category.mapId, userId))) {
     return null;
   }
   return category;
@@ -530,9 +533,17 @@ function parseCookies(header) {
 }
 
 function setSessionCookie(res, token) {
-  res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(token)}; HttpOnly; Path=/; Max-Age=${SESSION_MAX_AGE_SECONDS}; SameSite=Lax`);
+  res.setHeader('Set-Cookie', buildSessionCookie(`${COOKIE_NAME}=${encodeURIComponent(token)}`, SESSION_MAX_AGE_SECONDS));
 }
 
 function clearSessionCookie(res) {
-  res.setHeader('Set-Cookie', `${COOKIE_NAME}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax`);
+  res.setHeader('Set-Cookie', buildSessionCookie(`${COOKIE_NAME}=`, 0));
+}
+
+function buildSessionCookie(value, maxAge) {
+  return `${value}; HttpOnly; Path=/; Max-Age=${maxAge}; SameSite=Lax${secureCookies ? '; Secure' : ''}`;
+}
+
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
