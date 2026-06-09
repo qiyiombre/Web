@@ -37,6 +37,7 @@ const props = defineProps<{
   layoutMode: LayoutMode;
   activeTagIds: Set<number>;
   selectedLogId: number | null;
+  priorityTagIds?: number[];
 }>();
 
 const emit = defineEmits<{
@@ -49,6 +50,7 @@ const emit = defineEmits<{
 
 const FOCAL_LENGTH = 740;
 const VIEW_DISTANCE = 980;
+const UNIFORM_BYTE_SIZE = 80;
 
 const wrap = ref<HTMLDivElement | null>(null);
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -60,7 +62,7 @@ const heatMode = ref(false);
 const fullscreen = ref(false);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
 const camera = reactive({ yaw: 0, pitch: 0, panX: 0, panY: 0, panZ: 0 });
-const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2 });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2, target: 0 });
 
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
@@ -91,6 +93,11 @@ const tagTrendById = computed(() => {
   return trend;
 });
 
+const priorityRankByTagId = computed(() => {
+  const ids = props.priorityTagIds ?? [];
+  return new Map(ids.map((id, index) => [id, index]));
+});
+
 let device: any = null;
 let context: any = null;
 let format = '';
@@ -103,6 +110,14 @@ let lineInstanceBuffer: any = null;
 let backgroundPipeline: any = null;
 let nodePipeline: any = null;
 let linePipeline: any = null;
+let postPipeline: any = null;
+let postBindGroupLayout: any = null;
+let postBindGroup: any = null;
+let postSampler: any = null;
+let sceneTexture: any = null;
+let sceneView: any = null;
+let sceneTextureWidth = 0;
+let sceneTextureHeight = 0;
 let nodeInstanceCapacity = 0;
 let lineInstanceCapacity = 0;
 let starCount = 0;
@@ -262,7 +277,7 @@ async function createResources() {
   const usage = (globalThis as any).GPUBufferUsage;
   const shaderStage = (globalThis as any).GPUShaderStage;
   uniformBuffer = device.createBuffer({
-    size: 64,
+    size: UNIFORM_BYTE_SIZE,
     usage: usage.UNIFORM | usage.COPY_DST
   });
 
@@ -273,6 +288,18 @@ async function createResources() {
   bindGroup = device.createBindGroup({
     layout: bindGroupLayout,
     entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
+  });
+  postBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: shaderStage.FRAGMENT, sampler: {} },
+      { binding: 1, visibility: shaderStage.FRAGMENT, texture: {} },
+      { binding: 2, visibility: shaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+    ]
+  });
+  const postPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [postBindGroupLayout] });
+  postSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear'
   });
 
   quadBuffer = device.createBuffer({
@@ -358,6 +385,19 @@ async function createResources() {
     },
     primitive: { topology: 'triangle-list' }
   });
+  postPipeline = await createPipeline('WebGPU bloom postprocess', {
+    layout: postPipelineLayout,
+    vertex: {
+      module: await createShaderModule('WebGPU bloom shader', postShader),
+      entryPoint: 'vs'
+    },
+    fragment: {
+      module: await createShaderModule('WebGPU bloom shader', postShader),
+      entryPoint: 'fs',
+      targets: [{ format }]
+    },
+    primitive: { topology: 'triangle-list' }
+  });
 }
 
 async function createShaderModule(label: string, code: string) {
@@ -438,7 +478,35 @@ function resize() {
   canvas.value.style.height = '100%';
   buildStars();
   configureContext();
+  ensureSceneTarget(canvas.value.width, canvas.value.height);
   updateLabels();
+}
+
+function ensureSceneTarget(width: number, height: number) {
+  if (!device || !postBindGroupLayout || !postSampler || !format) {
+    return;
+  }
+  if (sceneTexture && sceneTextureWidth === width && sceneTextureHeight === height) {
+    return;
+  }
+  sceneTexture?.destroy?.();
+  const textureUsage = (globalThis as any).GPUTextureUsage;
+  sceneTexture = device.createTexture({
+    size: { width, height },
+    format,
+    usage: textureUsage.RENDER_ATTACHMENT | textureUsage.TEXTURE_BINDING
+  });
+  sceneView = sceneTexture.createView();
+  postBindGroup = device.createBindGroup({
+    layout: postBindGroupLayout,
+    entries: [
+      { binding: 0, resource: postSampler },
+      { binding: 1, resource: sceneView },
+      { binding: 2, resource: { buffer: uniformBuffer } }
+    ]
+  });
+  sceneTextureWidth = width;
+  sceneTextureHeight = height;
 }
 
 function buildStars() {
@@ -487,6 +555,7 @@ function render(timeMs: number) {
   animateCamera();
   updateGeometryBuffers();
   updateLabels();
+  const cursorVisible = nebulaCursor.visible ? 1 : 0;
   device.queue.writeBuffer(
     uniformBuffer,
     0,
@@ -506,17 +575,26 @@ function render(timeMs: number) {
       camera.panZ,
       0,
       0,
-      0
+      0,
+      nebulaCursor.x,
+      nebulaCursor.y,
+      cursorVisible,
+      nebulaCursor.target
     ])
   );
 
   device.pushErrorScope?.('validation');
   try {
+    ensureSceneTarget(canvas.value.width, canvas.value.height);
+    if (!sceneView || !postPipeline || !postBindGroup) {
+      return;
+    }
     const encoder = device.createCommandEncoder();
+    const outputView = context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
-          view: context.getCurrentTexture().createView(),
+          view: sceneView,
           clearValue: { r: 0.01, g: 0.018, b: 0.034, a: 1 },
           loadOp: 'clear',
           storeOp: 'store'
@@ -547,6 +625,21 @@ function render(timeMs: number) {
     }
 
     pass.end();
+
+    const postPass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: outputView,
+          clearValue: { r: 0.01, g: 0.018, b: 0.034, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store'
+        }
+      ]
+    });
+    postPass.setPipeline(postPipeline);
+    postPass.setBindGroup(0, postBindGroup);
+    postPass.draw(3);
+    postPass.end();
     device.queue.submit([encoder.finish()]);
   } catch (error) {
     webgpuError.value = error instanceof Error ? error.message : 'WebGPU 命令提交失败';
@@ -589,8 +682,11 @@ function updateGeometryBuffers() {
     const flatHeat = heatMode.value && heat === 'flat';
     const state = heatMode.value ? (flatHeat ? 0.28 : 1) : active || relatedToSelected ? 1 : related ? 0.62 : 0.18;
     const depth = 0.92 + seeded(tag.id + 2200) * 0.22;
+    const priority = tagPriority(tag.id);
+    const priorityScale = hasTagPriority() ? 0.88 + priority * 0.36 : 1;
+    const priorityAlpha = hasTagPriority() ? 0.72 + priority * 0.36 : 1;
     const activeScale = active || relatedToSelected ? 1.22 : related ? 1 : 0.92;
-    const coreRadius = point.r * 1.38 * depth * activeScale;
+    const coreRadius = point.r * 1.38 * depth * activeScale * priorityScale;
     const world = tagPoint3D(tag.id, point);
     pushNodeInstance(
       nodeRows,
@@ -598,7 +694,7 @@ function updateGeometryBuffers() {
       coreRadius * (active || relatedToSelected ? 1.44 : 1.12),
       3,
       color,
-      flatHeat ? (active || relatedToSelected ? 0.08 : related ? 0.035 : 0.018) : active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025,
+      (flatHeat ? (active || relatedToSelected ? 0.08 : related ? 0.035 : 0.018) : active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025) * priorityAlpha,
       state,
       seeded(tag.id + 700),
       0
@@ -609,7 +705,7 @@ function updateGeometryBuffers() {
       coreRadius * (active || relatedToSelected ? 1.82 : 1.48),
       1,
       color,
-      flatHeat ? (active || relatedToSelected ? 0.56 : related ? 0.38 : 0.24) : active || relatedToSelected ? 1 : related ? 0.92 : 0.46,
+      (flatHeat ? (active || relatedToSelected ? 0.56 : related ? 0.38 : 0.24) : active || relatedToSelected ? 1 : related ? 0.92 : 0.46) * priorityAlpha,
       state,
       seeded(tag.id + 800),
       0
@@ -627,17 +723,38 @@ function updateGeometryBuffers() {
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
     const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !highlighted;
-    const state = selected ? 1 : highlighted ? 0.82 : muted ? 0.12 : 0.26;
-    const radius = selected ? 8.2 : highlighted ? 7.4 : 6.1;
-    const glowAlpha = selected ? 0.68 : highlighted ? 0.34 : 0.1;
-    const glowRadius = selected ? 3.7 : highlighted ? 3 : 2.35;
-    const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : muted ? 0.38 : 0.84;
+    const state = selected ? 1 : highlighted ? 0.92 : muted ? 0.08 : 0.38;
+    const radius = selected ? 15.2 : highlighted ? 14.4 : 8.8;
+    const haloAlpha = selected ? 0.76 : highlighted ? 0.68 : muted ? 0.035 : 0.24;
+    const ringAlpha = selected ? 0.96 : highlighted ? 0.9 : muted ? 0.045 : 0.34;
+    const coreAlpha = selected ? 1 : highlighted ? 1 : muted ? 0.28 : 0.72;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
     const seed = seeded(log.id + 1900);
     const tilt = seeded(log.id + 341) * 1.1 - 0.55;
-    pushNodeInstance(nodeRows, world, radius * glowRadius, 3.25, logColor, glowAlpha, state, seeded(log.id + 1600), 0);
-    pushNodeInstance(nodeRows, world, radius * 1.18, 2, mixColor(logColor, { r: 1, g: 1, b: 1 }, 0.16), bodyAlpha, state, seed, tilt);
+    pushNodeInstance(
+      nodeRows,
+      world,
+      radius * (selected ? 3.55 : highlighted ? 3.35 : 2.28),
+      3.32,
+      mixColor(logColor, { r: 0.46, g: 0.92, b: 1 }, 0.32),
+      haloAlpha,
+      state,
+      seeded(log.id + 2110),
+      tilt
+    );
+    pushNodeInstance(
+      nodeRows,
+      world,
+      radius * (selected ? 2.72 : highlighted ? 2.54 : 1.66),
+      4.15,
+      mixColor(logColor, { r: 0.98, g: 0.28, b: 0.92 }, 0.36),
+      ringAlpha,
+      state,
+      seeded(log.id + 1600),
+      tilt
+    );
+    pushNodeInstance(nodeRows, world, radius * (selected || highlighted ? 1.08 : 0.78), 2, mixColor(logColor, { r: 0.86, g: 0.98, b: 1 }, 0.28), coreAlpha, state, seed, tilt);
   }
   nodeCount = Math.max(0, nodeRows.length / 12 - starCount);
   writeDynamicBuffer('node', new Float32Array(nodeRows), 48);
@@ -657,19 +774,20 @@ function updateGeometryBuffers() {
       }
       const tagMeta = props.graph.tags.find((item) => item.id === edge.tagId);
       const tagColor = tagMeta ? hexToRgb(tagMeta.color) : { r: 0.38, g: 0.84, b: 1 };
+      const neonColor = edgeNeonColor(tagColor);
       const color = [
-        Math.min(1, tagColor.r + 0.18),
-        Math.min(1, tagColor.g + 0.28),
-        Math.min(1, tagColor.b + 0.28),
-        relation.selected ? 0.74 : 0.56
+        neonColor.r,
+        neonColor.g,
+        neonColor.b,
+        relation.selected ? 0.8 : 0.64
       ];
       pushLineInstance(
         lineRows,
         tagPoint3D(edge.tagId, tagPoint),
         logPoint3D(logEntry, logPoint),
         color,
-        relation.selected ? 6.3 : 4.6,
-        relation.selected ? 1 : 0.84,
+        relation.selected ? 6.4 : 4.6,
+        relation.selected ? 1 : 0.72,
         seeded(edge.tagId * 31 + edge.logId)
       );
     }
@@ -1109,6 +1227,7 @@ function updateNebulaCursor(event: PointerEvent) {
   }
   nebulaCursor.x = point.x;
   nebulaCursor.y = point.y;
+  nebulaCursor.target = pickNodeAt(point.x, point.y) ? 1 : 0;
   nebulaCursor.visible = true;
 }
 
@@ -1125,6 +1244,7 @@ function canvasPointFromPointer(event: PointerEvent | MouseEvent) {
 
 function hideNebulaCursor() {
   nebulaCursor.visible = false;
+  nebulaCursor.target = 0;
 }
 
 function inspectLogAt(logId: number, event: PointerEvent) {
@@ -1599,8 +1719,25 @@ function logPoint3D(log: LogEntry, point: LayoutPoint): Point3D {
   };
 }
 
+function hasTagPriority() {
+  return (props.priorityTagIds?.length ?? 0) > 1;
+}
+
+function tagPriority(tagId: number) {
+  const total = props.priorityTagIds?.length ?? 0;
+  if (total <= 1) {
+    return 0.5;
+  }
+  const rank = priorityRankByTagId.value.get(tagId);
+  if (rank === undefined) {
+    return 0;
+  }
+  return 1 - rank / Math.max(1, total - 1);
+}
+
 function tagDepth(tagId: number) {
-  return (seeded(tagId + 4321) - 0.5) * 320;
+  const priorityDepth = hasTagPriority() ? (0.5 - tagPriority(tagId)) * 420 : 0;
+  return (seeded(tagId + 4321) - 0.5) * 320 + priorityDepth;
 }
 
 function hexToRgb(hex: string) {
@@ -1667,6 +1804,16 @@ function heatLabelColor(heat: 'up' | 'down' | 'flat', intensity = 0) {
 
 function rgbToCss(color: { r: number; g: number; b: number }) {
   return `rgb(${Math.round(color.r * 255)}, ${Math.round(color.g * 255)}, ${Math.round(color.b * 255)})`;
+}
+
+function edgeNeonColor(color: { r: number; g: number; b: number }) {
+  const maxChannel = Math.max(color.r, color.g, color.b, 0.001);
+  const boost = Math.max(1, 0.92 / maxChannel);
+  return {
+    r: clamp(color.r * boost, 0, 1),
+    g: clamp(color.g * boost, 0, 1),
+    b: clamp(color.b * boost, 0, 1)
+  };
 }
 
 function logVisualRgb(log: LogEntry) {
@@ -1839,6 +1986,94 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
 }
 `;
 
+const postShader = `
+struct VertexOut {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f
+};
+
+@group(0) @binding(0) var sceneSampler: sampler;
+@group(0) @binding(1) var sceneTexture: texture_2d<f32>;
+
+struct PostUniforms {
+  viewport: vec4f,
+  camera: vec4f,
+  space: vec4f,
+  extra: vec4f,
+  cursor: vec4f
+};
+
+@group(0) @binding(2) var<uniform> u: PostUniforms;
+
+@vertex
+fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
+  var pos = array<vec2f, 3>(
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+    vec2f(-1.0, 1.0)
+  );
+  let p = pos[vertexIndex];
+  var out: VertexOut;
+  out.position = vec4f(p, 0.0, 1.0);
+  out.uv = p * vec2f(0.5, -0.5) + vec2f(0.5);
+  return out;
+}
+
+fn sampleScene(uv: vec2f) -> vec3f {
+  return textureSample(sceneTexture, sceneSampler, clamp(uv, vec2f(0.0), vec2f(1.0))).rgb;
+}
+
+fn brightPart(color: vec3f) -> vec3f {
+  let luma = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+  let factor = smoothstep(0.25, 0.86, luma);
+  return color * factor;
+}
+
+fn ringMask(distance: f32, radius: f32, width: f32) -> f32 {
+  return 1.0 - smoothstep(width * 0.36, width, abs(distance - radius));
+}
+
+@fragment
+fn fs(input: VertexOut) -> @location(0) vec4f {
+  let dims = textureDimensions(sceneTexture);
+  let texel = 1.0 / vec2f(f32(dims.x), f32(dims.y));
+  let center = sampleScene(input.uv);
+  var bloom = brightPart(center) * 0.28;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(1.5, 0.0))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(-1.5, 0.0))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(0.0, 1.5))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(0.0, -1.5))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(2.4, 2.4))) * 0.07;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(-2.4, 2.4))) * 0.07;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(2.4, -2.4))) * 0.07;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(-2.4, -2.4))) * 0.07;
+  var color = center * 0.96 + bloom * 0.52;
+  let cursorVisible = clamp(u.cursor.z, 0.0, 1.0);
+  let cursorTarget = clamp(u.cursor.w, 0.0, 1.0);
+  let pixel = input.uv * max(u.viewport.xy, vec2f(1.0));
+  let delta = pixel - u.cursor.xy;
+  let d = length(delta);
+  let ringPulse = 0.5 + 0.5 * sin(u.viewport.w * 2.2);
+  let ring = ringMask(d, 8.4 + ringPulse * 0.45 + cursorTarget * 0.9, 0.95) * (0.28 + cursorTarget * 0.16)
+    + ringMask(d, 14.2 + cursorTarget * 1.2, 1.35) * cursorTarget * 0.12;
+  let ax = abs(delta.x);
+  let ay = abs(delta.y);
+  let tickX = (1.0 - smoothstep(0.8, 2.0, ay)) * smoothstep(5.2, 6.4, ax) * (1.0 - smoothstep(10.2, 11.7, ax));
+  let tickY = (1.0 - smoothstep(0.8, 2.0, ax)) * smoothstep(5.2, 6.4, ay) * (1.0 - smoothstep(10.2, 11.7, ay));
+  let ticks = (tickX + tickY) * (0.28 + cursorTarget * 0.18);
+  let core = exp(-d * 0.4) * 0.22 + (1.0 - smoothstep(0.0, 2.0, d)) * (0.52 + cursorTarget * 0.18);
+  let targetAura = exp(-d * 0.12) * cursorTarget * 0.08;
+  let probeCyan = vec3f(0.02, 0.95, 1.0);
+  let probeMagenta = vec3f(1.0, 0.22, 0.92);
+  let probeWhite = vec3f(1.0, 0.96, 0.82);
+  let probeColor = mix(probeCyan, probeMagenta, ringPulse * 0.12 + cursorTarget * 0.18);
+  color += cursorVisible * (probeColor * (ring + ticks + targetAura) + probeWhite * core);
+  let vignette = 1.0 - smoothstep(0.58, 1.25, length(input.uv - vec2f(0.5)));
+  let graded = pow(min(color, vec3f(1.0)), vec3f(0.94));
+  return vec4f(min(graded * (0.96 + vignette * 0.05), vec3f(1.0)), 1.0);
+}
+`;
+
 const projectionWGSL = `
 struct Uniforms {
   viewport: vec4f,
@@ -1938,14 +2173,29 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
     let c = cos(input.tilt);
     let s = sin(input.tilt);
     let local = vec2f(input.local.x * c - input.local.y * s, input.local.x * s + input.local.y * c);
-    let ringPoint = vec2f(local.x, local.y * 2.65);
-    let d = length(ringPoint);
-    if (d < 0.63 || d > 1.08 || local.y > 0.18) {
+    let diskPoint = vec2f(local.x * 0.88, local.y * 1.42);
+    let d = length(diskPoint);
+    if (d > 1.0) {
       discard;
     }
-    let band = exp(-abs(d - 0.84) * 23.0);
-    let shimmer = 0.68 + sin(input.time * 2.1 + input.seed * 8.0 + local.x * 8.0) * 0.18;
-    return vec4f(input.color.rgb * (0.74 + input.state * 0.35), band * input.color.a * shimmer);
+    let angle = atan2(diskPoint.y, diskPoint.x);
+    let spiralPhase = angle * 2.0 + d * 8.6 - input.time * 0.78 + input.seed * 6.283;
+    let spiral = 0.5 + 0.5 * sin(spiralPhase);
+    let arms = smoothstep(0.62, 0.98, spiral) * smoothstep(0.05, 0.18, d) * (1.0 - smoothstep(0.76, 1.0, d));
+    let opposite = smoothstep(0.68, 0.99, 0.5 + 0.5 * sin(spiralPhase + 3.14159)) * smoothstep(0.08, 0.24, d) * (1.0 - smoothstep(0.64, 0.98, d));
+    let diskGlow = (1.0 - smoothstep(0.14, 1.0, d)) * 0.24;
+    let rim = exp(-abs(d - 0.72) * 10.0) * 0.18;
+    let wake = smoothstep(0.78, 0.12, abs(local.y)) * smoothstep(0.88, -0.45, local.x) * (1.0 - smoothstep(0.54, 1.08, d)) * 0.22;
+    let spark = exp(-length(vec2f(local.x - 0.3, local.y * 1.65)) * 8.0) * 0.34;
+    let dust = smoothstep(0.82, 0.99, 0.5 + 0.5 * sin(angle * 9.0 + d * 17.0 + input.seed * 12.0)) * (1.0 - smoothstep(0.2, 0.98, d)) * 0.12;
+    let shimmer = 0.88 + sin(input.time * 2.0 + input.seed * 6.0 + angle * 2.0) * 0.1;
+    let alpha = (arms * 1.08 + opposite * 0.7 + diskGlow + rim + wake + spark + dust * 1.24) * input.color.a * shimmer * (0.72 + input.state * 0.42);
+    let cyan = vec3f(0.04, 0.96, 1.0);
+    let magenta = vec3f(1.0, 0.22, 0.9);
+    let violet = vec3f(0.52, 0.34, 1.0);
+    let armColor = mix(cyan, magenta, smoothstep(0.12, 0.92, d));
+    let color = mix(input.color.rgb, mix(armColor, violet, opposite * 0.32), 0.7 + input.state * 0.14);
+    return vec4f(min(color + vec3f(1.0, 0.86, 0.98) * (dust * 0.2 + spark * 0.36), vec3f(1.0)), min(1.0, alpha));
   }
 
   let d = length(input.local);
@@ -1959,14 +2209,19 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   }
 
   if (input.kind > 2.5) {
-    let logHalo = smoothstep(3.08, 3.22, input.kind);
+    let logHalo = smoothstep(3.08, 3.28, input.kind);
+    let angle = atan2(input.local.y, input.local.x);
+    let spiral = 0.5 + 0.5 * sin(angle * 3.0 + d * 10.5 - input.time * 0.8 + input.seed * 6.283);
+    let arms = smoothstep(0.62, 0.98, spiral) * (1.0 - smoothstep(0.12, 0.94, d)) * logHalo;
     let halo = 1.0 - smoothstep(0.08, 1.0, d);
-    let core = 1.0 - smoothstep(0.0, 0.48, d);
-    let pulse = 0.86 + sin(input.time * 2.2 + input.seed * 6.283) * 0.08;
+    let inner = 1.0 - smoothstep(0.0, 0.4, d);
+    let pulse = 0.88 + sin(input.time * 1.9 + input.seed * 6.283) * 0.08;
     let selectedGlow = smoothstep(0.92, 1.0, input.state) * logHalo;
-    let alpha = (halo * mix(0.62, 0.98, logHalo) + core * mix(0.2, 0.12, logHalo)) * input.color.a * pulse * (0.72 + input.state * 0.38);
-    let color = mix(input.color.rgb, vec3f(1.0, 0.96, 0.86), selectedGlow * 0.28) * (0.74 + core * 0.24 + selectedGlow * 0.18);
-    return vec4f(color, alpha);
+    let flare = exp(-abs(input.local.y) * 5.2) * (1.0 - smoothstep(0.3, 1.0, abs(input.local.x))) * 0.24 * logHalo;
+    let alpha = (halo * mix(0.36, 0.78, logHalo) + arms * 0.56 + flare + inner * mix(0.1, 0.24, logHalo)) * input.color.a * pulse * (0.68 + input.state * 0.42);
+    let dream = mix(vec3f(0.08, 0.9, 1.0), vec3f(0.98, 0.2, 0.88), spiral);
+    let color = mix(input.color.rgb, dream, logHalo * (0.34 + arms * 0.44 + selectedGlow * 0.14));
+    return vec4f(min(color * (0.86 + selectedGlow * 0.2) + vec3f(1.0) * inner * selectedGlow * 0.18, vec3f(1.0)), min(1.0, alpha));
   }
 
   if (input.kind > 0.5 && input.kind < 1.5) {
@@ -1981,22 +2236,18 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
     return vec4f(min(plasmaColor + whiteCore, vec3f(1.0)), alpha);
   }
 
-  if (d > 1.0) {
-    discard;
-  }
-  let z = sqrt(max(0.0, 1.0 - d * d));
-  let normal = normalize(vec3f(input.local.x, input.local.y, z));
-  let light = normalize(vec3f(-0.62, -0.42, 0.82));
-  let diffuse = clamp(dot(normal, light), 0.0, 1.0);
-  let rim = pow(1.0 - z, 2.2);
-  let bands = 0.5 + 0.5 * sin((input.local.y * 13.0 + input.local.x * 2.2) + input.seed * 8.0 + input.time * 0.16);
-  let terrain = 0.5 + 0.5 * sin(input.local.x * 19.0 + input.local.y * 11.0 + input.seed * 13.0);
-  let lava = smoothstep(0.72, 0.98, sin(input.local.x * 15.0 - input.local.y * 17.0 + input.seed * 7.0) * 0.5 + 0.5);
-  let colorBands = mix(input.color.rgb * (0.64 + bands * 0.36), input.color.rgb + vec3f(0.2, 0.16, 0.08), terrain * 0.2);
-  let hot = vec3f(1.0, 0.33, 0.12) * lava * input.state * 0.26;
-  let shade = colorBands * (0.24 + diffuse * 0.92) + vec3f(0.78, 0.9, 1.0) * rim * 0.17 + hot;
-  let glow = (1.0 - smoothstep(0.72, 1.0, d)) * input.color.a;
-  return vec4f(min(shade, vec3f(1.0)), glow);
+  let c = cos(input.tilt);
+  let s = sin(input.tilt);
+  let local = vec2f(input.local.x * c - input.local.y * s, input.local.x * s + input.local.y * c);
+  let angle = atan2(local.y, local.x);
+  let core = 1.0 - smoothstep(0.0, 0.32, d);
+  let glow = 1.0 - smoothstep(0.16, 0.94, d);
+  let ripple = exp(-abs(d - (0.5 + sin(input.time * 0.85 + input.seed * 6.283) * 0.035)) * 20.0);
+  let swirl = 0.5 + 0.5 * sin(angle * 3.5 + d * 9.0 - input.time * 0.9 + input.seed * 7.0);
+  let neon = mix(vec3f(0.1, 0.94, 1.0), vec3f(0.96, 0.24, 1.0), swirl);
+  let alpha = (core * 1.0 + glow * 0.4 + ripple * 0.28) * input.color.a * (0.78 + input.state * 0.34);
+  let color = mix(input.color.rgb, neon, 0.5 + ripple * 0.2) + vec3f(1.0, 0.98, 0.9) * core * 0.42;
+  return vec4f(min(color, vec3f(1.0)), min(1.0, alpha));
 }
 `;
 
@@ -2064,18 +2315,29 @@ fn vs(input: LineIn, @builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
-  let fade = smoothstep(0.02, 0.18, input.along) * (1.0 - smoothstep(0.82, 0.98, input.along));
-  let wave = fract(input.along * (5.2 + input.state * 1.4) - input.time * (0.42 + input.state * 0.34) + input.seed);
-  let bead = smoothstep(0.72, 0.88, wave) * (1.0 - smoothstep(0.88, 1.0, wave));
+  let fade = smoothstep(0.02, 0.16, input.along) * (1.0 - smoothstep(0.84, 0.99, input.along));
+  let flow = input.along * (5.2 + input.state * 1.25) - input.time * (0.52 + input.state * 0.34) + input.seed;
+  let wave = fract(flow);
+  let bead = smoothstep(0.5, 0.68, wave) * (1.0 - smoothstep(0.68, 0.92, wave));
+  let echoWave = fract(flow + 0.38);
+  let echo = smoothstep(0.54, 0.72, echoWave) * (1.0 - smoothstep(0.72, 0.95, echoWave));
   let side = abs(input.side);
-  let core = 1.0 - smoothstep(0.05, 0.82, side);
-  let mist = (1.0 - smoothstep(0.22, 1.0, side)) * 0.18;
-  let alpha = fade * input.color.a * (mist + bead * core * (0.9 + input.state * 0.56));
-  if (alpha < 0.008) {
+  let inner = 1.0 - smoothstep(0.02, 0.18, side);
+  let core = 1.0 - smoothstep(0.06, 0.42, side);
+  let halo = 1.0 - smoothstep(0.28, 1.0, side);
+  let pulse = 0.88 + sin(input.time * 2.15 + input.seed * 6.283 + input.along * 4.4) * 0.08;
+  let alpha = fade * input.color.a * (
+    halo * 0.26 +
+    core * (0.36 + input.state * 0.22) * pulse +
+    bead * inner * (0.86 + input.state * 0.72) +
+    echo * inner * (0.18 + input.state * 0.18)
+  );
+  if (alpha < 0.007) {
     discard;
   }
-  let color = input.color.rgb + vec3f(0.34, 0.52, 0.68) * bead * (0.28 + input.state * 0.42);
-  return vec4f(color, min(1.0, alpha));
+  let intensity = 0.68 + halo * 0.12 + core * 0.28 + bead * (0.62 + input.state * 0.4) + echo * 0.18;
+  let color = min(input.color.rgb * intensity, vec3f(1.0));
+  return vec4f(color, min(0.92, alpha));
 }
 `;
 </script>
@@ -2093,11 +2355,6 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
       @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
-    <div
-      class="nebula-star-cursor"
-      :class="{ visible: nebulaCursor.visible }"
-      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px) rotate(${nebulaCursor.angle}rad)` }"
-    ></div>
     <slot name="overlay"></slot>
 
     <div class="webgpu-label-layer">

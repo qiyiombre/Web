@@ -402,6 +402,30 @@ small {
   font-weight: 750;
 }
 
+.date-filter-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 4px 8px;
+  color: #aebdd0;
+  background: rgba(255, 255, 255, 0.055);
+  font-size: 12px;
+}
+
+.date-filter-controls input {
+  width: 118px;
+  min-height: 26px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 6px;
+  color: #d9e8f7;
+  background: rgba(2, 8, 18, 0.58);
+  font: inherit;
+}
+
 .stat-pill {
   display: inline-flex;
   align-items: center;
