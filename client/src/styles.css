@@ -1490,6 +1490,21 @@ small {
   padding: 0 9px;
 }
 
+.domain-category-focus {
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+}
+
+.domain-category-focus:hover,
+.domain-category-focus:focus-visible {
+  border-color: rgba(98, 214, 255, 0.42);
+  background: rgba(98, 214, 255, 0.09);
+}
+
 .domain-category-card strong,
 .domain-category-card small {
   overflow: hidden;

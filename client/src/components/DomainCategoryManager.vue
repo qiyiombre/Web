@@ -11,6 +11,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   changed: [];
+  focus: [category: DomainCategory];
 }>();
 
 const categoryName = ref('');
@@ -186,11 +187,16 @@ function parseKeywords(value: string) {
           </button>
         </template>
         <template v-else>
-          <div class="domain-category-card">
+          <button
+            class="domain-category-card domain-category-focus"
+            type="button"
+            :title="`定位到${category.name}`"
+            @click="emit('focus', category)"
+          >
             <span class="tag-dot" :style="{ backgroundColor: category.color }"></span>
             <strong>{{ category.name }}</strong>
             <small>{{ category.keywords.length ? category.keywords.join(' / ') : '无关键词' }}</small>
-          </div>
+          </button>
           <button class="icon-button" title="修改大类" @click="startCategoryEdit(category)">
             <Edit3 :size="15" />
           </button>

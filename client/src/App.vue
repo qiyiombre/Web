@@ -38,6 +38,7 @@ import {
   clearDraft,
   createLog,
   createMap,
+  deleteMap,
   deleteTag,
   deleteLog,
   generateAdvice,
@@ -54,7 +55,19 @@ import {
   updateMap,
   updateTag
 } from './services/api';
-import type { AdviceResponse, AiMeta, DraftLog, GraphData, Insight, LayoutMode, LogEntry, NebulaMap, TagNode, UserAccount } from './types/domain';
+import type {
+  AdviceResponse,
+  AiMeta,
+  DomainCategory,
+  DraftLog,
+  GraphData,
+  Insight,
+  LayoutMode,
+  LogEntry,
+  NebulaMap,
+  TagNode,
+  UserAccount
+} from './types/domain';
 
 type NebulaLogCard = {
   logId: number;
@@ -67,6 +80,8 @@ type NebulaLogCard = {
 type NebulaRenderer = {
   focusTag: (tagId: number) => void;
   focusLog: (logId: number) => NebulaLogCard | null;
+  focusDomainCategory: (category: DomainCategory) => boolean;
+  fitAllTags: () => boolean;
   resetTagLayout: () => void;
   refreshLayout: () => void;
   saveLayout: () => boolean;
@@ -677,6 +692,51 @@ async function saveRenameMap(mapId = renamingMapId.value) {
   }
 }
 
+function requestDeleteMap(map: NebulaMap) {
+  openNebulaConfirm({
+    title: '删除星云图',
+    message: `确定删除「${map.name}」吗？里面的日志、标签、领域大类都会一起删除。`,
+    confirmLabel: '删除',
+    onConfirm: async () => {
+      await deleteMap(map.id);
+      await clearDraft(map.id).catch(() => undefined);
+      maps.value = maps.value.filter((item) => item.id !== map.id);
+      if (renamingMapId.value === map.id) {
+        cancelRenameMap();
+      }
+
+      if (activeMapId.value === map.id) {
+        localStorage.removeItem(activeMapStorageKey());
+        const nextMap = maps.value[0] ?? null;
+        if (nextMap) {
+          await selectMap(nextMap.id);
+        } else {
+          clearActiveMapState();
+        }
+      } else {
+        await refreshMaps();
+      }
+      showNotice('星云图已删除');
+    }
+  });
+}
+
+function clearActiveMapState() {
+  activeMapId.value = null;
+  graph.value = null;
+  insights.value = null;
+  activeTagIds.value = new Set();
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  editorMode.value = 'new';
+  editingLog.value = null;
+  draft.value = undefined;
+  draftRestored.value = false;
+  draftSavedAt.value = '';
+  layoutDirty.value = false;
+  rightPanel.value = null;
+}
+
 function uniqueMapName(baseName: string) {
   const names = new Set(maps.value.map((map) => map.name));
   if (!names.has(baseName)) {
@@ -1118,6 +1178,23 @@ function focusTag(tagId: number) {
   canvasRef.value?.focusTag(tagId);
 }
 
+async function focusDomainCategory(category: DomainCategory) {
+  if (layoutMode.value !== 'domain') {
+    layoutMode.value = 'domain';
+    localStorage.setItem('nebula.layoutMode', 'domain');
+  }
+  activeTagIds.value = new Set();
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  await nextTick();
+  window.requestAnimationFrame(() => {
+    const focused = canvasRef.value?.focusDomainCategory(category) ?? false;
+    if (!focused) {
+      canvasRef.value?.fitAllTags();
+    }
+  });
+}
+
 function previousRelatedPage() {
   relatedPage.value = Math.max(0, relatedPage.value - 1);
 }
@@ -1373,6 +1450,9 @@ function formatTime(value: Date) {
               <button class="icon-button map-edit-button" title="修改星云图名称" @click="startRenameMap(map.id, 'list')">
                 <Edit3 :size="15" />
               </button>
+              <button class="icon-button map-edit-button danger" title="删除星云图" @click.stop="requestDeleteMap(map)">
+                <Trash2 :size="15" />
+              </button>
             </template>
           </div>
         </div>
@@ -1435,6 +1515,7 @@ function formatTime(value: Date) {
         :map-id="activeMapId"
         :domain-categories="visibleGraph.domainCategories ?? []"
         @changed="refreshData"
+        @focus="focusDomainCategory"
       />
     </aside>
 

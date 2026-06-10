@@ -75,6 +75,12 @@ export function updateMap(id: number, payload: { name: string; description?: str
   });
 }
 
+export function deleteMap(id: number) {
+  return request<{ ok: true }>(`/maps/${id}`, {
+    method: 'DELETE'
+  });
+}
+
 export function getGraph(mapId: number) {
   return request<GraphData>(`/maps/${mapId}/graph`);
 }

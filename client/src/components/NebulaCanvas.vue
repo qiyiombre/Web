@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import type { GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
+import type { DomainCategory, GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
 
 type PickNode =
   | { kind: 'tag'; id: number; x: number; y: number; r: number }
@@ -71,10 +71,13 @@ let lastPointer = { x: 0, y: 0 };
 let dragButton = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
+let pendingFocusCategory: DomainCategory | null = null;
+let pendingFitAllTags = true;
 let dragSnapshot: LayoutSnapshot | null = null;
 let lastPanInteractionAt = 0;
 const layoutHistory: LayoutSnapshot[] = [];
 const redoHistory: LayoutSnapshot[] = [];
+const MIN_VIEW_SCALE = 0.16;
 
 const layoutWorker = new Worker(new URL('../workers/layoutWorker.ts', import.meta.url), { type: 'module' });
 layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
@@ -96,7 +99,15 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
   if (pendingFocusTagId !== null) {
     const tagId = pendingFocusTagId;
     pendingFocusTagId = null;
+    pendingFitAllTags = false;
     centerTag(tagId);
+  } else if (pendingFocusCategory) {
+    const category = pendingFocusCategory;
+    pendingFocusCategory = null;
+    pendingFitAllTags = false;
+    focusDomainCategory(category);
+  } else if (pendingFitAllTags && fitAllTags(false)) {
+    pendingFitAllTags = false;
   }
   draw();
 };
@@ -112,7 +123,7 @@ onMounted(async () => {
   resize();
   window.addEventListener('resize', resize);
   animate();
-  requestLayout();
+  requestLayout({ fitAll: true });
 });
 
 onBeforeUnmount(() => {
@@ -126,14 +137,14 @@ watch(
   () => [props.graph.map.id, props.layoutMode],
   () => {
     loadManualPositions();
-    requestLayout();
+    requestLayout({ fitAll: true });
   },
   { immediate: true }
 );
 
 watch(
   () => [props.graph.tags, props.graph.logs, props.graph.tagSimilarities, props.graph.tagGroups, props.layoutMode],
-  () => requestLayout(),
+  () => requestLayout({ fitAll: true }),
   { deep: true }
 );
 
@@ -146,6 +157,8 @@ watch(
 defineExpose({
   focusTag,
   focusLog,
+  focusDomainCategory,
+  fitAllTags,
   resetTagLayout,
   refreshLayout,
   saveLayout,
@@ -171,6 +184,9 @@ function resize() {
     transform.x = rect.width / 2;
     transform.y = rect.height / 2;
   }
+  if (pendingFitAllTags && tagPositions.size > 0 && fitAllTags(false)) {
+    pendingFitAllTags = false;
+  }
   draw();
 }
 
@@ -184,7 +200,10 @@ function animate(timestamp = 0) {
   raf = requestAnimationFrame(animate);
 }
 
-function requestLayout() {
+function requestLayout(options: { fitAll?: boolean } = {}) {
+  if (options.fitAll) {
+    pendingFitAllTags = true;
+  }
   latestLayoutRequestId += 1;
   layoutBusy.value = true;
   layoutWorker.postMessage({
@@ -672,7 +691,7 @@ function onWheel(event: WheelEvent) {
   }
   const zoom = event.deltaY < 0 ? 1.08 : 0.92;
   const before = screenToWorld(event.offsetX, event.offsetY);
-  transform.scale = Math.min(2.4, Math.max(0.45, transform.scale * zoom));
+  transform.scale = Math.min(2.4, Math.max(MIN_VIEW_SCALE, transform.scale * zoom));
   const after = worldToScreen(before.x, before.y);
   transform.x += event.offsetX - after.x;
   transform.y += event.offsetY - after.y;
@@ -763,6 +782,35 @@ function focusLog(logId: number) {
   };
 }
 
+function focusDomainCategory(category: DomainCategory) {
+  if (!canvas.value) {
+    pendingFocusCategory = category;
+    return false;
+  }
+  if (layoutBusy.value) {
+    pendingFocusCategory = category;
+    pendingFitAllTags = false;
+    return true;
+  }
+  const tagIds = resolveCategoryTagIds(category);
+  if (tagIds.length === 0) {
+    if (tagPositions.size === 0) {
+      pendingFocusCategory = category;
+      requestLayout();
+      return true;
+    }
+    return false;
+  }
+  return fitTagBounds(tagIds, { margin: 92, minScale: 0.26, maxScale: 1.18 });
+}
+
+function fitAllTags(drawNow = true) {
+  return fitTagBounds(
+    props.graph.tags.map((tag) => tag.id),
+    { margin: 54, minScale: MIN_VIEW_SCALE, maxScale: 1.08, drawNow }
+  );
+}
+
 function centerTag(tagId: number) {
   if (!canvas.value) {
     return;
@@ -775,6 +823,87 @@ function centerTag(tagId: number) {
   transform.scale = Math.max(transform.scale, 1.08);
   transform.x = rect.width / 2 - point.x * transform.scale;
   transform.y = rect.height / 2 - point.y * transform.scale;
+}
+
+function fitTagBounds(
+  tagIds: number[],
+  options: { margin?: number; minScale?: number; maxScale?: number; drawNow?: boolean } = {}
+) {
+  if (!canvas.value || tagIds.length === 0) {
+    return false;
+  }
+  const rect = canvas.value.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+  const idSet = new Set(tagIds);
+  const points = props.graph.tags
+    .filter((tag) => idSet.has(tag.id))
+    .map((tag) => {
+      const point = tagPositions.get(tag.id);
+      return point ? { tag, point } : null;
+    })
+    .filter((item): item is { tag: TagNode; point: LayoutPoint } => Boolean(item));
+
+  if (points.length === 0) {
+    return false;
+  }
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const { tag, point } of points) {
+    const labelPadding = Math.max(96, tag.name.length * 18);
+    minX = Math.min(minX, point.x - point.r - labelPadding);
+    maxX = Math.max(maxX, point.x + point.r + labelPadding);
+    minY = Math.min(minY, point.y - point.r - 78);
+    maxY = Math.max(maxY, point.y + point.r + 118);
+  }
+
+  const margin = options.margin ?? 56;
+  const usableWidth = Math.max(120, rect.width - margin * 2);
+  const usableHeight = Math.max(120, rect.height - margin * 2);
+  const boundsWidth = Math.max(1, maxX - minX);
+  const boundsHeight = Math.max(1, maxY - minY);
+  const nextScale = Math.min(
+    options.maxScale ?? 1.08,
+    Math.max(options.minScale ?? MIN_VIEW_SCALE, Math.min(usableWidth / boundsWidth, usableHeight / boundsHeight))
+  );
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+
+  transform.scale = nextScale;
+  transform.x = rect.width / 2 - centerX * nextScale;
+  transform.y = rect.height / 2 - centerY * nextScale;
+  if (options.drawNow ?? true) {
+    draw();
+  }
+  return true;
+}
+
+function resolveCategoryTagIds(category: DomainCategory) {
+  const cleanName = normalizeText(category.name);
+  const matchingGroup = props.graph.tagGroups.find((group) => normalizeText(group.name) === cleanName);
+  if (matchingGroup?.tagIds.length) {
+    return matchingGroup.tagIds.filter((id) => tagPositions.has(id));
+  }
+
+  const keywords = [category.name, ...(category.keywords ?? [])].map(normalizeText).filter(Boolean);
+  if (keywords.length === 0) {
+    return [];
+  }
+  return props.graph.tags
+    .filter((tag) => {
+      const name = normalizeText(tag.name);
+      return keywords.some((keyword) => name.includes(keyword) || keyword.includes(name));
+    })
+    .map((tag) => tag.id)
+    .filter((id) => tagPositions.has(id));
+}
+
+function normalizeText(value: string) {
+  return String(value ?? '').trim().toLowerCase();
 }
 
 function pickNodeAt(screenX: number, screenY: number) {

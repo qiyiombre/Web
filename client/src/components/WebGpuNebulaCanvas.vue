@@ -1,7 +1,7 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { Maximize2, Minimize2 } from 'lucide-vue-next';
-import type { GraphData, LayoutMode, LogEntry } from '../types/domain';
+import type { DomainCategory, GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
 
 type PickNode =
   | { kind: 'tag'; id: number; x: number; y: number; r: number }
@@ -126,8 +126,10 @@ let lineCount = 0;
 let raf = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
+let pendingFocusCategory: DomainCategory | null = null;
+let layoutBusy = false;
 let isDragging = false;
-let dragMode: 'orbit' | 'pan' | 'tag' | 'log' | null = null;
+let dragMode: 'pan' | 'orbit' | 'tag' | 'log' | null = null;
 let dragTagId: number | null = null;
 let dragLogId: number | null = null;
 let dragTagOffset = { x: 0, y: 0 };
@@ -161,10 +163,17 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
   for (const point of result.logPositions) {
     logPositions.set(point.id, { x: point.x, y: point.y, r: point.r });
   }
+  layoutBusy = false;
   if (pendingFocusTagId !== null) {
     const tagId = pendingFocusTagId;
     pendingFocusTagId = null;
+    pendingFitAllFrontView = false;
     centerTag(tagId);
+  } else if (pendingFocusCategory) {
+    const category = pendingFocusCategory;
+    pendingFocusCategory = null;
+    pendingFitAllFrontView = false;
+    focusDomainCategory(category);
   } else if (pendingFitAllFrontView) {
     pendingFitAllFrontView = !fitAllTagsFrontView();
   }
@@ -172,6 +181,7 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
 };
 
 layoutWorker.onerror = (event) => {
+  layoutBusy = false;
   webgpuMessage.value = `布局 Worker 运行失败：${event.message}`;
 };
 
@@ -224,6 +234,8 @@ watch(
 defineExpose({
   focusTag,
   focusLog,
+  focusDomainCategory,
+  fitAllTags: fitAllTagsFrontView,
   resetTagLayout,
   refreshLayout,
   saveLayout,
@@ -264,7 +276,7 @@ async function initWebGpu() {
     await createResources();
   } catch (error) {
     webgpuReady.value = false;
-    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 渲染资源创建失败';
+    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 娓叉煋璧勬簮鍒涘缓澶辫触';
     return;
   }
   configureContext();
@@ -312,24 +324,24 @@ async function createResources() {
     new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1])
   );
 
-  backgroundPipeline = await createPipeline('WebGPU 背景星云管线', {
+  backgroundPipeline = await createPipeline('WebGPU 鑳屾櫙鏄熶簯绠＄嚎', {
     layout: pipelineLayout,
     vertex: {
-      module: await createShaderModule('WebGPU 背景星云 shader', backgroundShader),
+      module: await createShaderModule('WebGPU 鑳屾櫙鏄熶簯 shader', backgroundShader),
       entryPoint: 'vs'
     },
     fragment: {
-      module: await createShaderModule('WebGPU 背景星云 shader', backgroundShader),
+      module: await createShaderModule('WebGPU 鑳屾櫙鏄熶簯 shader', backgroundShader),
       entryPoint: 'fs',
       targets: [{ format }]
     },
     primitive: { topology: 'triangle-list' }
   });
 
-  nodePipeline = await createPipeline('WebGPU 恒星行星管线', {
+  nodePipeline = await createPipeline('WebGPU 鎭掓槦琛屾槦绠＄嚎', {
     layout: pipelineLayout,
     vertex: {
-      module: await createShaderModule('WebGPU 恒星行星 shader', nodeShader),
+      module: await createShaderModule('WebGPU 鎭掓槦琛屾槦 shader', nodeShader),
       entryPoint: 'vs',
       buffers: [
         {
@@ -353,7 +365,7 @@ async function createResources() {
       ]
     },
     fragment: {
-      module: await createShaderModule('WebGPU 恒星行星 shader', nodeShader),
+      module: await createShaderModule('WebGPU 鎭掓槦琛屾槦 shader', nodeShader),
       entryPoint: 'fs',
       targets: [blendTarget()]
     },
@@ -510,21 +522,12 @@ function ensureSceneTarget(width: number, height: number) {
 }
 
 function buildStars() {
-  stars = Array.from({ length: 1200 }, (_, index) => {
-    const seed = seeded(index + 37);
-    return {
-      x: (seeded(index + 17) - 0.5) * 1900,
-      y: (seeded(index + 89) - 0.5) * 1120,
-      z: (seeded(index + 191) - 0.5) * 1450,
-      r: 0.62 + seeded(index + 144) * 1.72,
-      alpha: 0.11 + seeded(index + 233) * 0.24,
-      seed
-    };
-  });
+  stars = [];
 }
 
 function requestLayout() {
   latestLayoutRequestId += 1;
+  layoutBusy = true;
   layoutWorker.postMessage({
     requestId: latestLayoutRequestId,
     tags: props.graph.tags.map((tag) => ({
@@ -642,12 +645,12 @@ function render(timeMs: number) {
     postPass.end();
     device.queue.submit([encoder.finish()]);
   } catch (error) {
-    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 命令提交失败';
+    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 鍛戒护鎻愪氦澶辫触';
   }
   device.popErrorScope?.()
     .then((error: any) => {
       if (error) {
-        webgpuError.value = error.message ?? 'WebGPU 渲染命令验证失败';
+        webgpuError.value = error.message ?? 'WebGPU 娓叉煋鍛戒护楠岃瘉澶辫触';
       }
     })
     .catch(() => {});
@@ -725,8 +728,6 @@ function updateGeometryBuffers() {
     const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !highlighted;
     const state = selected ? 1 : highlighted ? 0.92 : muted ? 0.08 : 0.38;
     const radius = selected ? 15.2 : highlighted ? 14.4 : 8.8;
-    const haloAlpha = selected ? 0.76 : highlighted ? 0.68 : muted ? 0.035 : 0.24;
-    const ringAlpha = selected ? 0.96 : highlighted ? 0.9 : muted ? 0.045 : 0.34;
     const coreAlpha = selected ? 1 : highlighted ? 1 : muted ? 0.28 : 0.72;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
@@ -735,26 +736,14 @@ function updateGeometryBuffers() {
     pushNodeInstance(
       nodeRows,
       world,
-      radius * (selected ? 3.55 : highlighted ? 3.35 : 2.28),
-      3.32,
-      mixColor(logColor, { r: 0.46, g: 0.92, b: 1 }, 0.32),
-      haloAlpha,
+      radius * (selected ? 4.8 : highlighted ? 4.2 : 3.2),
+      4.0,
+      logColor,
+      coreAlpha,
       state,
-      seeded(log.id + 2110),
+      seed,
       tilt
     );
-    pushNodeInstance(
-      nodeRows,
-      world,
-      radius * (selected ? 2.72 : highlighted ? 2.54 : 1.66),
-      4.15,
-      mixColor(logColor, { r: 0.98, g: 0.28, b: 0.92 }, 0.36),
-      ringAlpha,
-      state,
-      seeded(log.id + 1600),
-      tilt
-    );
-    pushNodeInstance(nodeRows, world, radius * (selected || highlighted ? 1.08 : 0.78), 2, mixColor(logColor, { r: 0.86, g: 0.98, b: 1 }, 0.28), coreAlpha, state, seed, tilt);
   }
   nodeCount = Math.max(0, nodeRows.length / 12 - starCount);
   writeDynamicBuffer('node', new Float32Array(nodeRows), 48);
@@ -1172,7 +1161,7 @@ function onWheel(event: WheelEvent) {
   cameraTarget = null;
   const wheelDelta = normalizeWheelDelta(event);
   const zoom = clamp(Math.exp(-wheelDelta * 0.0012), 0.76, 1.32);
-  transform.scale = Math.min(2.55, Math.max(0.42, transform.scale * zoom));
+  transform.scale = Math.min(2.55, Math.max(0.05, transform.scale * zoom));
   updateLabels();
 }
 
@@ -1337,6 +1326,28 @@ function focusLog(logId: number) {
     width: rect.width,
     height: rect.height
   };
+}
+
+function focusDomainCategory(category: DomainCategory) {
+  if (!canvas.value) {
+    pendingFocusCategory = category;
+    return false;
+  }
+  if (layoutBusy) {
+    pendingFocusCategory = category;
+    pendingFitAllFrontView = false;
+    return true;
+  }
+  const tagIds = resolveCategoryTagIds(category);
+  if (tagIds.length === 0) {
+    if (tagPositions.size === 0) {
+      pendingFocusCategory = category;
+      requestLayout();
+      return true;
+    }
+    return false;
+  }
+  return fitTagIdsFrontView(tagIds, { marginX: 168, marginY: 136, minScale: 0.14, maxScale: 1.22 });
 }
 
 function centerTag(tagId: number) {
@@ -1580,18 +1591,49 @@ function fitAllTagsFrontView() {
     return Boolean(canvas.value);
   }
 
+  return fitTagIdsFrontView(
+    props.graph.tags.map((tag) => tag.id),
+    { marginX: 128, marginY: 112, minScale: 0.05, maxScale: 1.18 }
+  );
+}
+
+function fitTagIdsFrontView(
+  tagIds: number[],
+  options: { marginX?: number; marginY?: number; minScale?: number; maxScale?: number } = {}
+) {
+  if (!canvas.value || tagIds.length === 0) {
+    return false;
+  }
   const rect = canvas.value.getBoundingClientRect();
-  const points = [...tagPositions.values()];
-  const minX = Math.min(...points.map((point) => point.x - point.r * 2.2));
-  const maxX = Math.max(...points.map((point) => point.x + point.r * 2.2));
-  const minY = Math.min(...points.map((point) => point.y - point.r * 3.1));
-  const maxY = Math.max(...points.map((point) => point.y + point.r * 3.4));
+  const idSet = new Set(tagIds);
+  const points = props.graph.tags
+    .filter((tag) => idSet.has(tag.id))
+    .map((tag) => {
+      const point = tagPositions.get(tag.id);
+      return point ? { tag, point } : null;
+    })
+    .filter((item): item is { tag: TagNode; point: LayoutPoint } => Boolean(item));
+
+  if (points.length === 0) {
+    return false;
+  }
+
+  const minX = Math.min(...points.map(({ tag, point }) => point.x - point.r * 2.2 - Math.max(96, tag.name.length * 18)));
+  const maxX = Math.max(...points.map(({ tag, point }) => point.x + point.r * 2.2 + Math.max(96, tag.name.length * 18)));
+  const minY = Math.min(...points.map(({ point }) => point.y - point.r * 3.1 - 72));
+  const maxY = Math.max(...points.map(({ point }) => point.y + point.r * 3.4 + 112));
   const worldWidth = Math.max(1, maxX - minX);
   const worldHeight = Math.max(1, maxY - minY);
   const projection = FOCAL_LENGTH / VIEW_DISTANCE;
-  const availableWidth = Math.max(240, rect.width - 128);
-  const availableHeight = Math.max(180, rect.height - 112);
-  const nextScale = Math.min(1.18, Math.max(0.38, Math.min(availableWidth / (worldWidth * projection), availableHeight / (worldHeight * projection))));
+  const availableWidth = Math.max(240, rect.width - (options.marginX ?? 128));
+  const availableHeight = Math.max(180, rect.height - (options.marginY ?? 112));
+  const nextScale = Math.min(
+    options.maxScale ?? 1.18,
+    Math.max(
+      options.minScale ?? 0.05,
+      Math.min(availableWidth / (worldWidth * projection), availableHeight / (worldHeight * projection))
+    )
+  );
 
   cameraTarget = null;
   transform.scale = nextScale;
@@ -1601,6 +1643,30 @@ function fitAllTagsFrontView() {
   camera.panY = (minY + maxY) / 2;
   camera.panZ = 0;
   return true;
+}
+
+function resolveCategoryTagIds(category: DomainCategory) {
+  const cleanName = normalizeText(category.name);
+  const matchingGroup = props.graph.tagGroups.find((group) => normalizeText(group.name) === cleanName);
+  if (matchingGroup?.tagIds.length) {
+    return matchingGroup.tagIds.filter((id) => tagPositions.has(id));
+  }
+
+  const keywords = [category.name, ...(category.keywords ?? [])].map(normalizeText).filter(Boolean);
+  if (keywords.length === 0) {
+    return [];
+  }
+  return props.graph.tags
+    .filter((tag) => {
+      const name = normalizeText(tag.name);
+      return keywords.some((keyword) => name.includes(keyword) || keyword.includes(name));
+    })
+    .map((tag) => tag.id)
+    .filter((id) => tagPositions.has(id));
+}
+
+function normalizeText(value: string) {
+  return String(value ?? '').trim().toLowerCase();
 }
 
 function screenToWorld(x: number, y: number) {
@@ -1817,28 +1883,45 @@ function edgeNeonColor(color: { r: number; g: number; b: number }) {
 }
 
 function logVisualRgb(log: LogEntry) {
+  const palettes = [
+    { r: 1.0, g: 0.15, b: 0.55 }, // Neon Pink
+    { r: 0.15, g: 1.0, b: 0.25 }, // Neon Green
+    { r: 1.0, g: 0.85, b: 0.0 },  // Neon Yellow
+    { r: 1.0, g: 0.45, b: 0.0 },  // Neon Orange
+    { r: 0.85, g: 0.15, b: 1.0 }, // Neon Purple
+    { r: 0.0, g: 1.0, b: 0.75 },  // Bright Teal
+    { r: 1.0, g: 0.25, b: 0.25 }, // Bright Red
+    { r: 0.65, g: 1.0, b: 0.0 },  // Lime
+    { r: 1.0, g: 0.0, b: 1.0 }    // Magenta
+  ];
+
   if (log.tags.length === 0) {
-    return { r: 0.57, g: 0.86, b: 1 };
+    return palettes[log.id % palettes.length];
   }
-  if (log.tags.length === 1) {
-    return hexToRgb(log.tags[0].color);
-  }
+
   const total = log.tags.reduce(
     (acc, tag) => {
       const color = hexToRgb(tag.color);
-      return {
-        r: acc.r + color.r,
-        g: acc.g + color.g,
-        b: acc.b + color.b
-      };
+      return { r: acc.r + color.r, g: acc.g + color.g, b: acc.b + color.b };
     },
     { r: 0, g: 0, b: 0 }
   );
-  return {
+
+  const avg = {
     r: total.r / log.tags.length,
     g: total.g / log.tags.length,
     b: total.b / log.tags.length
   };
+
+  for (let i = 0; i < palettes.length; i++) {
+    const candidate = palettes[(log.id + i) % palettes.length];
+    const dist = Math.abs(candidate.r - avg.r) + Math.abs(candidate.g - avg.g) + Math.abs(candidate.b - avg.b);
+    if (dist > 0.8) {
+      return candidate;
+    }
+  }
+
+  return palettes[(log.id + 1) % palettes.length];
 }
 
 function logPlanetKind(log: LogEntry) {
@@ -1913,6 +1996,20 @@ fn valueNoiseWrapped(p: vec2f, periodX: f32) -> f32 {
   return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
+fn fbm(p: vec2f, periodX: f32) -> f32 {
+  var v = 0.0;
+  var a = 0.5;
+  var shift = p;
+  var px = periodX;
+  for (var i = 0; i < 4; i++) {
+    v += a * valueNoiseWrapped(shift, px);
+    shift = shift * 2.0 + vec2f(100.0);
+    px *= 2.0;
+    a *= 0.5;
+  }
+  return v;
+}
+
 fn rotateSky(dir: vec3f) -> vec3f {
   let cy = cos(-u.camera.z);
   let sy = sin(-u.camera.z);
@@ -1922,15 +2019,19 @@ fn rotateSky(dir: vec3f) -> vec3f {
   return normalize(vec3f(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy));
 }
 
-fn softStar(uv: vec2f, periodX: f32, threshold: f32, radius: f32, scale: f32) -> f32 {
-  let cell = wrapCellX(floor(uv), periodX);
-  let brightness = hash(cell);
-  let intensity = smoothstep(threshold, 1.0, brightness);
-  let offset = vec2f(hash(cell + vec2f(23.4, 11.8)), hash(cell + vec2f(7.2, 59.1)));
-  let d = length(fract(uv) - offset);
-  let core = 1.0 - smoothstep(radius * 0.25, radius, d);
-  let glow = 1.0 - smoothstep(radius, radius * 2.8, d);
-  return (core + glow * 0.28) * intensity * scale;
+fn drawDotStar(sky: vec2f, gridSize: f32, threshold: f32) -> f32 {
+  let scaledUv = sky * gridSize;
+  let cell = floor(scaledUv);
+
+  let h1 = hash(cell);
+  if (h1 < threshold) { return 0.0; }
+
+  let localUv = fract(scaledUv) * 2.0 - vec2f(1.0);
+  let offset = vec2f(hash(cell + vec2f(11.0, 31.0)), hash(cell + vec2f(51.0, 71.0))) * 2.0 - vec2f(1.0);
+  let centeredUv = localUv - offset * 0.8;
+
+  let d = length(centeredUv);
+  return smoothstep(0.4, 0.0, d) * ((h1 - threshold) / (1.0 - threshold));
 }
 
 @vertex
@@ -1957,31 +2058,47 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   let screen = ((input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0) + viewPan) / backgroundZoom;
   let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
   let dir = rotateSky(viewDir);
+
   let lon = atan2(dir.x, dir.z);
   let lat = asin(clamp(dir.y, -1.0, 1.0));
   let sky = vec2f(lon / 6.2831853 + 0.5, lat / 3.1415926 + 0.5);
 
-  let horizon = 1.0 - smoothstep(0.28, 0.96, abs(dir.y));
-  let swirlA = sin(lon * 2.0 + lat * 5.8 + time * 0.035);
-  let swirlB = cos(lon * 5.0 - lat * 3.1 - time * 0.027);
-  let noiseA = valueNoiseWrapped(sky * vec2f(12.0, 6.0) + vec2f(time * 0.006, 0.0), 12.0);
-  let noiseB = valueNoiseWrapped(sky * vec2f(31.0, 15.0) - vec2f(0.0, time * 0.004), 31.0);
-  let cloud = smoothstep(0.58, 1.28, swirlA * 0.16 + swirlB * 0.12 + noiseA * 0.38 + noiseB * 0.18 + horizon * 0.44);
-  let deep = mix(vec3f(0.003, 0.007, 0.015), vec3f(0.012, 0.032, 0.064), horizon * 0.42);
-  let cyan = vec3f(0.026, 0.15, 0.28) * cloud * (0.45 + horizon * 0.2);
-  let violet = vec3f(0.12, 0.055, 0.22) * smoothstep(0.32, 0.96, swirlB * 0.5 + 0.5) * cloud * 0.12;
-  let amber = vec3f(0.22, 0.12, 0.045) * smoothstep(0.5, 0.98, swirlA * 0.5 + 0.5) * cloud * 0.05;
+  let colorDeepNavy = vec3f(0.02, 0.04, 0.08);
+  let colorMilkyGlow = vec3f(0.12, 0.22, 0.50);
+  let colorCoreWhite = vec3f(0.35, 0.55, 0.85);
+
+  let baseNoiseSky = sky * vec2f(3.0, 3.0) - vec2f(time * 0.0005, time * 0.0002);
+  let structuralNoise = fbm(baseNoiseSky, 3.0);
+
+  // Make the glow omnipresent everywhere, varying from 0.4 to 1.0
+  let galacticGlow = mix(0.4, 1.0, smoothstep(0.2, 0.8, structuralNoise));
+
+  let noiseSky = sky * vec2f(8.0, 8.0) + vec2f(time * 0.001, 0.0);
+  let dustNoise = fbm(noiseSky, 8.0);
+
+  let dustMask = smoothstep(0.3, 0.7, dustNoise);
+
+  let coreIntensity = galacticGlow * dustMask;
+  let haloIntensity = galacticGlow * 0.5 * (0.4 + dustMask * 0.6);
+
+  let backgroundGradient = mix(colorDeepNavy, colorMilkyGlow, haloIntensity);
+  let finalBackground = mix(backgroundGradient, colorCoreWhite, coreIntensity * 0.8);
 
   let starSky = (sky - vec2f(0.5)) / backgroundZoom + vec2f(0.5);
-  let uvTiny = starSky * vec2f(520.0, 220.0);
-  let uvFine = starSky * vec2f(340.0, 148.0);
-  let uvBright = starSky * vec2f(150.0, 68.0) + vec2f(time * 0.0012, 0.0);
-  let starTiny = softStar(uvTiny, 520.0, 0.955, 0.09, 0.46);
-  let starFine = softStar(uvFine, 340.0, 0.965, 0.12, 0.76);
-  let starBright = softStar(uvBright, 150.0, 0.982, 0.16, 0.95);
-  let starColor = vec3f(0.95, 0.98, 1.0) * (starTiny + starFine + starBright) + vec3f(1.0, 0.86, 0.64) * starBright * 0.12;
-  let vignette = 1.0 - smoothstep(0.72, 1.34, length(screen));
-  let color = (deep + cyan + violet + amber) * (0.86 + vignette * 0.14) + starColor;
+
+  // Lower thresholds so there are significantly more stars everywhere
+  let s1 = drawDotStar(starSky, 600.0, 0.80);
+  let s2 = drawDotStar(starSky + vec2f(0.3, 0.7), 1200.0, 0.85);
+  let s3 = drawDotStar(starSky + vec2f(0.8, 0.1), 2400.0, 0.90);
+
+  // Stars are uniformly dense everywhere, no empty patches
+  let starBrightness = s1 * 1.2 + s2 * 0.8 + s3 * 0.4;
+
+  let twinkle = 0.8 + 0.2 * sin(time * 3.0 + lon * 100.0);
+  let starColor = vec3f(0.7, 0.85, 1.0) * starBrightness * twinkle;
+
+  let color = finalBackground + starColor;
+
   return vec4f(min(color, vec3f(1.0)), 1.0);
 }
 `;
@@ -2053,21 +2170,32 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   let pixel = input.uv * max(u.viewport.xy, vec2f(1.0));
   let delta = pixel - u.cursor.xy;
   let d = length(delta);
-  let ringPulse = 0.5 + 0.5 * sin(u.viewport.w * 2.2);
-  let ring = ringMask(d, 8.4 + ringPulse * 0.45 + cursorTarget * 0.9, 0.95) * (0.28 + cursorTarget * 0.16)
-    + ringMask(d, 14.2 + cursorTarget * 1.2, 1.35) * cursorTarget * 0.12;
-  let ax = abs(delta.x);
-  let ay = abs(delta.y);
-  let tickX = (1.0 - smoothstep(0.8, 2.0, ay)) * smoothstep(5.2, 6.4, ax) * (1.0 - smoothstep(10.2, 11.7, ax));
-  let tickY = (1.0 - smoothstep(0.8, 2.0, ax)) * smoothstep(5.2, 6.4, ay) * (1.0 - smoothstep(10.2, 11.7, ay));
-  let ticks = (tickX + tickY) * (0.28 + cursorTarget * 0.18);
-  let core = exp(-d * 0.4) * 0.22 + (1.0 - smoothstep(0.0, 2.0, d)) * (0.52 + cursorTarget * 0.18);
-  let targetAura = exp(-d * 0.12) * cursorTarget * 0.08;
-  let probeCyan = vec3f(0.02, 0.95, 1.0);
-  let probeMagenta = vec3f(1.0, 0.22, 0.92);
-  let probeWhite = vec3f(1.0, 0.96, 0.82);
-  let probeColor = mix(probeCyan, probeMagenta, ringPulse * 0.12 + cursorTarget * 0.18);
-  color += cursorVisible * (probeColor * (ring + ticks + targetAura) + probeWhite * core);
+  let angle = atan2(delta.y, delta.x);
+  let time = u.viewport.w;
+
+  let corePulse = 0.5 + 0.5 * sin(time * 4.0);
+  let coreRadius = 2.0 + cursorTarget * 1.5 + corePulse * 0.5;
+  let core = exp(-d / coreRadius) * (1.2 + cursorTarget * 0.8);
+
+  let spin1 = angle - time * 2.5;
+  let petal1 = pow(0.5 + 0.5 * sin(spin1 * 3.0), 2.0);
+  let ring1 = exp(-abs(d - (12.0 + cursorTarget * 4.0)) * 0.3) * petal1 * (0.6 + cursorTarget * 0.5);
+
+  let spin2 = angle + time * 1.8;
+  let petal2 = pow(0.5 + 0.5 * sin(spin2 * 5.0), 2.0);
+  let ring2 = exp(-abs(d - (22.0 + cursorTarget * 8.0)) * 0.15) * petal2 * (0.4 + cursorTarget * 0.4);
+
+  let dustPhase = sin(d * 4.0 - time * 3.0) * cos(angle * 8.0 + time * 2.0);
+  let dust = max(0.0, dustPhase) * exp(-d * 0.03) * 0.15 * (1.0 + cursorTarget * 1.5);
+
+  let cCyan = vec3f(0.05, 0.85, 1.0);
+  let cMagenta = vec3f(0.9, 0.15, 1.0);
+  let cGold = vec3f(1.0, 0.9, 0.5);
+  let probeWhite = vec3f(1.0, 0.96, 0.9);
+
+  let flareColor = mix(cCyan, cMagenta, 0.5 + 0.5 * sin(d * 0.1 - time * 1.5));
+  let cursorGlow = probeWhite * core + flareColor * (ring1 + ring2) + cGold * dust;
+  color += cursorVisible * cursorGlow;
   let vignette = 1.0 - smoothstep(0.58, 1.25, length(input.uv - vec2f(0.5)));
   let graded = pow(min(color, vec3f(1.0)), vec3f(0.94));
   return vec4f(min(graded * (0.96 + vignette * 0.05), vec3f(1.0)), 1.0);
@@ -2170,32 +2298,32 @@ fn vs(input: VertexIn) -> VertexOut {
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
   if (input.kind > 3.5) {
-    let c = cos(input.tilt);
-    let s = sin(input.tilt);
-    let local = vec2f(input.local.x * c - input.local.y * s, input.local.x * s + input.local.y * c);
-    let diskPoint = vec2f(local.x * 0.88, local.y * 1.42);
-    let d = length(diskPoint);
-    if (d > 1.0) {
-      discard;
-    }
-    let angle = atan2(diskPoint.y, diskPoint.x);
-    let spiralPhase = angle * 2.0 + d * 8.6 - input.time * 0.78 + input.seed * 6.283;
-    let spiral = 0.5 + 0.5 * sin(spiralPhase);
-    let arms = smoothstep(0.62, 0.98, spiral) * smoothstep(0.05, 0.18, d) * (1.0 - smoothstep(0.76, 1.0, d));
-    let opposite = smoothstep(0.68, 0.99, 0.5 + 0.5 * sin(spiralPhase + 3.14159)) * smoothstep(0.08, 0.24, d) * (1.0 - smoothstep(0.64, 0.98, d));
-    let diskGlow = (1.0 - smoothstep(0.14, 1.0, d)) * 0.24;
-    let rim = exp(-abs(d - 0.72) * 10.0) * 0.18;
-    let wake = smoothstep(0.78, 0.12, abs(local.y)) * smoothstep(0.88, -0.45, local.x) * (1.0 - smoothstep(0.54, 1.08, d)) * 0.22;
-    let spark = exp(-length(vec2f(local.x - 0.3, local.y * 1.65)) * 8.0) * 0.34;
-    let dust = smoothstep(0.82, 0.99, 0.5 + 0.5 * sin(angle * 9.0 + d * 17.0 + input.seed * 12.0)) * (1.0 - smoothstep(0.2, 0.98, d)) * 0.12;
-    let shimmer = 0.88 + sin(input.time * 2.0 + input.seed * 6.0 + angle * 2.0) * 0.1;
-    let alpha = (arms * 1.08 + opposite * 0.7 + diskGlow + rim + wake + spark + dust * 1.24) * input.color.a * shimmer * (0.72 + input.state * 0.42);
-    let cyan = vec3f(0.04, 0.96, 1.0);
-    let magenta = vec3f(1.0, 0.22, 0.9);
-    let violet = vec3f(0.52, 0.34, 1.0);
-    let armColor = mix(cyan, magenta, smoothstep(0.12, 0.92, d));
-    let color = mix(input.color.rgb, mix(armColor, violet, opposite * 0.32), 0.7 + input.state * 0.14);
-    return vec4f(min(color + vec3f(1.0, 0.86, 0.98) * (dust * 0.2 + spark * 0.36), vec3f(1.0)), min(1.0, alpha));
+    let d = length(input.local);
+    if (d > 1.0) { discard; }
+
+    let ax = abs(input.local.x);
+    let ay = abs(input.local.y);
+
+    let core = exp(-d * 12.0);
+    let flareX = exp(-ay * 50.0) * exp(-ax * 1.5);
+    let flareY = exp(-ax * 50.0) * exp(-ay * 1.5);
+    let crossFlare = flareX + flareY;
+
+    let diagX = abs(input.local.x + input.local.y) * 0.707;
+    let diagY = abs(input.local.x - input.local.y) * 0.707;
+    let diagFlare = (exp(-diagX * 35.0) * exp(-diagY * 5.0) + exp(-diagY * 35.0) * exp(-diagX * 5.0)) * 0.6;
+
+    let twinkle = 0.7 + 0.5 * sin(input.time * 3.2 + input.seed * 15.0);
+    let selectedBoost = 1.0 + input.state * 1.2;
+
+    let alpha = (core * 2.5 + crossFlare * 2.0 + diagFlare) * input.color.a * twinkle * selectedBoost;
+    let coreGlow = smoothstep(0.0, 0.12, core);
+
+    // Make the core a brighter version of its own color instead of white
+    let brightColor = input.color.rgb * 1.8;
+    let color = mix(input.color.rgb, brightColor, coreGlow);
+
+    return vec4f(color * selectedBoost, min(1.0, alpha));
   }
 
   let d = length(input.local);
@@ -2209,18 +2337,17 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   }
 
   if (input.kind > 2.5) {
-    let logHalo = smoothstep(3.08, 3.28, input.kind);
     let angle = atan2(input.local.y, input.local.x);
     let spiral = 0.5 + 0.5 * sin(angle * 3.0 + d * 10.5 - input.time * 0.8 + input.seed * 6.283);
-    let arms = smoothstep(0.62, 0.98, spiral) * (1.0 - smoothstep(0.12, 0.94, d)) * logHalo;
+    let arms = smoothstep(0.62, 0.98, spiral) * (1.0 - smoothstep(0.12, 0.94, d));
     let halo = 1.0 - smoothstep(0.08, 1.0, d);
     let inner = 1.0 - smoothstep(0.0, 0.4, d);
     let pulse = 0.88 + sin(input.time * 1.9 + input.seed * 6.283) * 0.08;
-    let selectedGlow = smoothstep(0.92, 1.0, input.state) * logHalo;
-    let flare = exp(-abs(input.local.y) * 5.2) * (1.0 - smoothstep(0.3, 1.0, abs(input.local.x))) * 0.24 * logHalo;
-    let alpha = (halo * mix(0.36, 0.78, logHalo) + arms * 0.56 + flare + inner * mix(0.1, 0.24, logHalo)) * input.color.a * pulse * (0.68 + input.state * 0.42);
+    let selectedGlow = smoothstep(0.92, 1.0, input.state);
+    let flare = exp(-abs(input.local.y) * 5.2) * (1.0 - smoothstep(0.3, 1.0, abs(input.local.x))) * 0.24;
+    let alpha = (halo * 0.36 + arms * 0.56 + flare + inner * 0.1) * input.color.a * pulse * (0.68 + input.state * 0.42);
     let dream = mix(vec3f(0.08, 0.9, 1.0), vec3f(0.98, 0.2, 0.88), spiral);
-    let color = mix(input.color.rgb, dream, logHalo * (0.34 + arms * 0.44 + selectedGlow * 0.14));
+    let color = mix(input.color.rgb, dream, 0.34 + arms * 0.44 + selectedGlow * 0.14);
     return vec4f(min(color * (0.86 + selectedGlow * 0.2) + vec3f(1.0) * inner * selectedGlow * 0.18, vec3f(1.0)), min(1.0, alpha));
   }
 
