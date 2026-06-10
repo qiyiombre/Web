@@ -41,14 +41,14 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
   } else {
     applyOrbitLayout(tags, tagPositions, manualTagPositions);
     applySimilarityLayout(tags, similarities, tagPositions, manualTagPositions);
-    relaxTagCollisions(tags, tagPositions, manualTagPositions, 128, 210);
+    relaxTagCollisions(tags, tagPositions, manualTagPositions, 128, 150);
   }
 
   logs.forEach((log) => {
     const related = log.tags.map((tag) => tagPositions.get(tag.id)).filter(Boolean) as Point[];
     const seed = seeded(log.id);
     const jitterAngle = seed * Math.PI * 2;
-    const jitterDistance = related.length <= 1 ? 132 + (seed % 1) * 86 : 72 + (seed % 1) * 66;
+    const jitterDistance = related.length <= 1 ? 90 + (seed % 1) * 110 : 30 + (seed % 1) * 50;
     const center =
       related.length > 0
         ? related.reduce(
@@ -70,6 +70,8 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
     });
   });
 
+  relaxLogCollisions(logs, logPositions, manualLogPositions, 60, 48);
+
   return {
     requestId: request.requestId,
     tagPositions: [...tagPositions.entries()].map(([id, point]) => ({ id, ...point })),
@@ -83,7 +85,7 @@ function applyOrbitLayout(
   manualPositions: Map<number, { x: number; y: number }>
 ) {
   const tagCount = Math.max(tags.length, 1);
-  const baseRadius = Math.min(1080, Math.max(380, 260 + tagCount * 52));
+  const baseRadius = Math.max(500, 350 + tagCount * 80);
 
   tags.forEach((tag, index) => {
     const angle = (Math.PI * 2 * index) / tagCount - Math.PI / 2;
@@ -111,7 +113,7 @@ function applyDomainLayout(
   const tagById = new Map(tags.map((tag) => [tag.id, tag]));
   const groupCount = groups.length;
   const galaxyRadius =
-    groupCount === 1 ? 0 : Math.min(1120, Math.max(430, 300 + groupCount * 132 + Math.sqrt(tags.length) * 46));
+    groupCount === 1 ? 0 : Math.max(600, 450 + groupCount * 180 + Math.sqrt(tags.length) * 60);
 
   groups.forEach((group, groupIndex) => {
     const groupTags = group.tagIds
@@ -127,7 +129,7 @@ function applyDomainLayout(
       x: Math.cos(groupAngle) * galaxyRadius,
       y: Math.sin(groupAngle) * galaxyRadius * 0.76
     };
-    const innerRadius = Math.min(350, Math.max(132, 88 + Math.sqrt(groupTags.length) * 78));
+    const innerRadius = Math.max(200, 120 + Math.sqrt(groupTags.length) * 90);
 
     groupTags.forEach((tag, index) => {
       const r = tagRadius(tag);
@@ -185,7 +187,7 @@ function applySimilarityLayout(
         const dx = b.x - a.x;
         const dy = b.y - a.y;
         const distance = Math.max(1, Math.hypot(dx, dy));
-        const minDistance = a.r + b.r + 206;
+        const minDistance = a.r + b.r + 150;
         if (distance < minDistance) {
           const push = (minDistance - distance) * 0.068;
           const ux = dx / distance;
@@ -208,8 +210,8 @@ function applySimilarityLayout(
       const dx = b.x - a.x;
       const dy = b.y - a.y;
       const distance = Math.max(1, Math.hypot(dx, dy));
-      const desired = 790 - Math.min(1, similarity.score) * 330;
-      const force = (distance - desired) * (0.007 + similarity.score * 0.01);
+      const desired = 500 - Math.min(1, similarity.score) * 300;
+      const force = (distance - desired) * (0.015 + similarity.score * 0.02);
       const ux = dx / distance;
       const uy = dy / distance;
       movePoint(similarity.tagAId, ux * force, uy * force);
@@ -261,6 +263,45 @@ function relaxTagCollisions(
           a.y -= uy * push;
         }
         if (movable(tags[j].id)) {
+          b.x += ux * push;
+          b.y += uy * push;
+        }
+      }
+    }
+  }
+}
+
+function relaxLogCollisions(
+  logs: LogEntry[],
+  logPositions: Map<number, Point>,
+  manualPositions: Map<number, { x: number; y: number }>,
+  iterations: number,
+  padding: number
+) {
+  const movable = (id: number) => !manualPositions.has(id);
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    for (let i = 0; i < logs.length; i += 1) {
+      for (let j = i + 1; j < logs.length; j += 1) {
+        const a = logPositions.get(logs[i].id);
+        const b = logPositions.get(logs[j].id);
+        if (!a || !b) {
+          continue;
+        }
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const distance = Math.max(1, Math.hypot(dx, dy));
+        const minDistance = a.r + b.r + padding;
+        if (distance >= minDistance) {
+          continue;
+        }
+        const push = (minDistance - distance) * 0.05;
+        const ux = dx / distance;
+        const uy = dy / distance;
+        if (movable(logs[i].id)) {
+          a.x -= ux * push;
+          a.y -= uy * push;
+        }
+        if (movable(logs[j].id)) {
           b.x += ux * push;
           b.y += uy * push;
         }

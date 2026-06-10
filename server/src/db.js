@@ -303,6 +303,22 @@ export async function updateMap(id, userId, payload) {
   return getMapById(id, userId);
 }
 
+export async function deleteMap(id, userId) {
+  const mapId = Number(id);
+  const ownerId = Number(userId);
+  if (!Number.isFinite(mapId) || mapId <= 0 || !Number.isFinite(ownerId) || ownerId <= 0) {
+    return false;
+  }
+
+  return withTransaction(async (client) => {
+    const result = await client.query('DELETE FROM nebula_maps WHERE id = $1 AND user_id = $2', [mapId, ownerId]);
+    if (result.rowCount > 0) {
+      await client.query('DELETE FROM ai_cache WHERE cache_key LIKE $1', [`%:${mapId}:%`]);
+    }
+    return result.rowCount > 0;
+  });
+}
+
 export async function getMapById(id, userId) {
   if (Number.isFinite(Number(userId))) {
     return one(

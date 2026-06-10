@@ -38,6 +38,7 @@ import {
   clearDraft,
   createLog,
   createMap,
+  deleteMap,
   deleteTag,
   deleteLog,
   generateAdvice,
@@ -54,7 +55,19 @@ import {
   updateMap,
   updateTag
 } from './services/api';
-import type { AdviceResponse, AiMeta, DraftLog, GraphData, Insight, LayoutMode, LogEntry, NebulaMap, TagNode, UserAccount } from './types/domain';
+import type {
+  AdviceResponse,
+  AiMeta,
+  DomainCategory,
+  DraftLog,
+  GraphData,
+  Insight,
+  LayoutMode,
+  LogEntry,
+  NebulaMap,
+  TagNode,
+  UserAccount
+} from './types/domain';
 
 type NebulaLogCard = {
   logId: number;
@@ -67,6 +80,8 @@ type NebulaLogCard = {
 type NebulaRenderer = {
   focusTag: (tagId: number) => void;
   focusLog: (logId: number) => NebulaLogCard | null;
+  focusDomainCategory: (category: DomainCategory) => boolean;
+  fitAllTags: () => boolean;
   resetTagLayout: () => void;
   refreshLayout: () => void;
   saveLayout: () => boolean;
@@ -76,6 +91,9 @@ type NebulaRenderer = {
 
 type RightPanel = 'logs' | 'editor' | 'insight';
 type LeftPanel = 'maps' | 'active' | 'related' | 'manage' | 'domains';
+type TimeFilterMode = 'all' | 'week' | 'month' | 'quarter' | 'custom';
+type FrequencyFilterMode = 'all' | 'high' | 'low';
+type NebulaSortMode = 'layout' | 'frequency' | 'lowFrequency' | 'recent';
 type NebulaConfirm = {
   title: string;
   message: string;
@@ -118,6 +136,22 @@ const draftSavedAt = ref('');
 const draftRestored = ref(false);
 const rendererMode = ref<'canvas' | 'webgpu'>(localStorage.getItem('nebula.rendererMode') === 'webgpu' ? 'webgpu' : 'canvas');
 const layoutMode = ref<LayoutMode>(localStorage.getItem('nebula.layoutMode') === 'domain' ? 'domain' : 'semantic');
+const savedTimeFilter = localStorage.getItem('nebula.timeFilter');
+const savedFrequencyFilter = localStorage.getItem('nebula.frequencyFilter');
+const savedSortMode = localStorage.getItem('nebula.sortMode');
+const timeFilter = ref<TimeFilterMode>(
+  savedTimeFilter === 'week' || savedTimeFilter === 'month' || savedTimeFilter === 'quarter' || savedTimeFilter === 'custom'
+    ? savedTimeFilter
+    : 'all'
+);
+const frequencyFilter = ref<FrequencyFilterMode>(
+  savedFrequencyFilter === 'high' || savedFrequencyFilter === 'low' ? savedFrequencyFilter : 'all'
+);
+const sortMode = ref<NebulaSortMode>(
+  savedSortMode === 'frequency' || savedSortMode === 'lowFrequency' || savedSortMode === 'recent' ? savedSortMode : 'layout'
+);
+const customStartDate = ref(localStorage.getItem('nebula.customStartDate') ?? '');
+const customEndDate = ref(localStorage.getItem('nebula.customEndDate') ?? '');
 const nebulaRenderKey = ref(0);
 const canvasRef = ref<NebulaRenderer | null>(null);
 const tagManagerRef = ref<InstanceType<typeof TagManager> | null>(null);
@@ -137,7 +171,42 @@ const deleteUndoStack = ref<DeleteHistoryAction[]>([]);
 const deleteRedoStack = ref<DeleteHistoryAction[]>([]);
 const relatedPage = ref(0);
 
-const visibleGraph = computed<GraphData | null>(() => graph.value);
+const visibleGraph = computed<GraphData | null>(() => {
+  if (!graph.value) {
+    return null;
+  }
+  const timeLogs = graph.value.logs.filter((log) => matchesTimeFilter(log, timeFilter.value));
+  const tagUsage = buildTagUsageStats(timeLogs);
+  const thresholds = buildFrequencyThresholds(tagUsage);
+  const tagFilterActive = timeFilter.value !== 'all' || frequencyFilter.value !== 'all';
+  const tags = graph.value.tags
+    .map((tag) => ({ ...tag, count: tagUsage.get(tag.id)?.count ?? 0 }))
+    .filter((tag) => (!tagFilterActive || tag.count > 0) && matchesFrequencyFilter(tag.count, thresholds));
+  const visibleTagIds = new Set(tags.map((tag) => tag.id));
+  const logs = tagFilterActive
+    ? timeLogs.filter((log) => log.tags.some((tag) => visibleTagIds.has(tag.id)))
+    : timeLogs;
+  const visibleLogIds = new Set(logs.map((log) => log.id));
+  return {
+    ...graph.value,
+    tags,
+    logs,
+    edges: graph.value.edges.filter((edge) => visibleLogIds.has(edge.logId) && visibleTagIds.has(edge.tagId)),
+    tagSimilarities: graph.value.tagSimilarities.filter(
+      (item) => visibleTagIds.has(item.tagAId) && visibleTagIds.has(item.tagBId)
+    ),
+    tagGroups: graph.value.tagGroups
+      .map((group) => ({ ...group, tagIds: group.tagIds.filter((tagId) => visibleTagIds.has(tagId)) }))
+      .filter((group) => group.tagIds.length > 0)
+  };
+});
+
+const priorityTagIds = computed(() => {
+  if (sortMode.value === 'layout' || !visibleGraph.value) {
+    return [];
+  }
+  return sortTagsForPriority(visibleGraph.value.tags, visibleGraph.value.logs, sortMode.value).map((tag) => tag.id);
+});
 
 const nebulaCardLog = computed(() => {
   if (!visibleGraph.value || !nebulaLogCard.value) {
@@ -210,6 +279,27 @@ const relatedTags = computed(() => {
 
 const relatedPageLabel = computed(() => `${Math.min(relatedPage.value + 1, relatedTotalPages.value)} / ${relatedTotalPages.value}`);
 
+const logListHint = computed(() => {
+  if (timeFilter.value !== 'all' && frequencyFilter.value !== 'all') {
+    return '时间 + 频率';
+  }
+  if (timeFilter.value !== 'all') {
+    return '按时间筛选';
+  }
+  if (frequencyFilter.value !== 'all') {
+    return '按频率筛选';
+  }
+  if (sortMode.value === 'frequency') {
+    return '高频优先';
+  }
+  if (sortMode.value === 'lowFrequency') {
+    return '低频优先';
+  }
+  if (sortMode.value === 'recent') {
+    return '最近活跃';
+  }
+  return '默认布局';
+});
 watch(activeTagIds, () => {
   relatedPage.value = 0;
 });
@@ -223,8 +313,113 @@ watch(relatedTotalPages, (pages) => {
 const stats = computed(() => ({
   tags: visibleGraph.value?.tags.length ?? 0,
   logs: visibleGraph.value?.logs.length ?? 0,
-  filtered: activeTagIds.value.size === 0 ? 0 : filteredLogs.value.length
+  filtered:
+    activeTagIds.value.size === 0 && timeFilter.value === 'all' && frequencyFilter.value === 'all'
+      ? 0
+      : filteredLogs.value.length
 }));
+
+function matchesTimeFilter(log: LogEntry, mode: TimeFilterMode) {
+  if (mode === 'all') {
+    return true;
+  }
+  const created = new Date(log.createdAt).getTime();
+  if (!Number.isFinite(created)) {
+    return true;
+  }
+  if (mode === 'custom') {
+    const start = customStartDate.value ? new Date(`${customStartDate.value}T00:00:00`).getTime() : -Infinity;
+    const end = customEndDate.value ? new Date(`${customEndDate.value}T23:59:59`).getTime() : Infinity;
+    return created >= start && created <= end;
+  }
+  const now = Date.now();
+  const day = 1000 * 60 * 60 * 24;
+  const range =
+    mode === 'week'
+      ? day * 7
+      : mode === 'month'
+        ? day * 30
+        : day * 90;
+  return now - created <= range;
+}
+
+function buildTagUsageStats(logs: LogEntry[]) {
+  const usage = new Map<number, { count: number; latest: number }>();
+  for (const log of logs) {
+    const created = new Date(log.createdAt).getTime();
+    for (const tag of log.tags) {
+      const current = usage.get(tag.id) ?? { count: 0, latest: 0 };
+      current.count += 1;
+      current.latest = Math.max(current.latest, Number.isFinite(created) ? created : 0);
+      usage.set(tag.id, current);
+    }
+  }
+  return usage;
+}
+
+function buildFrequencyThresholds(usage: Map<number, { count: number; latest: number }>) {
+  const counts = [...usage.values()].map((item) => item.count).filter((count) => count > 0);
+  const max = Math.max(0, ...counts);
+  return {
+    high: Math.max(2, Math.ceil(max * 0.66)),
+    low: Math.max(1, Math.floor(max * 0.34))
+  };
+}
+
+function matchesFrequencyFilter(count: number, thresholds: { high: number; low: number }) {
+  if (frequencyFilter.value === 'high') {
+    return count >= thresholds.high;
+  }
+  if (frequencyFilter.value === 'low') {
+    return count > 0 && count <= thresholds.low;
+  }
+  return true;
+}
+
+function sortTagsForPriority(tags: TagNode[], logs: LogEntry[], mode: NebulaSortMode) {
+  const usage = buildTagUsageStats(logs);
+  return [...tags].sort((a, b) => {
+    const aUsage = usage.get(a.id) ?? { count: a.count, latest: 0 };
+    const bUsage = usage.get(b.id) ?? { count: b.count, latest: 0 };
+    if (mode === 'frequency') {
+      return bUsage.count - aUsage.count || a.name.localeCompare(b.name);
+    }
+    if (mode === 'lowFrequency') {
+      return aUsage.count - bUsage.count || a.name.localeCompare(b.name);
+    }
+    if (mode === 'recent') {
+      return bUsage.latest - aUsage.latest || bUsage.count - aUsage.count || a.name.localeCompare(b.name);
+    }
+    return 0;
+  });
+}
+
+function setTimeFilter(mode: TimeFilterMode) {
+  timeFilter.value = mode;
+  localStorage.setItem('nebula.timeFilter', mode);
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  nebulaRenderKey.value += 1;
+}
+
+function setFrequencyFilter(mode: FrequencyFilterMode) {
+  frequencyFilter.value = mode;
+  localStorage.setItem('nebula.frequencyFilter', mode);
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  nebulaRenderKey.value += 1;
+}
+
+function setSortMode(mode: NebulaSortMode) {
+  sortMode.value = mode;
+  localStorage.setItem('nebula.sortMode', mode);
+}
+
+function updateCustomTimeRange() {
+  localStorage.setItem('nebula.customStartDate', customStartDate.value);
+  localStorage.setItem('nebula.customEndDate', customEndDate.value);
+  setTimeFilter('custom');
+}
 
 const layoutAiStatus = computed(() => {
   const isDomain = layoutMode.value === 'domain';
@@ -495,6 +690,51 @@ async function saveRenameMap(mapId = renamingMapId.value) {
   } finally {
     renameSaving.value = false;
   }
+}
+
+function requestDeleteMap(map: NebulaMap) {
+  openNebulaConfirm({
+    title: '删除星云图',
+    message: `确定删除「${map.name}」吗？里面的日志、标签、领域大类都会一起删除。`,
+    confirmLabel: '删除',
+    onConfirm: async () => {
+      await deleteMap(map.id);
+      await clearDraft(map.id).catch(() => undefined);
+      maps.value = maps.value.filter((item) => item.id !== map.id);
+      if (renamingMapId.value === map.id) {
+        cancelRenameMap();
+      }
+
+      if (activeMapId.value === map.id) {
+        localStorage.removeItem(activeMapStorageKey());
+        const nextMap = maps.value[0] ?? null;
+        if (nextMap) {
+          await selectMap(nextMap.id);
+        } else {
+          clearActiveMapState();
+        }
+      } else {
+        await refreshMaps();
+      }
+      showNotice('星云图已删除');
+    }
+  });
+}
+
+function clearActiveMapState() {
+  activeMapId.value = null;
+  graph.value = null;
+  insights.value = null;
+  activeTagIds.value = new Set();
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  editorMode.value = 'new';
+  editingLog.value = null;
+  draft.value = undefined;
+  draftRestored.value = false;
+  draftSavedAt.value = '';
+  layoutDirty.value = false;
+  rightPanel.value = null;
 }
 
 function uniqueMapName(baseName: string) {
@@ -938,6 +1178,23 @@ function focusTag(tagId: number) {
   canvasRef.value?.focusTag(tagId);
 }
 
+async function focusDomainCategory(category: DomainCategory) {
+  if (layoutMode.value !== 'domain') {
+    layoutMode.value = 'domain';
+    localStorage.setItem('nebula.layoutMode', 'domain');
+  }
+  activeTagIds.value = new Set();
+  selectedLogId.value = null;
+  nebulaLogCard.value = null;
+  await nextTick();
+  window.requestAnimationFrame(() => {
+    const focused = canvasRef.value?.focusDomainCategory(category) ?? false;
+    if (!focused) {
+      canvasRef.value?.fitAllTags();
+    }
+  });
+}
+
 function previousRelatedPage() {
   relatedPage.value = Math.max(0, relatedPage.value - 1);
 }
@@ -1193,6 +1450,9 @@ function formatTime(value: Date) {
               <button class="icon-button map-edit-button" title="修改星云图名称" @click="startRenameMap(map.id, 'list')">
                 <Edit3 :size="15" />
               </button>
+              <button class="icon-button map-edit-button danger" title="删除星云图" @click.stop="requestDeleteMap(map)">
+                <Trash2 :size="15" />
+              </button>
             </template>
           </div>
         </div>
@@ -1242,10 +1502,10 @@ function formatTime(value: Date) {
       </section>
 
       <TagManager
-        v-if="leftPanel === 'manage' && activeMapId && visibleGraph"
+        v-if="leftPanel === 'manage' && activeMapId && graph"
         ref="tagManagerRef"
         :map-id="activeMapId"
-        :tags="visibleGraph.tags"
+        :tags="graph.tags"
         @changed="refreshData"
         @delete-request="requestDeleteTag"
         @focus="activateTagAndFocus"
@@ -1255,6 +1515,7 @@ function formatTime(value: Date) {
         :map-id="activeMapId"
         :domain-categories="visibleGraph.domainCategories ?? []"
         @changed="refreshData"
+        @focus="focusDomainCategory"
       />
     </aside>
 
@@ -1292,7 +1553,6 @@ function formatTime(value: Date) {
               </button>
             </template>
           </div>
-          <p>Canvas 实时渲染 · Web Worker 布局 · REST API · SQLite · Cookie Session · IndexedDB 草稿</p>
         </div>
         <div class="topbar-actions">
           <div class="renderer-toggle" title="渲染模式">
@@ -1313,6 +1573,29 @@ function formatTime(value: Date) {
               <Layers :size="14" />
               领域
             </button>
+          </div>
+          <div class="renderer-toggle filter-toggle" title="时间筛选">
+            <button :class="{ active: timeFilter === 'all' }" @click="setTimeFilter('all')">全部</button>
+            <button :class="{ active: timeFilter === 'week' }" @click="setTimeFilter('week')">7天</button>
+            <button :class="{ active: timeFilter === 'month' }" @click="setTimeFilter('month')">30天</button>
+            <button :class="{ active: timeFilter === 'quarter' }" @click="setTimeFilter('quarter')">90天</button>
+            <button :class="{ active: timeFilter === 'custom' }" @click="setTimeFilter('custom')">自定义</button>
+          </div>
+          <div v-if="timeFilter === 'custom'" class="date-filter-controls">
+            <input v-model="customStartDate" type="date" aria-label="开始日期" @change="updateCustomTimeRange" />
+            <span>至</span>
+            <input v-model="customEndDate" type="date" aria-label="结束日期" @change="updateCustomTimeRange" />
+          </div>
+          <div class="renderer-toggle frequency-toggle" title="标签使用频率筛选">
+            <button :class="{ active: frequencyFilter === 'all' }" @click="setFrequencyFilter('all')">频率全部</button>
+            <button :class="{ active: frequencyFilter === 'high' }" @click="setFrequencyFilter('high')">高频</button>
+            <button :class="{ active: frequencyFilter === 'low' }" @click="setFrequencyFilter('low')">低频</button>
+          </div>
+          <div class="renderer-toggle sort-toggle" title="标签排序">
+            <button :class="{ active: sortMode === 'layout' }" @click="setSortMode('layout')">布局</button>
+            <button :class="{ active: sortMode === 'frequency' }" @click="setSortMode('frequency')">高频优先</button>
+            <button :class="{ active: sortMode === 'lowFrequency' }" @click="setSortMode('lowFrequency')">低频优先</button>
+            <button :class="{ active: sortMode === 'recent' }" @click="setSortMode('recent')">最近活跃</button>
           </div>
           <div class="stat-pill">{{ stats.tags }} 标签</div>
           <div class="stat-pill">{{ stats.logs }} 日志</div>
@@ -1469,12 +1752,13 @@ function formatTime(value: Date) {
       </NebulaCanvas>
       <WebGpuNebulaCanvas
         v-else-if="visibleGraph"
-        :key="`webgpu-${activeMapId ?? 'none'}-${nebulaRenderKey}`"
+        :key="`webgpu-${activeMapId ?? 'none'}-${timeFilter}-${frequencyFilter}-${customStartDate}-${customEndDate}-${nebulaRenderKey}`"
         ref="canvasRef"
         :graph="visibleGraph"
         :layout-mode="layoutMode"
         :active-tag-ids="activeTagIds"
         :selected-log-id="selectedLogId"
+        :priority-tag-ids="priorityTagIds"
         @tag-toggle="toggleTag"
         @tag-context="openTagContext"
         @log-open="selectNebulaLog"
@@ -1621,7 +1905,7 @@ function formatTime(value: Date) {
       <section v-if="rightPanel === 'logs'" class="panel log-list-panel">
         <div class="panel-title">
           <span>日志列表</span>
-          <small>按时间倒序</small>
+          <small>{{ logListHint }}</small>
         </div>
         <div class="log-list">
           <button
@@ -1643,7 +1927,7 @@ function formatTime(value: Date) {
         :map-id="activeMapId"
         :initial-log="editingLog"
         :draft="draft"
-        :existing-tags="visibleGraph?.tags ?? []"
+        :existing-tags="graph?.tags ?? []"
         :offline="!isOnline"
         :draft-saved-at="draftSavedAt"
         :draft-restored="draftRestored"

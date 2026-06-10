@@ -1,7 +1,7 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { Maximize2, Minimize2 } from 'lucide-vue-next';
-import type { GraphData, LayoutMode, LogEntry } from '../types/domain';
+import type { DomainCategory, GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
 
 type PickNode =
   | { kind: 'tag'; id: number; x: number; y: number; r: number }
@@ -37,6 +37,7 @@ const props = defineProps<{
   layoutMode: LayoutMode;
   activeTagIds: Set<number>;
   selectedLogId: number | null;
+  priorityTagIds?: number[];
 }>();
 
 const emit = defineEmits<{
@@ -49,6 +50,7 @@ const emit = defineEmits<{
 
 const FOCAL_LENGTH = 740;
 const VIEW_DISTANCE = 980;
+const UNIFORM_BYTE_SIZE = 80;
 
 const wrap = ref<HTMLDivElement | null>(null);
 const canvas = ref<HTMLCanvasElement | null>(null);
@@ -60,7 +62,7 @@ const heatMode = ref(false);
 const fullscreen = ref(false);
 const transform = reactive({ scale: 1, x: 0, y: 0 });
 const camera = reactive({ yaw: 0, pitch: 0, panX: 0, panY: 0, panZ: 0 });
-const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2 });
+const nebulaCursor = reactive({ x: 0, y: 0, visible: false, angle: -0.2, target: 0 });
 
 const tagPositions = new Map<number, LayoutPoint>();
 const logPositions = new Map<number, LayoutPoint>();
@@ -91,6 +93,11 @@ const tagTrendById = computed(() => {
   return trend;
 });
 
+const priorityRankByTagId = computed(() => {
+  const ids = props.priorityTagIds ?? [];
+  return new Map(ids.map((id, index) => [id, index]));
+});
+
 let device: any = null;
 let context: any = null;
 let format = '';
@@ -103,6 +110,14 @@ let lineInstanceBuffer: any = null;
 let backgroundPipeline: any = null;
 let nodePipeline: any = null;
 let linePipeline: any = null;
+let postPipeline: any = null;
+let postBindGroupLayout: any = null;
+let postBindGroup: any = null;
+let postSampler: any = null;
+let sceneTexture: any = null;
+let sceneView: any = null;
+let sceneTextureWidth = 0;
+let sceneTextureHeight = 0;
 let nodeInstanceCapacity = 0;
 let lineInstanceCapacity = 0;
 let starCount = 0;
@@ -111,8 +126,10 @@ let lineCount = 0;
 let raf = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
+let pendingFocusCategory: DomainCategory | null = null;
+let layoutBusy = false;
 let isDragging = false;
-let dragMode: 'orbit' | 'pan' | 'tag' | 'log' | null = null;
+let dragMode: 'pan' | 'orbit' | 'tag' | 'log' | null = null;
 let dragTagId: number | null = null;
 let dragLogId: number | null = null;
 let dragTagOffset = { x: 0, y: 0 };
@@ -146,10 +163,17 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
   for (const point of result.logPositions) {
     logPositions.set(point.id, { x: point.x, y: point.y, r: point.r });
   }
+  layoutBusy = false;
   if (pendingFocusTagId !== null) {
     const tagId = pendingFocusTagId;
     pendingFocusTagId = null;
+    pendingFitAllFrontView = false;
     centerTag(tagId);
+  } else if (pendingFocusCategory) {
+    const category = pendingFocusCategory;
+    pendingFocusCategory = null;
+    pendingFitAllFrontView = false;
+    focusDomainCategory(category);
   } else if (pendingFitAllFrontView) {
     pendingFitAllFrontView = !fitAllTagsFrontView();
   }
@@ -157,6 +181,7 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
 };
 
 layoutWorker.onerror = (event) => {
+  layoutBusy = false;
   webgpuMessage.value = `布局 Worker 运行失败：${event.message}`;
 };
 
@@ -209,6 +234,8 @@ watch(
 defineExpose({
   focusTag,
   focusLog,
+  focusDomainCategory,
+  fitAllTags: fitAllTagsFrontView,
   resetTagLayout,
   refreshLayout,
   saveLayout,
@@ -249,7 +276,7 @@ async function initWebGpu() {
     await createResources();
   } catch (error) {
     webgpuReady.value = false;
-    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 渲染资源创建失败';
+    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 娓叉煋璧勬簮鍒涘缓澶辫触';
     return;
   }
   configureContext();
@@ -262,7 +289,7 @@ async function createResources() {
   const usage = (globalThis as any).GPUBufferUsage;
   const shaderStage = (globalThis as any).GPUShaderStage;
   uniformBuffer = device.createBuffer({
-    size: 64,
+    size: UNIFORM_BYTE_SIZE,
     usage: usage.UNIFORM | usage.COPY_DST
   });
 
@@ -273,6 +300,18 @@ async function createResources() {
   bindGroup = device.createBindGroup({
     layout: bindGroupLayout,
     entries: [{ binding: 0, resource: { buffer: uniformBuffer } }]
+  });
+  postBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: shaderStage.FRAGMENT, sampler: {} },
+      { binding: 1, visibility: shaderStage.FRAGMENT, texture: {} },
+      { binding: 2, visibility: shaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+    ]
+  });
+  const postPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [postBindGroupLayout] });
+  postSampler = device.createSampler({
+    magFilter: 'linear',
+    minFilter: 'linear'
   });
 
   quadBuffer = device.createBuffer({
@@ -285,24 +324,24 @@ async function createResources() {
     new Float32Array([-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1])
   );
 
-  backgroundPipeline = await createPipeline('WebGPU 背景星云管线', {
+  backgroundPipeline = await createPipeline('WebGPU 鑳屾櫙鏄熶簯绠＄嚎', {
     layout: pipelineLayout,
     vertex: {
-      module: await createShaderModule('WebGPU 背景星云 shader', backgroundShader),
+      module: await createShaderModule('WebGPU 鑳屾櫙鏄熶簯 shader', backgroundShader),
       entryPoint: 'vs'
     },
     fragment: {
-      module: await createShaderModule('WebGPU 背景星云 shader', backgroundShader),
+      module: await createShaderModule('WebGPU 鑳屾櫙鏄熶簯 shader', backgroundShader),
       entryPoint: 'fs',
       targets: [{ format }]
     },
     primitive: { topology: 'triangle-list' }
   });
 
-  nodePipeline = await createPipeline('WebGPU 恒星行星管线', {
+  nodePipeline = await createPipeline('WebGPU 鎭掓槦琛屾槦绠＄嚎', {
     layout: pipelineLayout,
     vertex: {
-      module: await createShaderModule('WebGPU 恒星行星 shader', nodeShader),
+      module: await createShaderModule('WebGPU 鎭掓槦琛屾槦 shader', nodeShader),
       entryPoint: 'vs',
       buffers: [
         {
@@ -326,7 +365,7 @@ async function createResources() {
       ]
     },
     fragment: {
-      module: await createShaderModule('WebGPU 恒星行星 shader', nodeShader),
+      module: await createShaderModule('WebGPU 鎭掓槦琛屾槦 shader', nodeShader),
       entryPoint: 'fs',
       targets: [blendTarget()]
     },
@@ -355,6 +394,19 @@ async function createResources() {
       module: await createShaderModule('WebGPU 空间能量线 shader', lineShader),
       entryPoint: 'fs',
       targets: [blendTarget()]
+    },
+    primitive: { topology: 'triangle-list' }
+  });
+  postPipeline = await createPipeline('WebGPU bloom postprocess', {
+    layout: postPipelineLayout,
+    vertex: {
+      module: await createShaderModule('WebGPU bloom shader', postShader),
+      entryPoint: 'vs'
+    },
+    fragment: {
+      module: await createShaderModule('WebGPU bloom shader', postShader),
+      entryPoint: 'fs',
+      targets: [{ format }]
     },
     primitive: { topology: 'triangle-list' }
   });
@@ -438,25 +490,44 @@ function resize() {
   canvas.value.style.height = '100%';
   buildStars();
   configureContext();
+  ensureSceneTarget(canvas.value.width, canvas.value.height);
   updateLabels();
 }
 
-function buildStars() {
-  stars = Array.from({ length: 1200 }, (_, index) => {
-    const seed = seeded(index + 37);
-    return {
-      x: (seeded(index + 17) - 0.5) * 1900,
-      y: (seeded(index + 89) - 0.5) * 1120,
-      z: (seeded(index + 191) - 0.5) * 1450,
-      r: 0.62 + seeded(index + 144) * 1.72,
-      alpha: 0.11 + seeded(index + 233) * 0.24,
-      seed
-    };
+function ensureSceneTarget(width: number, height: number) {
+  if (!device || !postBindGroupLayout || !postSampler || !format) {
+    return;
+  }
+  if (sceneTexture && sceneTextureWidth === width && sceneTextureHeight === height) {
+    return;
+  }
+  sceneTexture?.destroy?.();
+  const textureUsage = (globalThis as any).GPUTextureUsage;
+  sceneTexture = device.createTexture({
+    size: { width, height },
+    format,
+    usage: textureUsage.RENDER_ATTACHMENT | textureUsage.TEXTURE_BINDING
   });
+  sceneView = sceneTexture.createView();
+  postBindGroup = device.createBindGroup({
+    layout: postBindGroupLayout,
+    entries: [
+      { binding: 0, resource: postSampler },
+      { binding: 1, resource: sceneView },
+      { binding: 2, resource: { buffer: uniformBuffer } }
+    ]
+  });
+  sceneTextureWidth = width;
+  sceneTextureHeight = height;
+}
+
+function buildStars() {
+  stars = [];
 }
 
 function requestLayout() {
   latestLayoutRequestId += 1;
+  layoutBusy = true;
   layoutWorker.postMessage({
     requestId: latestLayoutRequestId,
     tags: props.graph.tags.map((tag) => ({
@@ -487,6 +558,7 @@ function render(timeMs: number) {
   animateCamera();
   updateGeometryBuffers();
   updateLabels();
+  const cursorVisible = nebulaCursor.visible ? 1 : 0;
   device.queue.writeBuffer(
     uniformBuffer,
     0,
@@ -506,17 +578,26 @@ function render(timeMs: number) {
       camera.panZ,
       0,
       0,
-      0
+      0,
+      nebulaCursor.x,
+      nebulaCursor.y,
+      cursorVisible,
+      nebulaCursor.target
     ])
   );
 
   device.pushErrorScope?.('validation');
   try {
+    ensureSceneTarget(canvas.value.width, canvas.value.height);
+    if (!sceneView || !postPipeline || !postBindGroup) {
+      return;
+    }
     const encoder = device.createCommandEncoder();
+    const outputView = context.getCurrentTexture().createView();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
-          view: context.getCurrentTexture().createView(),
+          view: sceneView,
           clearValue: { r: 0.01, g: 0.018, b: 0.034, a: 1 },
           loadOp: 'clear',
           storeOp: 'store'
@@ -547,14 +628,29 @@ function render(timeMs: number) {
     }
 
     pass.end();
+
+    const postPass = encoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: outputView,
+          clearValue: { r: 0.01, g: 0.018, b: 0.034, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store'
+        }
+      ]
+    });
+    postPass.setPipeline(postPipeline);
+    postPass.setBindGroup(0, postBindGroup);
+    postPass.draw(3);
+    postPass.end();
     device.queue.submit([encoder.finish()]);
   } catch (error) {
-    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 命令提交失败';
+    webgpuError.value = error instanceof Error ? error.message : 'WebGPU 鍛戒护鎻愪氦澶辫触';
   }
   device.popErrorScope?.()
     .then((error: any) => {
       if (error) {
-        webgpuError.value = error.message ?? 'WebGPU 渲染命令验证失败';
+        webgpuError.value = error.message ?? 'WebGPU 娓叉煋鍛戒护楠岃瘉澶辫触';
       }
     })
     .catch(() => {});
@@ -589,8 +685,11 @@ function updateGeometryBuffers() {
     const flatHeat = heatMode.value && heat === 'flat';
     const state = heatMode.value ? (flatHeat ? 0.28 : 1) : active || relatedToSelected ? 1 : related ? 0.62 : 0.18;
     const depth = 0.92 + seeded(tag.id + 2200) * 0.22;
+    const priority = tagPriority(tag.id);
+    const priorityScale = hasTagPriority() ? 0.88 + priority * 0.36 : 1;
+    const priorityAlpha = hasTagPriority() ? 0.72 + priority * 0.36 : 1;
     const activeScale = active || relatedToSelected ? 1.22 : related ? 1 : 0.92;
-    const coreRadius = point.r * 1.38 * depth * activeScale;
+    const coreRadius = point.r * 1.38 * depth * activeScale * priorityScale;
     const world = tagPoint3D(tag.id, point);
     pushNodeInstance(
       nodeRows,
@@ -598,7 +697,7 @@ function updateGeometryBuffers() {
       coreRadius * (active || relatedToSelected ? 1.44 : 1.12),
       3,
       color,
-      flatHeat ? (active || relatedToSelected ? 0.08 : related ? 0.035 : 0.018) : active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025,
+      (flatHeat ? (active || relatedToSelected ? 0.08 : related ? 0.035 : 0.018) : active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025) * priorityAlpha,
       state,
       seeded(tag.id + 700),
       0
@@ -609,7 +708,7 @@ function updateGeometryBuffers() {
       coreRadius * (active || relatedToSelected ? 1.82 : 1.48),
       1,
       color,
-      flatHeat ? (active || relatedToSelected ? 0.56 : related ? 0.38 : 0.24) : active || relatedToSelected ? 1 : related ? 0.92 : 0.46,
+      (flatHeat ? (active || relatedToSelected ? 0.56 : related ? 0.38 : 0.24) : active || relatedToSelected ? 1 : related ? 0.92 : 0.46) * priorityAlpha,
       state,
       seeded(tag.id + 800),
       0
@@ -627,17 +726,24 @@ function updateGeometryBuffers() {
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
     const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !highlighted;
-    const state = selected ? 1 : highlighted ? 0.82 : muted ? 0.12 : 0.26;
-    const radius = selected ? 8.2 : highlighted ? 7.4 : 6.1;
-    const glowAlpha = selected ? 0.68 : highlighted ? 0.34 : 0.1;
-    const glowRadius = selected ? 3.7 : highlighted ? 3 : 2.35;
-    const bodyAlpha = selected ? 0.98 : highlighted ? 0.92 : muted ? 0.38 : 0.84;
+    const state = selected ? 1 : highlighted ? 0.92 : muted ? 0.08 : 0.38;
+    const radius = selected ? 15.2 : highlighted ? 14.4 : 8.8;
+    const coreAlpha = selected ? 1 : highlighted ? 1 : muted ? 0.28 : 0.72;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
     const seed = seeded(log.id + 1900);
     const tilt = seeded(log.id + 341) * 1.1 - 0.55;
-    pushNodeInstance(nodeRows, world, radius * glowRadius, 3.25, logColor, glowAlpha, state, seeded(log.id + 1600), 0);
-    pushNodeInstance(nodeRows, world, radius * 1.18, 2, mixColor(logColor, { r: 1, g: 1, b: 1 }, 0.16), bodyAlpha, state, seed, tilt);
+    pushNodeInstance(
+      nodeRows,
+      world,
+      radius * (selected ? 4.8 : highlighted ? 4.2 : 3.2),
+      4.0,
+      logColor,
+      coreAlpha,
+      state,
+      seed,
+      tilt
+    );
   }
   nodeCount = Math.max(0, nodeRows.length / 12 - starCount);
   writeDynamicBuffer('node', new Float32Array(nodeRows), 48);
@@ -657,19 +763,20 @@ function updateGeometryBuffers() {
       }
       const tagMeta = props.graph.tags.find((item) => item.id === edge.tagId);
       const tagColor = tagMeta ? hexToRgb(tagMeta.color) : { r: 0.38, g: 0.84, b: 1 };
+      const neonColor = edgeNeonColor(tagColor);
       const color = [
-        Math.min(1, tagColor.r + 0.18),
-        Math.min(1, tagColor.g + 0.28),
-        Math.min(1, tagColor.b + 0.28),
-        relation.selected ? 0.74 : 0.56
+        neonColor.r,
+        neonColor.g,
+        neonColor.b,
+        relation.selected ? 0.8 : 0.64
       ];
       pushLineInstance(
         lineRows,
         tagPoint3D(edge.tagId, tagPoint),
         logPoint3D(logEntry, logPoint),
         color,
-        relation.selected ? 6.3 : 4.6,
-        relation.selected ? 1 : 0.84,
+        relation.selected ? 6.4 : 4.6,
+        relation.selected ? 1 : 0.72,
         seeded(edge.tagId * 31 + edge.logId)
       );
     }
@@ -1054,7 +1161,7 @@ function onWheel(event: WheelEvent) {
   cameraTarget = null;
   const wheelDelta = normalizeWheelDelta(event);
   const zoom = clamp(Math.exp(-wheelDelta * 0.0012), 0.76, 1.32);
-  transform.scale = Math.min(2.55, Math.max(0.42, transform.scale * zoom));
+  transform.scale = Math.min(2.55, Math.max(0.05, transform.scale * zoom));
   updateLabels();
 }
 
@@ -1109,6 +1216,7 @@ function updateNebulaCursor(event: PointerEvent) {
   }
   nebulaCursor.x = point.x;
   nebulaCursor.y = point.y;
+  nebulaCursor.target = pickNodeAt(point.x, point.y) ? 1 : 0;
   nebulaCursor.visible = true;
 }
 
@@ -1125,6 +1233,7 @@ function canvasPointFromPointer(event: PointerEvent | MouseEvent) {
 
 function hideNebulaCursor() {
   nebulaCursor.visible = false;
+  nebulaCursor.target = 0;
 }
 
 function inspectLogAt(logId: number, event: PointerEvent) {
@@ -1217,6 +1326,28 @@ function focusLog(logId: number) {
     width: rect.width,
     height: rect.height
   };
+}
+
+function focusDomainCategory(category: DomainCategory) {
+  if (!canvas.value) {
+    pendingFocusCategory = category;
+    return false;
+  }
+  if (layoutBusy) {
+    pendingFocusCategory = category;
+    pendingFitAllFrontView = false;
+    return true;
+  }
+  const tagIds = resolveCategoryTagIds(category);
+  if (tagIds.length === 0) {
+    if (tagPositions.size === 0) {
+      pendingFocusCategory = category;
+      requestLayout();
+      return true;
+    }
+    return false;
+  }
+  return fitTagIdsFrontView(tagIds, { marginX: 168, marginY: 136, minScale: 0.14, maxScale: 1.22 });
 }
 
 function centerTag(tagId: number) {
@@ -1460,18 +1591,49 @@ function fitAllTagsFrontView() {
     return Boolean(canvas.value);
   }
 
+  return fitTagIdsFrontView(
+    props.graph.tags.map((tag) => tag.id),
+    { marginX: 128, marginY: 112, minScale: 0.05, maxScale: 1.18 }
+  );
+}
+
+function fitTagIdsFrontView(
+  tagIds: number[],
+  options: { marginX?: number; marginY?: number; minScale?: number; maxScale?: number } = {}
+) {
+  if (!canvas.value || tagIds.length === 0) {
+    return false;
+  }
   const rect = canvas.value.getBoundingClientRect();
-  const points = [...tagPositions.values()];
-  const minX = Math.min(...points.map((point) => point.x - point.r * 2.2));
-  const maxX = Math.max(...points.map((point) => point.x + point.r * 2.2));
-  const minY = Math.min(...points.map((point) => point.y - point.r * 3.1));
-  const maxY = Math.max(...points.map((point) => point.y + point.r * 3.4));
+  const idSet = new Set(tagIds);
+  const points = props.graph.tags
+    .filter((tag) => idSet.has(tag.id))
+    .map((tag) => {
+      const point = tagPositions.get(tag.id);
+      return point ? { tag, point } : null;
+    })
+    .filter((item): item is { tag: TagNode; point: LayoutPoint } => Boolean(item));
+
+  if (points.length === 0) {
+    return false;
+  }
+
+  const minX = Math.min(...points.map(({ tag, point }) => point.x - point.r * 2.2 - Math.max(96, tag.name.length * 18)));
+  const maxX = Math.max(...points.map(({ tag, point }) => point.x + point.r * 2.2 + Math.max(96, tag.name.length * 18)));
+  const minY = Math.min(...points.map(({ point }) => point.y - point.r * 3.1 - 72));
+  const maxY = Math.max(...points.map(({ point }) => point.y + point.r * 3.4 + 112));
   const worldWidth = Math.max(1, maxX - minX);
   const worldHeight = Math.max(1, maxY - minY);
   const projection = FOCAL_LENGTH / VIEW_DISTANCE;
-  const availableWidth = Math.max(240, rect.width - 128);
-  const availableHeight = Math.max(180, rect.height - 112);
-  const nextScale = Math.min(1.18, Math.max(0.38, Math.min(availableWidth / (worldWidth * projection), availableHeight / (worldHeight * projection))));
+  const availableWidth = Math.max(240, rect.width - (options.marginX ?? 128));
+  const availableHeight = Math.max(180, rect.height - (options.marginY ?? 112));
+  const nextScale = Math.min(
+    options.maxScale ?? 1.18,
+    Math.max(
+      options.minScale ?? 0.05,
+      Math.min(availableWidth / (worldWidth * projection), availableHeight / (worldHeight * projection))
+    )
+  );
 
   cameraTarget = null;
   transform.scale = nextScale;
@@ -1481,6 +1643,30 @@ function fitAllTagsFrontView() {
   camera.panY = (minY + maxY) / 2;
   camera.panZ = 0;
   return true;
+}
+
+function resolveCategoryTagIds(category: DomainCategory) {
+  const cleanName = normalizeText(category.name);
+  const matchingGroup = props.graph.tagGroups.find((group) => normalizeText(group.name) === cleanName);
+  if (matchingGroup?.tagIds.length) {
+    return matchingGroup.tagIds.filter((id) => tagPositions.has(id));
+  }
+
+  const keywords = [category.name, ...(category.keywords ?? [])].map(normalizeText).filter(Boolean);
+  if (keywords.length === 0) {
+    return [];
+  }
+  return props.graph.tags
+    .filter((tag) => {
+      const name = normalizeText(tag.name);
+      return keywords.some((keyword) => name.includes(keyword) || keyword.includes(name));
+    })
+    .map((tag) => tag.id)
+    .filter((id) => tagPositions.has(id));
+}
+
+function normalizeText(value: string) {
+  return String(value ?? '').trim().toLowerCase();
 }
 
 function screenToWorld(x: number, y: number) {
@@ -1599,8 +1785,25 @@ function logPoint3D(log: LogEntry, point: LayoutPoint): Point3D {
   };
 }
 
+function hasTagPriority() {
+  return (props.priorityTagIds?.length ?? 0) > 1;
+}
+
+function tagPriority(tagId: number) {
+  const total = props.priorityTagIds?.length ?? 0;
+  if (total <= 1) {
+    return 0.5;
+  }
+  const rank = priorityRankByTagId.value.get(tagId);
+  if (rank === undefined) {
+    return 0;
+  }
+  return 1 - rank / Math.max(1, total - 1);
+}
+
 function tagDepth(tagId: number) {
-  return (seeded(tagId + 4321) - 0.5) * 320;
+  const priorityDepth = hasTagPriority() ? (0.5 - tagPriority(tagId)) * 420 : 0;
+  return (seeded(tagId + 4321) - 0.5) * 320 + priorityDepth;
 }
 
 function hexToRgb(hex: string) {
@@ -1669,29 +1872,56 @@ function rgbToCss(color: { r: number; g: number; b: number }) {
   return `rgb(${Math.round(color.r * 255)}, ${Math.round(color.g * 255)}, ${Math.round(color.b * 255)})`;
 }
 
+function edgeNeonColor(color: { r: number; g: number; b: number }) {
+  const maxChannel = Math.max(color.r, color.g, color.b, 0.001);
+  const boost = Math.max(1, 0.92 / maxChannel);
+  return {
+    r: clamp(color.r * boost, 0, 1),
+    g: clamp(color.g * boost, 0, 1),
+    b: clamp(color.b * boost, 0, 1)
+  };
+}
+
 function logVisualRgb(log: LogEntry) {
+  const palettes = [
+    { r: 1.0, g: 0.15, b: 0.55 }, // Neon Pink
+    { r: 0.15, g: 1.0, b: 0.25 }, // Neon Green
+    { r: 1.0, g: 0.85, b: 0.0 },  // Neon Yellow
+    { r: 1.0, g: 0.45, b: 0.0 },  // Neon Orange
+    { r: 0.85, g: 0.15, b: 1.0 }, // Neon Purple
+    { r: 0.0, g: 1.0, b: 0.75 },  // Bright Teal
+    { r: 1.0, g: 0.25, b: 0.25 }, // Bright Red
+    { r: 0.65, g: 1.0, b: 0.0 },  // Lime
+    { r: 1.0, g: 0.0, b: 1.0 }    // Magenta
+  ];
+
   if (log.tags.length === 0) {
-    return { r: 0.57, g: 0.86, b: 1 };
+    return palettes[log.id % palettes.length];
   }
-  if (log.tags.length === 1) {
-    return hexToRgb(log.tags[0].color);
-  }
+
   const total = log.tags.reduce(
     (acc, tag) => {
       const color = hexToRgb(tag.color);
-      return {
-        r: acc.r + color.r,
-        g: acc.g + color.g,
-        b: acc.b + color.b
-      };
+      return { r: acc.r + color.r, g: acc.g + color.g, b: acc.b + color.b };
     },
     { r: 0, g: 0, b: 0 }
   );
-  return {
+
+  const avg = {
     r: total.r / log.tags.length,
     g: total.g / log.tags.length,
     b: total.b / log.tags.length
   };
+
+  for (let i = 0; i < palettes.length; i++) {
+    const candidate = palettes[(log.id + i) % palettes.length];
+    const dist = Math.abs(candidate.r - avg.r) + Math.abs(candidate.g - avg.g) + Math.abs(candidate.b - avg.b);
+    if (dist > 0.8) {
+      return candidate;
+    }
+  }
+
+  return palettes[(log.id + 1) % palettes.length];
 }
 
 function logPlanetKind(log: LogEntry) {
@@ -1766,6 +1996,20 @@ fn valueNoiseWrapped(p: vec2f, periodX: f32) -> f32 {
   return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
+fn fbm(p: vec2f, periodX: f32) -> f32 {
+  var v = 0.0;
+  var a = 0.5;
+  var shift = p;
+  var px = periodX;
+  for (var i = 0; i < 4; i++) {
+    v += a * valueNoiseWrapped(shift, px);
+    shift = shift * 2.0 + vec2f(100.0);
+    px *= 2.0;
+    a *= 0.5;
+  }
+  return v;
+}
+
 fn rotateSky(dir: vec3f) -> vec3f {
   let cy = cos(-u.camera.z);
   let sy = sin(-u.camera.z);
@@ -1775,15 +2019,19 @@ fn rotateSky(dir: vec3f) -> vec3f {
   return normalize(vec3f(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy));
 }
 
-fn softStar(uv: vec2f, periodX: f32, threshold: f32, radius: f32, scale: f32) -> f32 {
-  let cell = wrapCellX(floor(uv), periodX);
-  let brightness = hash(cell);
-  let intensity = smoothstep(threshold, 1.0, brightness);
-  let offset = vec2f(hash(cell + vec2f(23.4, 11.8)), hash(cell + vec2f(7.2, 59.1)));
-  let d = length(fract(uv) - offset);
-  let core = 1.0 - smoothstep(radius * 0.25, radius, d);
-  let glow = 1.0 - smoothstep(radius, radius * 2.8, d);
-  return (core + glow * 0.28) * intensity * scale;
+fn drawDotStar(sky: vec2f, gridSize: f32, threshold: f32) -> f32 {
+  let scaledUv = sky * gridSize;
+  let cell = floor(scaledUv);
+
+  let h1 = hash(cell);
+  if (h1 < threshold) { return 0.0; }
+
+  let localUv = fract(scaledUv) * 2.0 - vec2f(1.0);
+  let offset = vec2f(hash(cell + vec2f(11.0, 31.0)), hash(cell + vec2f(51.0, 71.0))) * 2.0 - vec2f(1.0);
+  let centeredUv = localUv - offset * 0.8;
+
+  let d = length(centeredUv);
+  return smoothstep(0.4, 0.0, d) * ((h1 - threshold) / (1.0 - threshold));
 }
 
 @vertex
@@ -1810,32 +2058,147 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   let screen = ((input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0) + viewPan) / backgroundZoom;
   let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
   let dir = rotateSky(viewDir);
+
   let lon = atan2(dir.x, dir.z);
   let lat = asin(clamp(dir.y, -1.0, 1.0));
   let sky = vec2f(lon / 6.2831853 + 0.5, lat / 3.1415926 + 0.5);
 
-  let horizon = 1.0 - smoothstep(0.28, 0.96, abs(dir.y));
-  let swirlA = sin(lon * 2.0 + lat * 5.8 + time * 0.035);
-  let swirlB = cos(lon * 5.0 - lat * 3.1 - time * 0.027);
-  let noiseA = valueNoiseWrapped(sky * vec2f(12.0, 6.0) + vec2f(time * 0.006, 0.0), 12.0);
-  let noiseB = valueNoiseWrapped(sky * vec2f(31.0, 15.0) - vec2f(0.0, time * 0.004), 31.0);
-  let cloud = smoothstep(0.58, 1.28, swirlA * 0.16 + swirlB * 0.12 + noiseA * 0.38 + noiseB * 0.18 + horizon * 0.44);
-  let deep = mix(vec3f(0.003, 0.007, 0.015), vec3f(0.012, 0.032, 0.064), horizon * 0.42);
-  let cyan = vec3f(0.026, 0.15, 0.28) * cloud * (0.45 + horizon * 0.2);
-  let violet = vec3f(0.12, 0.055, 0.22) * smoothstep(0.32, 0.96, swirlB * 0.5 + 0.5) * cloud * 0.12;
-  let amber = vec3f(0.22, 0.12, 0.045) * smoothstep(0.5, 0.98, swirlA * 0.5 + 0.5) * cloud * 0.05;
+  let colorDeepNavy = vec3f(0.02, 0.04, 0.08);
+  let colorMilkyGlow = vec3f(0.12, 0.22, 0.50);
+  let colorCoreWhite = vec3f(0.35, 0.55, 0.85);
+
+  let baseNoiseSky = sky * vec2f(3.0, 3.0) - vec2f(time * 0.0005, time * 0.0002);
+  let structuralNoise = fbm(baseNoiseSky, 3.0);
+
+  // Make the glow omnipresent everywhere, varying from 0.4 to 1.0
+  let galacticGlow = mix(0.4, 1.0, smoothstep(0.2, 0.8, structuralNoise));
+
+  let noiseSky = sky * vec2f(8.0, 8.0) + vec2f(time * 0.001, 0.0);
+  let dustNoise = fbm(noiseSky, 8.0);
+
+  let dustMask = smoothstep(0.3, 0.7, dustNoise);
+
+  let coreIntensity = galacticGlow * dustMask;
+  let haloIntensity = galacticGlow * 0.5 * (0.4 + dustMask * 0.6);
+
+  let backgroundGradient = mix(colorDeepNavy, colorMilkyGlow, haloIntensity);
+  let finalBackground = mix(backgroundGradient, colorCoreWhite, coreIntensity * 0.8);
 
   let starSky = (sky - vec2f(0.5)) / backgroundZoom + vec2f(0.5);
-  let uvTiny = starSky * vec2f(520.0, 220.0);
-  let uvFine = starSky * vec2f(340.0, 148.0);
-  let uvBright = starSky * vec2f(150.0, 68.0) + vec2f(time * 0.0012, 0.0);
-  let starTiny = softStar(uvTiny, 520.0, 0.955, 0.09, 0.46);
-  let starFine = softStar(uvFine, 340.0, 0.965, 0.12, 0.76);
-  let starBright = softStar(uvBright, 150.0, 0.982, 0.16, 0.95);
-  let starColor = vec3f(0.95, 0.98, 1.0) * (starTiny + starFine + starBright) + vec3f(1.0, 0.86, 0.64) * starBright * 0.12;
-  let vignette = 1.0 - smoothstep(0.72, 1.34, length(screen));
-  let color = (deep + cyan + violet + amber) * (0.86 + vignette * 0.14) + starColor;
+
+  // Lower thresholds so there are significantly more stars everywhere
+  let s1 = drawDotStar(starSky, 600.0, 0.80);
+  let s2 = drawDotStar(starSky + vec2f(0.3, 0.7), 1200.0, 0.85);
+  let s3 = drawDotStar(starSky + vec2f(0.8, 0.1), 2400.0, 0.90);
+
+  // Stars are uniformly dense everywhere, no empty patches
+  let starBrightness = s1 * 1.2 + s2 * 0.8 + s3 * 0.4;
+
+  let twinkle = 0.8 + 0.2 * sin(time * 3.0 + lon * 100.0);
+  let starColor = vec3f(0.7, 0.85, 1.0) * starBrightness * twinkle;
+
+  let color = finalBackground + starColor;
+
   return vec4f(min(color, vec3f(1.0)), 1.0);
+}
+`;
+
+const postShader = `
+struct VertexOut {
+  @builtin(position) position: vec4f,
+  @location(0) uv: vec2f
+};
+
+@group(0) @binding(0) var sceneSampler: sampler;
+@group(0) @binding(1) var sceneTexture: texture_2d<f32>;
+
+struct PostUniforms {
+  viewport: vec4f,
+  camera: vec4f,
+  space: vec4f,
+  extra: vec4f,
+  cursor: vec4f
+};
+
+@group(0) @binding(2) var<uniform> u: PostUniforms;
+
+@vertex
+fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
+  var pos = array<vec2f, 3>(
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+    vec2f(-1.0, 1.0)
+  );
+  let p = pos[vertexIndex];
+  var out: VertexOut;
+  out.position = vec4f(p, 0.0, 1.0);
+  out.uv = p * vec2f(0.5, -0.5) + vec2f(0.5);
+  return out;
+}
+
+fn sampleScene(uv: vec2f) -> vec3f {
+  return textureSample(sceneTexture, sceneSampler, clamp(uv, vec2f(0.0), vec2f(1.0))).rgb;
+}
+
+fn brightPart(color: vec3f) -> vec3f {
+  let luma = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+  let factor = smoothstep(0.25, 0.86, luma);
+  return color * factor;
+}
+
+fn ringMask(distance: f32, radius: f32, width: f32) -> f32 {
+  return 1.0 - smoothstep(width * 0.36, width, abs(distance - radius));
+}
+
+@fragment
+fn fs(input: VertexOut) -> @location(0) vec4f {
+  let dims = textureDimensions(sceneTexture);
+  let texel = 1.0 / vec2f(f32(dims.x), f32(dims.y));
+  let center = sampleScene(input.uv);
+  var bloom = brightPart(center) * 0.28;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(1.5, 0.0))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(-1.5, 0.0))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(0.0, 1.5))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(0.0, -1.5))) * 0.11;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(2.4, 2.4))) * 0.07;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(-2.4, 2.4))) * 0.07;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(2.4, -2.4))) * 0.07;
+  bloom += brightPart(sampleScene(input.uv + texel * vec2f(-2.4, -2.4))) * 0.07;
+  var color = center * 0.96 + bloom * 0.52;
+  let cursorVisible = clamp(u.cursor.z, 0.0, 1.0);
+  let cursorTarget = clamp(u.cursor.w, 0.0, 1.0);
+  let pixel = input.uv * max(u.viewport.xy, vec2f(1.0));
+  let delta = pixel - u.cursor.xy;
+  let d = length(delta);
+  let angle = atan2(delta.y, delta.x);
+  let time = u.viewport.w;
+
+  let corePulse = 0.5 + 0.5 * sin(time * 4.0);
+  let coreRadius = 2.0 + cursorTarget * 1.5 + corePulse * 0.5;
+  let core = exp(-d / coreRadius) * (1.2 + cursorTarget * 0.8);
+
+  let spin1 = angle - time * 2.5;
+  let petal1 = pow(0.5 + 0.5 * sin(spin1 * 3.0), 2.0);
+  let ring1 = exp(-abs(d - (12.0 + cursorTarget * 4.0)) * 0.3) * petal1 * (0.6 + cursorTarget * 0.5);
+
+  let spin2 = angle + time * 1.8;
+  let petal2 = pow(0.5 + 0.5 * sin(spin2 * 5.0), 2.0);
+  let ring2 = exp(-abs(d - (22.0 + cursorTarget * 8.0)) * 0.15) * petal2 * (0.4 + cursorTarget * 0.4);
+
+  let dustPhase = sin(d * 4.0 - time * 3.0) * cos(angle * 8.0 + time * 2.0);
+  let dust = max(0.0, dustPhase) * exp(-d * 0.03) * 0.15 * (1.0 + cursorTarget * 1.5);
+
+  let cCyan = vec3f(0.05, 0.85, 1.0);
+  let cMagenta = vec3f(0.9, 0.15, 1.0);
+  let cGold = vec3f(1.0, 0.9, 0.5);
+  let probeWhite = vec3f(1.0, 0.96, 0.9);
+
+  let flareColor = mix(cCyan, cMagenta, 0.5 + 0.5 * sin(d * 0.1 - time * 1.5));
+  let cursorGlow = probeWhite * core + flareColor * (ring1 + ring2) + cGold * dust;
+  color += cursorVisible * cursorGlow;
+  let vignette = 1.0 - smoothstep(0.58, 1.25, length(input.uv - vec2f(0.5)));
+  let graded = pow(min(color, vec3f(1.0)), vec3f(0.94));
+  return vec4f(min(graded * (0.96 + vignette * 0.05), vec3f(1.0)), 1.0);
 }
 `;
 
@@ -1935,17 +2298,32 @@ fn vs(input: VertexIn) -> VertexOut {
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
   if (input.kind > 3.5) {
-    let c = cos(input.tilt);
-    let s = sin(input.tilt);
-    let local = vec2f(input.local.x * c - input.local.y * s, input.local.x * s + input.local.y * c);
-    let ringPoint = vec2f(local.x, local.y * 2.65);
-    let d = length(ringPoint);
-    if (d < 0.63 || d > 1.08 || local.y > 0.18) {
-      discard;
-    }
-    let band = exp(-abs(d - 0.84) * 23.0);
-    let shimmer = 0.68 + sin(input.time * 2.1 + input.seed * 8.0 + local.x * 8.0) * 0.18;
-    return vec4f(input.color.rgb * (0.74 + input.state * 0.35), band * input.color.a * shimmer);
+    let d = length(input.local);
+    if (d > 1.0) { discard; }
+
+    let ax = abs(input.local.x);
+    let ay = abs(input.local.y);
+
+    let core = exp(-d * 12.0);
+    let flareX = exp(-ay * 50.0) * exp(-ax * 1.5);
+    let flareY = exp(-ax * 50.0) * exp(-ay * 1.5);
+    let crossFlare = flareX + flareY;
+
+    let diagX = abs(input.local.x + input.local.y) * 0.707;
+    let diagY = abs(input.local.x - input.local.y) * 0.707;
+    let diagFlare = (exp(-diagX * 35.0) * exp(-diagY * 5.0) + exp(-diagY * 35.0) * exp(-diagX * 5.0)) * 0.6;
+
+    let twinkle = 0.7 + 0.5 * sin(input.time * 3.2 + input.seed * 15.0);
+    let selectedBoost = 1.0 + input.state * 1.2;
+
+    let alpha = (core * 2.5 + crossFlare * 2.0 + diagFlare) * input.color.a * twinkle * selectedBoost;
+    let coreGlow = smoothstep(0.0, 0.12, core);
+
+    // Make the core a brighter version of its own color instead of white
+    let brightColor = input.color.rgb * 1.8;
+    let color = mix(input.color.rgb, brightColor, coreGlow);
+
+    return vec4f(color * selectedBoost, min(1.0, alpha));
   }
 
   let d = length(input.local);
@@ -1959,14 +2337,18 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
   }
 
   if (input.kind > 2.5) {
-    let logHalo = smoothstep(3.08, 3.22, input.kind);
+    let angle = atan2(input.local.y, input.local.x);
+    let spiral = 0.5 + 0.5 * sin(angle * 3.0 + d * 10.5 - input.time * 0.8 + input.seed * 6.283);
+    let arms = smoothstep(0.62, 0.98, spiral) * (1.0 - smoothstep(0.12, 0.94, d));
     let halo = 1.0 - smoothstep(0.08, 1.0, d);
-    let core = 1.0 - smoothstep(0.0, 0.48, d);
-    let pulse = 0.86 + sin(input.time * 2.2 + input.seed * 6.283) * 0.08;
-    let selectedGlow = smoothstep(0.92, 1.0, input.state) * logHalo;
-    let alpha = (halo * mix(0.62, 0.98, logHalo) + core * mix(0.2, 0.12, logHalo)) * input.color.a * pulse * (0.72 + input.state * 0.38);
-    let color = mix(input.color.rgb, vec3f(1.0, 0.96, 0.86), selectedGlow * 0.28) * (0.74 + core * 0.24 + selectedGlow * 0.18);
-    return vec4f(color, alpha);
+    let inner = 1.0 - smoothstep(0.0, 0.4, d);
+    let pulse = 0.88 + sin(input.time * 1.9 + input.seed * 6.283) * 0.08;
+    let selectedGlow = smoothstep(0.92, 1.0, input.state);
+    let flare = exp(-abs(input.local.y) * 5.2) * (1.0 - smoothstep(0.3, 1.0, abs(input.local.x))) * 0.24;
+    let alpha = (halo * 0.36 + arms * 0.56 + flare + inner * 0.1) * input.color.a * pulse * (0.68 + input.state * 0.42);
+    let dream = mix(vec3f(0.08, 0.9, 1.0), vec3f(0.98, 0.2, 0.88), spiral);
+    let color = mix(input.color.rgb, dream, 0.34 + arms * 0.44 + selectedGlow * 0.14);
+    return vec4f(min(color * (0.86 + selectedGlow * 0.2) + vec3f(1.0) * inner * selectedGlow * 0.18, vec3f(1.0)), min(1.0, alpha));
   }
 
   if (input.kind > 0.5 && input.kind < 1.5) {
@@ -1981,22 +2363,18 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
     return vec4f(min(plasmaColor + whiteCore, vec3f(1.0)), alpha);
   }
 
-  if (d > 1.0) {
-    discard;
-  }
-  let z = sqrt(max(0.0, 1.0 - d * d));
-  let normal = normalize(vec3f(input.local.x, input.local.y, z));
-  let light = normalize(vec3f(-0.62, -0.42, 0.82));
-  let diffuse = clamp(dot(normal, light), 0.0, 1.0);
-  let rim = pow(1.0 - z, 2.2);
-  let bands = 0.5 + 0.5 * sin((input.local.y * 13.0 + input.local.x * 2.2) + input.seed * 8.0 + input.time * 0.16);
-  let terrain = 0.5 + 0.5 * sin(input.local.x * 19.0 + input.local.y * 11.0 + input.seed * 13.0);
-  let lava = smoothstep(0.72, 0.98, sin(input.local.x * 15.0 - input.local.y * 17.0 + input.seed * 7.0) * 0.5 + 0.5);
-  let colorBands = mix(input.color.rgb * (0.64 + bands * 0.36), input.color.rgb + vec3f(0.2, 0.16, 0.08), terrain * 0.2);
-  let hot = vec3f(1.0, 0.33, 0.12) * lava * input.state * 0.26;
-  let shade = colorBands * (0.24 + diffuse * 0.92) + vec3f(0.78, 0.9, 1.0) * rim * 0.17 + hot;
-  let glow = (1.0 - smoothstep(0.72, 1.0, d)) * input.color.a;
-  return vec4f(min(shade, vec3f(1.0)), glow);
+  let c = cos(input.tilt);
+  let s = sin(input.tilt);
+  let local = vec2f(input.local.x * c - input.local.y * s, input.local.x * s + input.local.y * c);
+  let angle = atan2(local.y, local.x);
+  let core = 1.0 - smoothstep(0.0, 0.32, d);
+  let glow = 1.0 - smoothstep(0.16, 0.94, d);
+  let ripple = exp(-abs(d - (0.5 + sin(input.time * 0.85 + input.seed * 6.283) * 0.035)) * 20.0);
+  let swirl = 0.5 + 0.5 * sin(angle * 3.5 + d * 9.0 - input.time * 0.9 + input.seed * 7.0);
+  let neon = mix(vec3f(0.1, 0.94, 1.0), vec3f(0.96, 0.24, 1.0), swirl);
+  let alpha = (core * 1.0 + glow * 0.4 + ripple * 0.28) * input.color.a * (0.78 + input.state * 0.34);
+  let color = mix(input.color.rgb, neon, 0.5 + ripple * 0.2) + vec3f(1.0, 0.98, 0.9) * core * 0.42;
+  return vec4f(min(color, vec3f(1.0)), min(1.0, alpha));
 }
 `;
 
@@ -2064,18 +2442,29 @@ fn vs(input: LineIn, @builtin(vertex_index) vertexIndex: u32) -> VertexOut {
 
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
-  let fade = smoothstep(0.02, 0.18, input.along) * (1.0 - smoothstep(0.82, 0.98, input.along));
-  let wave = fract(input.along * (5.2 + input.state * 1.4) - input.time * (0.42 + input.state * 0.34) + input.seed);
-  let bead = smoothstep(0.72, 0.88, wave) * (1.0 - smoothstep(0.88, 1.0, wave));
+  let fade = smoothstep(0.02, 0.16, input.along) * (1.0 - smoothstep(0.84, 0.99, input.along));
+  let flow = input.along * (5.2 + input.state * 1.25) - input.time * (0.52 + input.state * 0.34) + input.seed;
+  let wave = fract(flow);
+  let bead = smoothstep(0.5, 0.68, wave) * (1.0 - smoothstep(0.68, 0.92, wave));
+  let echoWave = fract(flow + 0.38);
+  let echo = smoothstep(0.54, 0.72, echoWave) * (1.0 - smoothstep(0.72, 0.95, echoWave));
   let side = abs(input.side);
-  let core = 1.0 - smoothstep(0.05, 0.82, side);
-  let mist = (1.0 - smoothstep(0.22, 1.0, side)) * 0.18;
-  let alpha = fade * input.color.a * (mist + bead * core * (0.9 + input.state * 0.56));
-  if (alpha < 0.008) {
+  let inner = 1.0 - smoothstep(0.02, 0.18, side);
+  let core = 1.0 - smoothstep(0.06, 0.42, side);
+  let halo = 1.0 - smoothstep(0.28, 1.0, side);
+  let pulse = 0.88 + sin(input.time * 2.15 + input.seed * 6.283 + input.along * 4.4) * 0.08;
+  let alpha = fade * input.color.a * (
+    halo * 0.26 +
+    core * (0.36 + input.state * 0.22) * pulse +
+    bead * inner * (0.86 + input.state * 0.72) +
+    echo * inner * (0.18 + input.state * 0.18)
+  );
+  if (alpha < 0.007) {
     discard;
   }
-  let color = input.color.rgb + vec3f(0.34, 0.52, 0.68) * bead * (0.28 + input.state * 0.42);
-  return vec4f(color, min(1.0, alpha));
+  let intensity = 0.68 + halo * 0.12 + core * 0.28 + bead * (0.62 + input.state * 0.4) + echo * 0.18;
+  let color = min(input.color.rgb * intensity, vec3f(1.0));
+  return vec4f(color, min(0.92, alpha));
 }
 `;
 </script>
@@ -2093,11 +2482,6 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
       @contextmenu.prevent
       @wheel="onWheel"
     ></canvas>
-    <div
-      class="nebula-star-cursor"
-      :class="{ visible: nebulaCursor.visible }"
-      :style="{ transform: `translate(${nebulaCursor.x}px, ${nebulaCursor.y}px) rotate(${nebulaCursor.angle}rad)` }"
-    ></div>
     <slot name="overlay"></slot>
 
     <div class="webgpu-label-layer">

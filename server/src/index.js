@@ -12,6 +12,7 @@ import {
   createUser,
   deleteDomainCategory,
   deleteLog,
+  deleteMap,
   deleteSession,
   deleteTag,
   getEdges,
@@ -153,6 +154,19 @@ app.patch(
       return;
     }
     res.json(updated);
+  })
+);
+
+app.delete(
+  '/api/maps/:id',
+  asyncRoute(async (req, res) => {
+    const mapId = Number(req.params.id);
+    const deleted = await deleteMap(mapId, req.user.id);
+    if (!deleted) {
+      res.status(404).json({ message: '鏄熶簯鍥句笉瀛樺湪' });
+      return;
+    }
+    res.json({ ok: true });
   })
 );
 

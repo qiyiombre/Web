@@ -402,6 +402,30 @@ small {
   font-weight: 750;
 }
 
+.date-filter-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 4px 8px;
+  color: #aebdd0;
+  background: rgba(255, 255, 255, 0.055);
+  font-size: 12px;
+}
+
+.date-filter-controls input {
+  width: 118px;
+  min-height: 26px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 6px;
+  color: #d9e8f7;
+  background: rgba(2, 8, 18, 0.58);
+  font: inherit;
+}
+
 .stat-pill {
   display: inline-flex;
   align-items: center;
@@ -1464,6 +1488,21 @@ small {
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.045);
   padding: 0 9px;
+}
+
+.domain-category-focus {
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  appearance: none;
+}
+
+.domain-category-focus:hover,
+.domain-category-focus:focus-visible {
+  border-color: rgba(98, 214, 255, 0.42);
+  background: rgba(98, 214, 255, 0.09);
 }
 
 .domain-category-card strong,
