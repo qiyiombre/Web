@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { Maximize2, Minimize2 } from 'lucide-vue-next';
 import type { DomainCategory, GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
@@ -1962,145 +1962,108 @@ function seeded(input: number) {
 }
 
 const backgroundShader = `
-struct Uniforms {
-  viewport: vec4f,
-  camera: vec4f,
-  space: vec4f,
-  extra: vec4f
-};
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-
-struct VertexOut {
-  @builtin(position) position: vec4f,
-  @location(0) uv: vec2f
-};
-
-fn hash(p: vec2f) -> f32 {
-  return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
-}
-
-fn wrapCellX(cell: vec2f, periodX: f32) -> vec2f {
-  let x = cell.x - floor(cell.x / periodX) * periodX;
-  return vec2f(x, cell.y);
-}
-
-fn valueNoiseWrapped(p: vec2f, periodX: f32) -> f32 {
-  let i = floor(p);
-  let q = fract(p);
-  let f = q * q * (vec2f(3.0) - 2.0 * q);
-  let a = hash(wrapCellX(i, periodX));
-  let b = hash(wrapCellX(i + vec2f(1.0, 0.0), periodX));
-  let c = hash(wrapCellX(i + vec2f(0.0, 1.0), periodX));
-  let d = hash(wrapCellX(i + vec2f(1.0, 1.0), periodX));
-  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
-}
-
-fn fbm(p: vec2f, periodX: f32) -> f32 {
-  var v = 0.0;
-  var a = 0.5;
-  var shift = p;
-  var px = periodX;
-  for (var i = 0; i < 4; i++) {
-    v += a * valueNoiseWrapped(shift, px);
-    shift = shift * 2.0 + vec2f(100.0);
-    px *= 2.0;
-    a *= 0.5;
+  struct Uniforms {
+    viewport: vec4f,
+    camera: vec4f,
+    space: vec4f,
+    extra: vec4f
+  };
+  
+  @group(0) @binding(0) var<uniform> u: Uniforms;
+  
+  struct VertexOut {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f
+  };
+  
+  fn hash(p: vec2f) -> f32 {
+    return fract(sin(dot(p, vec2f(127.1, 311.7))) * 43758.5453);
   }
-  return v;
-}
-
-fn rotateSky(dir: vec3f) -> vec3f {
-  let cy = cos(-u.camera.z);
-  let sy = sin(-u.camera.z);
-  let cp = cos(-u.camera.w);
-  let sp = sin(-u.camera.w);
-  let pitched = vec3f(dir.x, dir.y * cp - dir.z * sp, dir.y * sp + dir.z * cp);
-  return normalize(vec3f(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy));
-}
-
-fn drawDotStar(sky: vec2f, gridSize: f32, threshold: f32) -> f32 {
-  let scaledUv = sky * gridSize;
-  let cell = floor(scaledUv);
-
-  let h1 = hash(cell);
-  if (h1 < threshold) { return 0.0; }
-
-  let localUv = fract(scaledUv) * 2.0 - vec2f(1.0);
-  let offset = vec2f(hash(cell + vec2f(11.0, 31.0)), hash(cell + vec2f(51.0, 71.0))) * 2.0 - vec2f(1.0);
-  let centeredUv = localUv - offset * 0.8;
-
-  let d = length(centeredUv);
-  return smoothstep(0.4, 0.0, d) * ((h1 - threshold) / (1.0 - threshold));
-}
-
-@vertex
-fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
-  var pos = vec2f(-1.0, -1.0);
-  if (vertexIndex == 1u) {
-    pos = vec2f(3.0, -1.0);
+  
+  fn wrapCellX(cell: vec2f, periodX: f32) -> vec2f {
+    let x = cell.x - floor(cell.x / periodX) * periodX;
+    return vec2f(x, cell.y);
   }
-  if (vertexIndex == 2u) {
-    pos = vec2f(-1.0, 3.0);
+  
+  fn valueNoiseWrapped(p: vec2f, periodX: f32) -> f32 {
+    let i = floor(p);
+    let q = fract(p);
+    let f = q * q * (vec2f(3.0) - 2.0 * q);
+    let a = hash(wrapCellX(i, periodX));
+    let b = hash(wrapCellX(i + vec2f(1.0, 0.0), periodX));
+    let c = hash(wrapCellX(i + vec2f(0.0, 1.0), periodX));
+    let d = hash(wrapCellX(i + vec2f(1.0, 1.0), periodX));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
   }
-  var out: VertexOut;
-  out.position = vec4f(pos, 0.0, 1.0);
-  out.uv = pos * 0.5 + vec2f(0.5);
-  return out;
-}
-
-@fragment
-fn fs(input: VertexOut) -> @location(0) vec4f {
-  let time = u.viewport.w;
-  let aspect = max(0.4, u.viewport.x / max(1.0, u.viewport.y));
-  let backgroundZoom = clamp(1.0 + (u.viewport.z - 1.0) * 0.18, 0.86, 1.28);
-  let viewPan = vec2f(u.camera.x, -u.camera.y) / max(1.0, u.space.y) * 0.72;
-  let screen = ((input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0) + viewPan) / backgroundZoom;
-  let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
-  let dir = rotateSky(viewDir);
-
-  let lon = atan2(dir.x, dir.z);
-  let lat = asin(clamp(dir.y, -1.0, 1.0));
-  let sky = vec2f(lon / 6.2831853 + 0.5, lat / 3.1415926 + 0.5);
-
-  let colorDeepNavy = vec3f(0.02, 0.04, 0.08);
-  let colorMilkyGlow = vec3f(0.12, 0.22, 0.50);
-  let colorCoreWhite = vec3f(0.35, 0.55, 0.85);
-
-  let baseNoiseSky = sky * vec2f(3.0, 3.0) - vec2f(time * 0.0005, time * 0.0002);
-  let structuralNoise = fbm(baseNoiseSky, 3.0);
-
-  // Make the glow omnipresent everywhere, varying from 0.4 to 1.0
-  let galacticGlow = mix(0.4, 1.0, smoothstep(0.2, 0.8, structuralNoise));
-
-  let noiseSky = sky * vec2f(8.0, 8.0) + vec2f(time * 0.001, 0.0);
-  let dustNoise = fbm(noiseSky, 8.0);
-
-  let dustMask = smoothstep(0.3, 0.7, dustNoise);
-
-  let coreIntensity = galacticGlow * dustMask;
-  let haloIntensity = galacticGlow * 0.5 * (0.4 + dustMask * 0.6);
-
-  let backgroundGradient = mix(colorDeepNavy, colorMilkyGlow, haloIntensity);
-  let finalBackground = mix(backgroundGradient, colorCoreWhite, coreIntensity * 0.8);
-
-  let starSky = (sky - vec2f(0.5)) / backgroundZoom + vec2f(0.5);
-
-  // Lower thresholds so there are significantly more stars everywhere
-  let s1 = drawDotStar(starSky, 600.0, 0.80);
-  let s2 = drawDotStar(starSky + vec2f(0.3, 0.7), 1200.0, 0.85);
-  let s3 = drawDotStar(starSky + vec2f(0.8, 0.1), 2400.0, 0.90);
-
-  // Stars are uniformly dense everywhere, no empty patches
-  let starBrightness = s1 * 1.2 + s2 * 0.8 + s3 * 0.4;
-
-  let twinkle = 0.8 + 0.2 * sin(time * 3.0 + lon * 100.0);
-  let starColor = vec3f(0.7, 0.85, 1.0) * starBrightness * twinkle;
-
-  let color = finalBackground + starColor;
-
-  return vec4f(min(color, vec3f(1.0)), 1.0);
-}
+  
+  fn rotateSky(dir: vec3f) -> vec3f {
+    let cy = cos(-u.camera.z);
+    let sy = sin(-u.camera.z);
+    let cp = cos(-u.camera.w);
+    let sp = sin(-u.camera.w);
+    let pitched = vec3f(dir.x, dir.y * cp - dir.z * sp, dir.y * sp + dir.z * cp);
+    return normalize(vec3f(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy));
+  }
+  
+  fn softStar(uv: vec2f, periodX: f32, threshold: f32, radius: f32, scale: f32) -> f32 {
+    let cell = wrapCellX(floor(uv), periodX);
+    let brightness = hash(cell);
+    let intensity = smoothstep(threshold, 1.0, brightness);
+    let offset = vec2f(hash(cell + vec2f(23.4, 11.8)), hash(cell + vec2f(7.2, 59.1)));
+    let d = length(fract(uv) - offset);
+    let core = 1.0 - smoothstep(radius * 0.25, radius, d);
+    let glow = 1.0 - smoothstep(radius, radius * 2.8, d);
+    return (core + glow * 0.28) * intensity * scale;
+  }
+  
+  @vertex
+  fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
+    var pos = vec2f(-1.0, -1.0);
+    if (vertexIndex == 1u) {
+      pos = vec2f(3.0, -1.0);
+    }
+    if (vertexIndex == 2u) {
+      pos = vec2f(-1.0, 3.0);
+    }
+    var out: VertexOut;
+    out.position = vec4f(pos, 0.0, 1.0);
+    out.uv = pos * 0.5 + vec2f(0.5);
+    return out;
+  }
+  
+  @fragment
+  fn fs(input: VertexOut) -> @location(0) vec4f {
+    let time = u.viewport.w;
+    let aspect = max(0.4, u.viewport.x / max(1.0, u.viewport.y));
+    let screen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0);
+    let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
+    let dir = rotateSky(viewDir);
+    let lon = atan2(dir.x, dir.z);
+    let lat = asin(clamp(dir.y, -1.0, 1.0));
+    let sky = vec2f(lon / 6.2831853 + 0.5, lat / 3.1415926 + 0.5);
+  
+    let horizon = 1.0 - smoothstep(0.28, 0.96, abs(dir.y));
+    let swirlA = sin(lon * 2.0 + lat * 5.8 + time * 0.035);
+    let swirlB = cos(lon * 5.0 - lat * 3.1 - time * 0.027);
+    let noiseA = valueNoiseWrapped(sky * vec2f(12.0, 6.0) + vec2f(time * 0.006, 0.0), 12.0);
+    let noiseB = valueNoiseWrapped(sky * vec2f(31.0, 15.0) - vec2f(0.0, time * 0.004), 31.0);
+    let cloud = smoothstep(0.58, 1.28, swirlA * 0.16 + swirlB * 0.12 + noiseA * 0.38 + noiseB * 0.18 + horizon * 0.44);
+    let deep = mix(vec3f(0.003, 0.007, 0.015), vec3f(0.012, 0.032, 0.064), horizon * 0.42);
+    let cyan = vec3f(0.026, 0.15, 0.28) * cloud * (0.45 + horizon * 0.2);
+    let violet = vec3f(0.12, 0.055, 0.22) * smoothstep(0.32, 0.96, swirlB * 0.5 + 0.5) * cloud * 0.12;
+    let amber = vec3f(0.22, 0.12, 0.045) * smoothstep(0.5, 0.98, swirlA * 0.5 + 0.5) * cloud * 0.05;
+  
+    let uvTiny = sky * vec2f(520.0, 220.0);
+    let uvFine = sky * vec2f(340.0, 148.0);
+    let uvBright = sky * vec2f(150.0, 68.0) + vec2f(time * 0.0012, 0.0);
+    let starTiny = softStar(uvTiny, 520.0, 0.955, 0.09, 0.46);
+    let starFine = softStar(uvFine, 340.0, 0.965, 0.12, 0.76);
+    let starBright = softStar(uvBright, 150.0, 0.982, 0.16, 0.95);
+    let starColor = vec3f(0.95, 0.98, 1.0) * (starTiny + starFine + starBright) + vec3f(1.0, 0.86, 0.64) * starBright * 0.12;
+    let vignette = 1.0 - smoothstep(0.72, 1.34, length(screen));
+    let color = (deep + cyan + violet + amber) * (0.86 + vignette * 0.14) + starColor;
+    return vec4f(min(color, vec3f(1.0)), 1.0);
+  }
 `;
 
 const postShader = `
