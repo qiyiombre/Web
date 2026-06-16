@@ -62,6 +62,11 @@ watch(
   () => openFromRouteQuery()
 );
 
+watch(
+  () => route.query.q,
+  () => syncSearchFromRoute()
+);
+
 const logs = computed(() => {
   let list = graphStore.filteredLogs;
   if (searchQuery.value.trim()) {
@@ -133,6 +138,7 @@ function switchMap(nextId: number) {
 }
 
 function openFromRouteQuery() {
+  syncSearchFromRoute();
   if (route.query.new === '1') {
     startNew();
     return;
@@ -142,6 +148,13 @@ function openFromRouteQuery() {
   if (!Number.isFinite(editId)) return;
   const log = mapsStore.graph?.logs.find(item => item.id === editId);
   if (log) startEdit(log);
+}
+
+function syncSearchFromRoute() {
+  const rawQuery = Array.isArray(route.query.q) ? route.query.q[0] : route.query.q;
+  if (typeof rawQuery === 'string' && rawQuery.trim()) {
+    searchQuery.value = rawQuery.trim();
+  }
 }
 
 async function handleSave(payload: { title: string; content: string; tagNames: string[] }) {
