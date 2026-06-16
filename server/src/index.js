@@ -21,6 +21,7 @@ import {
   getMapById,
   getSessionUser,
   getTagById,
+  getUserPreferences,
   initializeDatabase,
   listDomainCategories,
   listLogs,
@@ -29,15 +30,18 @@ import {
   normalizeTagNames,
   restoreLogSnapshot,
   restoreTagSnapshot,
+  setUserPreferences,
   updateDomainCategory,
   updateLog,
   updateMap,
+  updateUserPassword,
   updateTag,
   verifyUserCredentials
 } from './db.js';
 import { buildInsights, generateAdvice } from './insights.js';
 import { searchTags, suggestTags } from './recommend.js';
 import { buildTagGroups, buildTagSimilarities } from './semantic.js';
+import { createCorsMiddleware, createRateLimiter, securityHeaders } from './security.js';
 
 await initializeDatabase();
 
@@ -49,21 +53,12 @@ const clientDist = path.resolve(__dirname, '../../client/dist');
 const COOKIE_NAME = 'nebula_session';
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
 const secureCookies = process.env.NODE_ENV === 'production' || process.env.COOKIE_SECURE === 'true';
+const authRateLimit = createRateLimiter();
 
+app.set('trust proxy', 1);
+app.use(securityHeaders);
+app.use(createCorsMiddleware());
 app.use(express.json({ limit: '1mb' }));
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  res.setHeader('Access-Control-Allow-Origin', origin || '*');
-  res.setHeader('Vary', 'Origin');
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  if (req.method === 'OPTIONS') {
-    res.sendStatus(204);
-    return;
-  }
-  next();
-});
 
 app.use(
   asyncRoute(async (req, res, next) => {
@@ -88,6 +83,7 @@ app.get('/api/auth/me', (req, res) => {
 
 app.post(
   '/api/auth/register',
+  authRateLimit,
   asyncRoute(async (req, res) => {
     const user = await createUser(req.body.username, req.body.password);
     const session = await createSession(user.id);
@@ -98,6 +94,7 @@ app.post(
 
 app.post(
   '/api/auth/login',
+  authRateLimit,
   asyncRoute(async (req, res) => {
     const user = await verifyUserCredentials(req.body.username, req.body.password);
     if (!user) {
@@ -121,6 +118,34 @@ app.post(
 );
 
 app.use('/api', requireAuth);
+
+app.get(
+  '/api/user/preferences',
+  asyncRoute(async (req, res) => {
+    res.json(await getUserPreferences(req.user.id));
+  })
+);
+
+app.put(
+  '/api/user/preferences',
+  asyncRoute(async (req, res) => {
+    const preferences = normalizeUserPreferences(req.body?.preferences ?? req.body);
+    res.json(await setUserPreferences(req.user.id, preferences));
+  })
+);
+
+app.put(
+  '/api/auth/password',
+  authRateLimit,
+  asyncRoute(async (req, res) => {
+    const changed = await updateUserPassword(req.user.id, req.body?.currentPassword, req.body?.newPassword);
+    if (!changed) {
+      res.status(400).json({ message: '当前密码不正确' });
+      return;
+    }
+    res.json({ ok: true });
+  })
+);
 
 app.get(
   '/api/maps',
@@ -463,8 +488,13 @@ if (existsSync(clientDist)) {
 }
 
 app.use((error, req, res, next) => {
-  console.error(error);
-  res.status(400).json({ message: error.message ?? '服务器错误' });
+  const status = statusForError(error);
+  if (status >= 500) {
+    console.error(error);
+  } else {
+    console.warn(error.message ?? error);
+  }
+  res.status(status).json({ message: status >= 500 ? 'Server error' : error.message ?? 'Bad request' });
 });
 
 app.listen(port, () => {
@@ -506,6 +536,42 @@ async function getOwnedDomainCategory(categoryId, userId) {
     return null;
   }
   return category;
+}
+
+function normalizeUserPreferences(body) {
+  const source = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+  const highFrequencyMinimum = clampInteger(source.highFrequencyMinimum, 2, 99, 2);
+  const lowFrequencyMaximum = Math.min(
+    clampInteger(source.lowFrequencyMaximum, 1, 98, 1),
+    Math.max(1, highFrequencyMinimum - 1)
+  );
+  return {
+    rendererMode: source.rendererMode === 'webgpu' ? 'webgpu' : 'canvas',
+    layoutMode: source.layoutMode === 'domain' ? 'domain' : 'semantic',
+    timeFilter: ['week', 'month', 'quarter', 'custom'].includes(source.timeFilter) ? source.timeFilter : 'all',
+    frequencyFilter: source.frequencyFilter === 'high' || source.frequencyFilter === 'low' ? source.frequencyFilter : 'all',
+    highFrequencyMinimum,
+    lowFrequencyMaximum,
+    insightTopLimit: clampInteger(source.insightTopLimit, 3, 20, 8),
+    insightTrendLimit: clampInteger(source.insightTrendLimit, 3, 20, 5),
+    insightCooccurrenceLimit: clampInteger(source.insightCooccurrenceLimit, 3, 20, 8),
+    sortMode: ['frequency', 'lowFrequency', 'recent'].includes(source.sortMode) ? source.sortMode : 'layout',
+    customStartDate: normalizeIsoDate(source.customStartDate),
+    customEndDate: normalizeIsoDate(source.customEndDate)
+  };
+}
+
+function clampInteger(value, min, max, fallback) {
+  const next = Number(value);
+  if (!Number.isFinite(next)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, Math.round(next)));
+}
+
+function normalizeIsoDate(value) {
+  const clean = String(value ?? '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(clean) ? clean : '';
 }
 
 function normalizeLogPayload(body, { requireMapId }) {
@@ -560,4 +626,20 @@ function buildSessionCookie(value, maxAge) {
 
 function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
+function statusForError(error) {
+  if (Number.isInteger(error?.statusCode)) {
+    return error.statusCode;
+  }
+  if (error?.type === 'entity.parse.failed') {
+    return 400;
+  }
+  if (error?.code === '23505') {
+    return 409;
+  }
+  if (error?.code) {
+    return 500;
+  }
+  return 400;
 }

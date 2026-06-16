@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { computed } from 'vue';
 import { BarChart3, Lightbulb, Sparkles, TrendingDown, TrendingUp } from 'lucide-vue-next';
+import { useGraphStore } from '../stores/graph';
 import type { Insight } from '../types/domain';
 
-defineProps<{
+const props = defineProps<{
   insight: Insight | null;
   adviceLoading: boolean;
 }>();
@@ -10,6 +12,12 @@ defineProps<{
 const emit = defineEmits<{
   generateAdvice: [];
 }>();
+
+const graphStore = useGraphStore();
+const topTags = computed(() => props.insight?.topTags.slice(0, graphStore.insightTopLimit) ?? []);
+const risingTags = computed(() => props.insight?.risingTags.slice(0, graphStore.insightTrendLimit) ?? []);
+const fallingTags = computed(() => props.insight?.fallingTags.slice(0, graphStore.insightTrendLimit) ?? []);
+const cooccurrenceItems = computed(() => props.insight?.cooccurrence.slice(0, graphStore.insightCooccurrenceLimit) ?? []);
 </script>
 
 <template>
@@ -23,7 +31,7 @@ const emit = defineEmits<{
       <div class="mini-section">
         <h4><TrendingUp :size="15" /> 高频标签</h4>
         <div class="tag-meter-list">
-          <div v-for="tag in insight.topTags" :key="tag.id" class="tag-meter">
+          <div v-for="tag in topTags" :key="tag.id" class="tag-meter">
             <span class="tag-dot" :style="{ backgroundColor: tag.color }"></span>
             <span>{{ tag.name }}</span>
             <strong>{{ tag.count }}</strong>
@@ -35,14 +43,14 @@ const emit = defineEmits<{
         <div>
           <h4><TrendingUp :size="15" /> 上升</h4>
           <p v-if="!insight.risingTags.length" class="muted">暂无明显上升。</p>
-          <p v-for="tag in insight.risingTags" :key="tag.id" class="trend-line">
+          <p v-for="tag in risingTags" :key="tag.id" class="trend-line">
             {{ tag.name }} <strong>+{{ tag.delta }}</strong>
           </p>
         </div>
         <div>
           <h4><TrendingDown :size="15" /> 下降</h4>
           <p v-if="!insight.fallingTags.length" class="muted">暂无明显下降。</p>
-          <p v-for="tag in insight.fallingTags" :key="tag.id" class="trend-line">
+          <p v-for="tag in fallingTags" :key="tag.id" class="trend-line">
             {{ tag.name }} <strong>{{ tag.delta }}</strong>
           </p>
         </div>
@@ -51,7 +59,7 @@ const emit = defineEmits<{
       <div class="mini-section">
         <h4>常见共现</h4>
         <p v-if="!insight.cooccurrence.length" class="muted">日志积累后会出现标签关联。</p>
-        <div v-for="pair in insight.cooccurrence" :key="`${pair.tagA}-${pair.tagB}`" class="pair-row">
+        <div v-for="pair in cooccurrenceItems" :key="`${pair.tagA}-${pair.tagB}`" class="pair-row">
           <span>{{ pair.tagA }}</span>
           <i></i>
           <span>{{ pair.tagB }}</span>

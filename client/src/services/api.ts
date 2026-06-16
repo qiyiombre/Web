@@ -10,7 +10,8 @@ import type {
   TagSearchResponse,
   TagSuggestion,
   TagSuggestionResponse,
-  UserAccount
+  UserAccount,
+  UserPreferences
 } from '../types/domain';
 
 const API_BASE = '/api';
@@ -54,6 +55,24 @@ export function register(username: string, password: string) {
 export function logout() {
   return request<{ ok: true }>('/auth/logout', {
     method: 'POST'
+  });
+}
+
+export function changePassword(currentPassword: string, newPassword: string) {
+  return request<{ ok: true }>('/auth/password', {
+    method: 'PUT',
+    body: JSON.stringify({ currentPassword, newPassword })
+  });
+}
+
+export function getUserPreferences() {
+  return request<{ preferences: Partial<UserPreferences> | null; updatedAt: string | null }>('/user/preferences');
+}
+
+export function updateUserPreferences(preferences: UserPreferences) {
+  return request<{ preferences: UserPreferences; updatedAt: string }>('/user/preferences', {
+    method: 'PUT',
+    body: JSON.stringify({ preferences })
   });
 }
 

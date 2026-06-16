@@ -53,6 +53,21 @@ export interface TagSimilarity {
 
 export type LayoutMode = 'semantic' | 'domain';
 
+export interface UserPreferences {
+  rendererMode: 'canvas' | 'webgpu';
+  layoutMode: LayoutMode;
+  timeFilter: 'all' | 'week' | 'month' | 'quarter' | 'custom';
+  frequencyFilter: 'all' | 'high' | 'low';
+  highFrequencyMinimum: number;
+  lowFrequencyMaximum: number;
+  insightTopLimit: number;
+  insightTrendLimit: number;
+  insightCooccurrenceLimit: number;
+  sortMode: 'layout' | 'frequency' | 'lowFrequency' | 'recent';
+  customStartDate: string;
+  customEndDate: string;
+}
+
 export interface TagGroup {
   id: string;
   name: string;

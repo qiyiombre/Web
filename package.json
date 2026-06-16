@@ -14,7 +14,10 @@
     "dev:client": "npm --prefix client run dev",
     "dev:server": "npm --prefix server run dev",
     "build": "npm --prefix client run build",
+    "check": "npm --prefix client run build && npm --prefix server test && node --check server/src/index.js",
+    "migrate": "node scripts/apply-migrations.mjs",
     "start": "npm --prefix server start",
-    "seed:demo": "node scripts/seed-demo-logs.mjs"
+    "seed:demo": "node scripts/seed-demo-logs.mjs",
+    "test": "npm --prefix server test"
   }
 }
