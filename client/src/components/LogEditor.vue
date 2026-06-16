@@ -174,8 +174,8 @@ function save() {
 </script>
 
 <template>
-  <section class="panel editor-panel">
-    <div class="panel-title">
+  <section class="panel editor-panel log-editor-panel">
+    <div class="panel-title log-editor-title">
       <span>{{ isEditing ? '编辑日志' : '新建日志' }}</span>
       <button class="icon-button" title="关闭编辑器" @click="emit('cancel')">
         <X :size="16" />
