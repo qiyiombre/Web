@@ -68,6 +68,41 @@ export interface UserPreferences {
   customEndDate: string;
 }
 
+export type AssistantAction =
+  | 'none'
+  | 'create_log'
+  | 'search_logs'
+  | 'open_map'
+  | 'open_logs'
+  | 'open_insights'
+  | 'open_settings'
+  | 'open_home'
+  | 'show_stats'
+  | 'summarize_map';
+
+export interface AssistantStats {
+  mapName: string;
+  logCount: number;
+  tagCount: number;
+  topTags: Array<{ name: string; count: number }>;
+  recentLogTitles: string[];
+}
+
+export interface AssistantIntent {
+  reply: string;
+  action: AssistantAction;
+  confidence: number;
+  requiresConfirmation: boolean;
+  payload: {
+    mapId?: number | null;
+    title?: string;
+    content?: string;
+    tagNames?: string[];
+    query?: string;
+    stats?: AssistantStats;
+  };
+}
+
 export interface TagGroup {
   id: string;
   name: string;

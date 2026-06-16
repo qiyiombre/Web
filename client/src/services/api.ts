@@ -1,5 +1,6 @@
 import type {
   AdviceResponse,
+  AssistantIntent,
   DomainCategory,
   DraftLog,
   GraphData,
@@ -74,6 +75,31 @@ export function updateUserPreferences(preferences: UserPreferences) {
     method: 'PUT',
     body: JSON.stringify({ preferences })
   });
+}
+
+export function resolveAssistantIntent(payload: { message: string; currentMapId?: number | null }) {
+  return request<AssistantIntent>('/assistant', {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function transcribeAssistantAudio(audio: Blob) {
+  const response = await fetch(`${API_BASE}/assistant/transcribe`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': audio.type || 'application/octet-stream'
+    },
+    body: audio
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ message: '语音转文字失败' }));
+    throw new Error(error.message ?? '语音转文字失败');
+  }
+
+  return response.json() as Promise<{ text: string }>;
 }
 
 export function listMaps() {

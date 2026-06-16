@@ -5,6 +5,7 @@ import { useAuthStore } from './stores/auth';
 import { useGraphStore } from './stores/graph';
 import { useUiStore } from './stores/ui';
 import AuthPanel from './components/AuthPanel.vue';
+import AssistantPanel from './components/AssistantPanel.vue';
 import NavBar from './components/layout/NavBar.vue';
 import type { UserAccount } from './types/domain';
 
@@ -85,6 +86,7 @@ async function confirmGlobalAction() {
     <main class="app-main">
       <router-view />
     </main>
+    <AssistantPanel />
   </div>
 
   <div v-else class="app-splash">
