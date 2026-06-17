@@ -1274,11 +1274,21 @@ small {
   border: 0;
   border-radius: 999px;
   padding: 3px 8px;
-  color: rgba(232, 243, 255, 0.88);
-  background: rgba(4, 12, 22, 0.18);
-  text-shadow: 0 0 10px var(--label-color);
+  color: rgba(238, 247, 255, 0.94);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--label-color) 12%, transparent), rgba(4, 12, 22, 0.34)),
+    rgba(4, 12, 22, 0.28);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--label-color) 20%, transparent),
+    0 0 12px color-mix(in srgb, var(--label-color) 16%, transparent);
+  text-shadow:
+    0 0 8px rgba(255, 255, 255, 0.34),
+    0 0 14px var(--label-color);
   font-size: 13px;
   font-weight: 650;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   pointer-events: auto;
   white-space: nowrap;
   z-index: 2;
@@ -1304,6 +1314,63 @@ small {
   z-index: 6;
 }
 
+.webgpu-label.priority {
+  color: #f7fbff;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--label-color) 18%, transparent), rgba(4, 12, 22, 0.42)),
+    rgba(4, 12, 22, 0.28);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--label-color) 46%, transparent),
+    0 0 14px color-mix(in srgb, var(--label-color) 28%, transparent),
+    0 0 30px color-mix(in srgb, var(--label-color) 18%, transparent);
+  text-shadow:
+    0 0 8px rgba(255, 255, 255, 0.55),
+    0 0 18px var(--label-color);
+  z-index: 5;
+}
+
+.webgpu-label.priority:not(.active) {
+  transform: translate(-50%, -50%) scale(1.05);
+}
+
+.webgpu-label.priorityTop:not(.active) {
+  transform: translate(-50%, -50%) scale(1.1);
+}
+
+.webgpu-label.domainFocus {
+  color: #ffffff;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--label-color) 26%, transparent), rgba(4, 12, 22, 0.54)),
+    rgba(4, 12, 22, 0.36);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--label-color) 58%, transparent),
+    0 0 18px color-mix(in srgb, var(--label-color) 34%, transparent);
+  z-index: 6;
+}
+
+.webgpu-priority-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  color: #061421;
+  background: color-mix(in srgb, var(--label-color) 78%, #ffffff 22%);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.42),
+    0 0 12px color-mix(in srgb, var(--label-color) 44%, transparent);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.webgpu-label-name {
+  overflow: hidden;
+  max-width: 118px;
+  text-overflow: ellipsis;
+}
+
 .webgpu-label.up {
   color: #ffe8d4;
   text-shadow:
@@ -1319,7 +1386,7 @@ small {
 }
 
 .webgpu-label.heatFlat {
-  color: rgba(232, 243, 255, 0.62);
+  color: rgba(232, 243, 255, var(--heat-flat-alpha, 0.62));
   background: rgba(4, 12, 22, 0.12);
   text-shadow:
     0 0 6px rgba(255, 255, 255, 0.24),

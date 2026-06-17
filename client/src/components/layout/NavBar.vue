@@ -10,14 +10,22 @@ import {
   LogOut
 } from 'lucide-vue-next';
 import { useAuthStore } from '../../stores/auth';
+import { useMapsStore } from '../../stores/maps';
 import { useUiStore } from '../../stores/ui';
 
 const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
+const mapsStore = useMapsStore();
 const ui = useUiStore();
 
-const mapId = computed(() => route.params.id as string | undefined);
+const currentMapId = computed(() => {
+  const routeMapId = Number(route.params.id);
+  if (Number.isFinite(routeMapId) && routeMapId > 0) return routeMapId;
+  if (mapsStore.activeMapId) return mapsStore.activeMapId;
+  const storedMapId = Number(localStorage.getItem('nebula.lastActiveMapId'));
+  return Number.isFinite(storedMapId) && storedMapId > 0 ? storedMapId : null;
+});
 const userInitials = computed(() => {
   const username = auth.currentUser?.username.trim() ?? '';
   if (!username) return '--';
@@ -32,11 +40,11 @@ const navItems = computed(() => {
   const items = [
     { to: '/', label: '首页', icon: Home },
   ];
-  if (mapId.value) {
+  if (currentMapId.value) {
     items.push(
-      { to: `/maps/${mapId.value}`, label: '星图', icon: Orbit },
-      { to: `/maps/${mapId.value}/logs`, label: '日志', icon: FileText },
-      { to: `/maps/${mapId.value}/insights`, label: '洞察', icon: Sparkles },
+      { to: `/maps/${currentMapId.value}`, label: '星图', icon: Orbit },
+      { to: `/maps/${currentMapId.value}/logs`, label: '日志', icon: FileText },
+      { to: `/maps/${currentMapId.value}/insights`, label: '洞察', icon: Sparkles },
     );
   }
   items.push({ to: '/settings', label: '设置', icon: Settings });

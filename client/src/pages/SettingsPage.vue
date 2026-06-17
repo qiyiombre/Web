@@ -7,6 +7,7 @@ import {
   ChevronLeft,
   Cpu,
   FileText,
+  Flame,
   Globe,
   Gauge,
   KeyRound,
@@ -174,6 +175,12 @@ function resetDisplayPreferences() {
   graphStore.setInsightTopLimit(8);
   graphStore.setInsightTrendLimit(5);
   graphStore.setInsightCooccurrenceLimit(8);
+  graphStore.setNebulaPriorityDisplayLimit(8);
+  graphStore.setNebulaHeatWindowDays(7);
+  graphStore.setNebulaHeatMinimumDelta(1);
+  graphStore.setNebulaHeatMediumDelta(2);
+  graphStore.setNebulaHeatStrongDelta(4);
+  graphStore.setNebulaHeatFlatOpacity(28);
   graphStore.setSortMode('layout');
   graphStore.customStartDate = '';
   graphStore.customEndDate = '';
@@ -349,6 +356,72 @@ async function handleLogout() {
             </div>
             <div class="setting-row stacked">
               <div>
+                <strong><Flame :size="14" /> WebGPU 热力参数</strong>
+                <small>控制热力按钮的标签升温/降温判断，只影响 WebGPU 星云图</small>
+              </div>
+              <div class="insight-limit-grid">
+                <label class="threshold-field">
+                  <span>对比窗口</span>
+                  <input
+                    v-model.number="graphStore.nebulaHeatWindowDays"
+                    type="number"
+                    min="1"
+                    max="90"
+                    @change="graphStore.setNebulaHeatWindowDays(graphStore.nebulaHeatWindowDays)"
+                  />
+                  <span>天</span>
+                </label>
+                <label class="threshold-field">
+                  <span>最小变化</span>
+                  <input
+                    v-model.number="graphStore.nebulaHeatMinimumDelta"
+                    type="number"
+                    min="1"
+                    max="99"
+                    @change="graphStore.setNebulaHeatMinimumDelta(graphStore.nebulaHeatMinimumDelta)"
+                  />
+                  <span>次</span>
+                </label>
+                <label class="threshold-field">
+                  <span>中等变化</span>
+                  <input
+                    v-model.number="graphStore.nebulaHeatMediumDelta"
+                    type="number"
+                    :min="graphStore.nebulaHeatMinimumDelta"
+                    max="99"
+                    @change="graphStore.setNebulaHeatMediumDelta(graphStore.nebulaHeatMediumDelta)"
+                  />
+                  <span>次</span>
+                </label>
+                <label class="threshold-field">
+                  <span>强烈变化</span>
+                  <input
+                    v-model.number="graphStore.nebulaHeatStrongDelta"
+                    type="number"
+                    :min="graphStore.nebulaHeatMediumDelta"
+                    max="99"
+                    @change="graphStore.setNebulaHeatStrongDelta(graphStore.nebulaHeatStrongDelta)"
+                  />
+                  <span>次</span>
+                </label>
+                <label class="threshold-field">
+                  <span>无变化透明度</span>
+                  <input
+                    v-model.number="graphStore.nebulaHeatFlatOpacity"
+                    type="number"
+                    min="5"
+                    max="80"
+                    @change="graphStore.setNebulaHeatFlatOpacity(graphStore.nebulaHeatFlatOpacity)"
+                  />
+                  <span>%</span>
+                </label>
+              </div>
+              <p class="setting-hint">
+                例如窗口为 7 天时，会比较最近 7 天和上一个 7 天；差值小于“最小变化”会视为无变化。
+              </p>
+            </div>
+            <div class="setting-row stacked">
+              <div>
                 <strong><Sparkles :size="14" /> 洞察展示数量</strong>
                 <small>控制洞察页和星图抽屉里默认展示多少条分析结果</small>
               </div>
@@ -385,6 +458,17 @@ async function handleLogout() {
                     @change="graphStore.setInsightCooccurrenceLimit(graphStore.insightCooccurrenceLimit)"
                   />
                   <span>条</span>
+                </label>
+                <label class="threshold-field">
+                  <span>星云标记</span>
+                  <input
+                    v-model.number="graphStore.nebulaPriorityDisplayLimit"
+                    type="number"
+                    min="0"
+                    max="30"
+                    @change="graphStore.setNebulaPriorityDisplayLimit(graphStore.nebulaPriorityDisplayLimit)"
+                  />
+                  <span>个</span>
                 </label>
               </div>
             </div>

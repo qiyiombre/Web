@@ -37,6 +37,9 @@ const voiceStatus = ref('');
 const voiceDiagnosticsOpen = ref(false);
 const voiceLastError = ref('');
 const microphonePermission = ref('unknown');
+const voiceDraft = ref('');
+const voiceLevels = ref<number[]>(Array.from({ length: 28 }, () => 0.12));
+const voiceDurationMs = ref(0);
 const pendingIntent = ref<AssistantIntent | null>(null);
 const messages = ref<AssistantMessage[]>([]);
 const messageList = ref<HTMLElement | null>(null);
@@ -46,6 +49,12 @@ let mediaRecorder: MediaRecorder | null = null;
 let voiceStream: MediaStream | null = null;
 let voiceChunks: Blob[] = [];
 let voiceTimeoutId: number | null = null;
+let voiceStartedAt = 0;
+let voiceAnimationId: number | null = null;
+let voiceAudioContext: AudioContext | null = null;
+let voiceAnalyser: AnalyserNode | null = null;
+let voiceMeterSource: MediaStreamAudioSourceNode | null = null;
+let voiceMeterData: Uint8Array<ArrayBuffer> | null = null;
 
 const activeMapName = computed(() => mapsStore.graph?.map.name ?? mapsStore.maps.find(map => map.id === mapsStore.activeMapId)?.name ?? '当前星图');
 const voiceSecureContext = computed(() => {
@@ -60,6 +69,20 @@ const speechSupported = computed(() => {
   if (typeof window === 'undefined') return false;
   return typeof navigator.mediaDevices?.getUserMedia === 'function' && typeof window.MediaRecorder === 'function';
 });
+const hasVoiceCard = computed(() => listening.value || voiceUploading.value || Boolean(voiceDraft.value.trim()));
+const voiceDurationLabel = computed(() => formatDuration(voiceDurationMs.value));
+const voiceCardTitle = computed(() => {
+  if (listening.value) return '声纹采样中';
+  if (voiceUploading.value) return '正在识别语音';
+  if (voiceDraft.value.trim()) return '识别结果待发送';
+  return '语音输入';
+});
+const voiceCardMeta = computed(() => {
+  if (listening.value) return `${voiceDurationLabel.value} · 说完可识别，也可以取消`;
+  if (voiceUploading.value) return '正在转成文字，请稍候';
+  if (voiceDraft.value.trim()) return '确认后才会发送给助手';
+  return '';
+});
 const quickCommands = computed(() => [
   `总结${activeMapName.value}`,
   '打开当前星图日志',
@@ -69,7 +92,8 @@ const quickCommands = computed(() => [
 async function togglePanel() {
   open.value = !open.value;
   if (!open.value) {
-    stopListening();
+    stopListening(false);
+    clearVoiceDraft(false);
     return;
   }
   if (mapsStore.maps.length === 0) {
@@ -84,7 +108,8 @@ async function togglePanel() {
 function closePanel() {
   open.value = false;
   pendingIntent.value = null;
-  stopListening();
+  stopListening(false);
+  clearVoiceDraft(false);
 }
 
 async function sendMessage() {
@@ -250,6 +275,7 @@ async function toggleListening() {
   }
   if (voiceUploading.value) return;
   voiceLastError.value = '';
+  clearVoiceDraft(false);
   await updateMicrophonePermissionState();
   if (!speechSupported.value) {
     voiceLastError.value = 'unsupported';
@@ -267,6 +293,7 @@ async function toggleListening() {
         autoGainControl: true
       }
     });
+    startVoiceMeter(voiceStream);
     voiceChunks = [];
     mediaRecorder = new MediaRecorder(voiceStream, pickRecorderOptions());
     mediaRecorder.ondataavailable = (event) => {
@@ -284,12 +311,12 @@ async function toggleListening() {
     };
     mediaRecorder.start();
     listening.value = true;
-    voiceStatus.value = '正在录音，再点一次结束';
+    voiceStatus.value = '正在录音';
     voiceTimeoutId = window.setTimeout(() => {
       if (!listening.value) return;
       voiceStatus.value = '录音已达到上限，正在转文字...';
       stopListening(true);
-    }, 15000);
+    }, 30000);
   } catch (error: any) {
     listening.value = false;
     mediaRecorder = null;
@@ -304,6 +331,7 @@ function stopListening(shouldTranscribe = false) {
   clearVoiceTimeout();
   if (!mediaRecorder) {
     cleanupVoiceStream();
+    stopVoiceMeter(!shouldTranscribe);
     listening.value = false;
     if (!shouldTranscribe) voiceStatus.value = '';
     return;
@@ -331,6 +359,7 @@ async function finishVoiceRecording(shouldTranscribe: boolean) {
   voiceChunks = [];
   mediaRecorder = null;
   cleanupVoiceStream();
+  stopVoiceMeter(!shouldTranscribe);
   listening.value = false;
   if (!shouldTranscribe) {
     voiceStatus.value = '';
@@ -357,10 +386,9 @@ async function finishVoiceRecording(shouldTranscribe: boolean) {
       ui.showNotice('没有识别到文字，请重新录制');
       return;
     }
-    input.value = `${input.value}${input.value ? ' ' : ''}${transcript}`.trim();
-    voiceStatus.value = `已识别：${transcript}`;
+    voiceDraft.value = transcript;
+    voiceStatus.value = '语音已识别，确认后发送';
     await nextTick();
-    await sendMessage();
   } catch (error: any) {
     voiceLastError.value = 'transcribe-failed';
     voiceStatus.value = '';
@@ -370,9 +398,103 @@ async function finishVoiceRecording(shouldTranscribe: boolean) {
   }
 }
 
+function cancelVoiceRecording() {
+  voiceChunks = [];
+  stopListening(false);
+  clearVoiceDraft(false);
+  ui.showNotice('已取消录音');
+}
+
+async function sendVoiceDraft() {
+  const transcript = voiceDraft.value.trim();
+  if (!transcript || loading.value || voiceUploading.value) return;
+  const typed = input.value.trim();
+  input.value = typed ? `${typed} ${transcript}` : transcript;
+  clearVoiceDraft(false);
+  await nextTick();
+  await sendMessage();
+}
+
+function clearVoiceDraft(showNotice = true) {
+  voiceDraft.value = '';
+  voiceStatus.value = '';
+  voiceDurationMs.value = 0;
+  voiceLevels.value = Array.from({ length: 28 }, () => 0.12);
+  if (showNotice) {
+    ui.showNotice('已取消语音发送');
+  }
+}
+
 function cleanupVoiceStream() {
   voiceStream?.getTracks().forEach(track => track.stop());
   voiceStream = null;
+}
+
+function startVoiceMeter(stream: MediaStream) {
+  stopVoiceMeter(true);
+  const AudioContextCtor = (window as any).AudioContext || (window as any).webkitAudioContext;
+  if (!AudioContextCtor) return;
+
+  try {
+    const audioContext = new AudioContextCtor() as AudioContext;
+    voiceAudioContext = audioContext;
+    voiceAnalyser = audioContext.createAnalyser();
+    voiceAnalyser.fftSize = 512;
+    voiceAnalyser.smoothingTimeConstant = 0.76;
+    voiceMeterSource = audioContext.createMediaStreamSource(stream);
+    voiceMeterSource.connect(voiceAnalyser);
+    voiceMeterData = new Uint8Array(voiceAnalyser.frequencyBinCount);
+    voiceStartedAt = performance.now();
+    voiceDurationMs.value = 0;
+    updateVoiceMeter();
+  } catch {
+    stopVoiceMeter(true);
+  }
+}
+
+function updateVoiceMeter() {
+  if (!voiceAnalyser || !voiceMeterData) return;
+  voiceAnalyser.getByteFrequencyData(voiceMeterData);
+  const bucketCount = voiceLevels.value.length;
+  const bucketSize = Math.max(1, Math.floor(voiceMeterData.length / bucketCount));
+  const nextLevels = Array.from({ length: bucketCount }, (_, bucketIndex) => {
+    let total = 0;
+    const start = bucketIndex * bucketSize;
+    for (let i = 0; i < bucketSize; i++) {
+      total += voiceMeterData?.[start + i] ?? 0;
+    }
+    const normalized = total / bucketSize / 255;
+    return Math.max(0.08, Math.min(1, normalized * 2.6));
+  });
+  voiceLevels.value = nextLevels;
+  voiceDurationMs.value = performance.now() - voiceStartedAt;
+  voiceAnimationId = window.requestAnimationFrame(updateVoiceMeter);
+}
+
+function stopVoiceMeter(reset = false) {
+  if (voiceAnimationId !== null) {
+    window.cancelAnimationFrame(voiceAnimationId);
+    voiceAnimationId = null;
+  }
+  voiceMeterSource?.disconnect();
+  voiceAnalyser?.disconnect();
+  void voiceAudioContext?.close?.();
+  voiceMeterSource = null;
+  voiceAnalyser = null;
+  voiceAudioContext = null;
+  voiceMeterData = null;
+  voiceStartedAt = 0;
+  if (reset) {
+    voiceDurationMs.value = 0;
+    voiceLevels.value = Array.from({ length: 28 }, () => 0.12);
+  }
+}
+
+function formatDuration(milliseconds: number) {
+  const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 async function convertRecordingToWav(audio: Blob) {
@@ -569,11 +691,57 @@ onBeforeUnmount(() => {
           >
             <Mic :size="16" />
           </button>
-          <button class="send-action" type="button" :disabled="loading || voiceUploading || !input.trim()" @click="sendMessage">
+          <button class="send-action" type="button" :disabled="loading || listening || voiceUploading || !input.trim()" @click="sendMessage">
             <Send :size="15" />
           </button>
         </div>
-        <p v-if="voiceStatus" class="assistant-voice-status">{{ voiceStatus }}</p>
+        <div v-if="hasVoiceCard" class="assistant-voice-card" :class="{ recording: listening, pending: voiceDraft }">
+          <div class="assistant-voice-card-head">
+            <span class="voice-state-dot" />
+            <div>
+              <strong>{{ voiceCardTitle }}</strong>
+              <span>{{ voiceCardMeta }}</span>
+            </div>
+          </div>
+
+          <div class="assistant-voiceprint" aria-label="声纹波形">
+            <span
+              v-for="(level, index) in voiceLevels"
+              :key="index"
+              :style="{ height: `${Math.round(8 + level * 40)}px` }"
+            />
+          </div>
+
+          <p v-if="voiceDraft" class="assistant-voice-draft">{{ voiceDraft }}</p>
+
+          <div class="assistant-voice-actions">
+            <template v-if="listening">
+              <button type="button" class="ghost-action" @click="cancelVoiceRecording">
+                <Ban :size="14" />
+                取消录音
+              </button>
+              <button type="button" class="confirm-action" @click="stopListening(true)">
+                <Check :size="14" />
+                完成识别
+              </button>
+            </template>
+            <button v-else-if="voiceUploading" type="button" class="ghost-action" disabled>
+              <Loader2 :size="14" class="spin" />
+              识别中
+            </button>
+            <template v-else-if="voiceDraft">
+              <button type="button" class="ghost-action" :disabled="loading" @click="() => clearVoiceDraft()">
+                <Ban :size="14" />
+                取消发送
+              </button>
+              <button type="button" class="confirm-action" :disabled="loading" @click="sendVoiceDraft">
+                <Send :size="14" />
+                发送给助手
+              </button>
+            </template>
+          </div>
+        </div>
+        <p v-if="voiceStatus && !hasVoiceCard" class="assistant-voice-status">{{ voiceStatus }}</p>
         <div class="assistant-voice-diagnostics">
           <button type="button" @click="voiceDiagnosticsOpen = !voiceDiagnosticsOpen">
             {{ voiceDiagnosticsOpen ? '收起录音诊断' : '录音不能用？查看诊断' }}
@@ -890,6 +1058,107 @@ onBeforeUnmount(() => {
   gap: 6px;
 }
 
+.assistant-voice-card {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+  margin-top: -2px;
+  padding: 11px;
+  border: 1px solid rgba(98, 214, 255, 0.18);
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(98, 214, 255, 0.13), transparent 38%),
+    radial-gradient(circle at 88% 24%, rgba(247, 215, 116, 0.1), transparent 34%),
+    rgba(5, 12, 22, 0.56);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.assistant-voice-card.recording {
+  border-color: rgba(98, 214, 255, 0.3);
+  box-shadow: 0 0 24px rgba(98, 214, 255, 0.08), inset 0 0 0 1px rgba(255, 255, 255, 0.035);
+}
+
+.assistant-voice-card.pending {
+  border-color: rgba(247, 215, 116, 0.24);
+}
+
+.assistant-voice-card-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.assistant-voice-card-head strong,
+.assistant-voice-card-head span {
+  display: block;
+}
+
+.assistant-voice-card-head strong {
+  color: #eef6ff;
+  font-size: 12px;
+}
+
+.assistant-voice-card-head span {
+  margin-top: 2px;
+  color: rgba(238, 246, 255, 0.5);
+  font-size: 11px;
+}
+
+.voice-state-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: #62d6ff;
+  box-shadow: 0 0 16px rgba(98, 214, 255, 0.76);
+}
+
+.assistant-voice-card.recording .voice-state-dot {
+  animation: voiceDotPulse 1.1s ease-in-out infinite;
+}
+
+.assistant-voiceprint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 52px;
+  gap: 3px;
+  padding: 0 2px;
+  overflow: hidden;
+}
+
+.assistant-voiceprint span {
+  width: 5px;
+  min-height: 8px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #f7d774, #62d6ff 54%, #9cffc7);
+  opacity: 0.82;
+  box-shadow: 0 0 10px rgba(98, 214, 255, 0.18);
+  transition: height 0.08s ease-out, opacity 0.12s ease;
+}
+
+.assistant-voice-card:not(.recording) .assistant-voiceprint span {
+  opacity: 0.58;
+}
+
+.assistant-voice-draft {
+  max-height: 74px;
+  margin: 0;
+  overflow-y: auto;
+  padding: 8px 9px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.045);
+  color: rgba(238, 246, 255, 0.82);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.assistant-voice-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
 .assistant-voice-status {
   grid-column: 1 / -1;
   margin: -2px 2px 0;
@@ -972,6 +1241,19 @@ onBeforeUnmount(() => {
 @keyframes assistantSpin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes voiceDotPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.75;
+  }
+
+  50% {
+    transform: scale(1.45);
+    opacity: 1;
   }
 }
 

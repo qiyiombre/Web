@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import type { DomainCategory, GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
 
 type PickNode =
@@ -35,6 +35,10 @@ const props = defineProps<{
   layoutMode: LayoutMode;
   activeTagIds: Set<number>;
   selectedLogId: number | null;
+  focusPulseLogId?: number | null;
+  priorityTagIds?: number[];
+  priorityDisplayLimit?: number;
+  domainFocusTagIds?: Set<number>;
 }>();
 
 const emit = defineEmits<{
@@ -71,6 +75,7 @@ let lastPointer = { x: 0, y: 0 };
 let dragButton = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
+let pendingFocusLogId: number | null = null;
 let pendingFocusCategory: DomainCategory | null = null;
 let pendingFitAllTags = true;
 let dragSnapshot: LayoutSnapshot | null = null;
@@ -78,6 +83,7 @@ let lastPanInteractionAt = 0;
 const layoutHistory: LayoutSnapshot[] = [];
 const redoHistory: LayoutSnapshot[] = [];
 const MIN_VIEW_SCALE = 0.16;
+const priorityRankByTagId = computed(() => new Map((props.priorityTagIds ?? []).map((id, index) => [id, index])));
 
 const layoutWorker = new Worker(new URL('../workers/layoutWorker.ts', import.meta.url), { type: 'module' });
 layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
@@ -96,7 +102,12 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
   }
   layoutBusy.value = false;
 
-  if (pendingFocusTagId !== null) {
+  if (pendingFocusLogId !== null) {
+    const logId = pendingFocusLogId;
+    pendingFocusLogId = null;
+    pendingFitAllTags = false;
+    focusLog(logId);
+  } else if (pendingFocusTagId !== null) {
     const tagId = pendingFocusTagId;
     pendingFocusTagId = null;
     pendingFitAllTags = false;
@@ -149,7 +160,7 @@ watch(
 );
 
 watch(
-  () => [props.activeTagIds, props.selectedLogId],
+  () => [props.activeTagIds, props.selectedLogId, props.focusPulseLogId, props.priorityTagIds, props.priorityDisplayLimit, props.domainFocusTagIds],
   () => draw(),
   { deep: true }
 );
@@ -336,13 +347,47 @@ function drawBackground(width: number, height: number) {
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, width, height);
 
-  for (let i = 0; i < 120; i += 1) {
-    const x = (seeded(i + 11) * width + frame * 0.02 * (i % 3)) % width;
-    const y = seeded(i + 97) * height;
-    const alpha = 0.22 + seeded(i + 177) * 0.35;
-    ctx.fillStyle = `rgba(210, 235, 255, ${alpha})`;
-    ctx.fillRect(x, y, 1, 1);
+  const parallax = 0.42;
+  const bgScale = Math.max(0.28, Math.pow(transform.scale, 0.62));
+  const offsetX = (transform.x - width / 2) * parallax;
+  const offsetY = (transform.y - height / 2) * parallax;
+  const wrapWidth = width + 260;
+  const wrapHeight = height + 260;
+
+  const glowPoints = [
+    { seed: 31, radius: 210, color: 'rgba(98, 214, 255, 0.08)' },
+    { seed: 63, radius: 260, color: 'rgba(185, 156, 255, 0.06)' },
+    { seed: 97, radius: 180, color: 'rgba(247, 215, 116, 0.045)' }
+  ];
+
+  for (const glow of glowPoints) {
+    const baseX = (seeded(glow.seed) - 0.5) * width * 1.8;
+    const baseY = (seeded(glow.seed + 17) - 0.5) * height * 1.7;
+    const x = width / 2 + baseX * bgScale + offsetX;
+    const y = height / 2 + baseY * bgScale + offsetY;
+    const radius = glow.radius * bgScale;
+    const radial = ctx.createRadialGradient(x, y, 0, x, y, radius);
+    radial.addColorStop(0, glow.color);
+    radial.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = radial;
+    ctx.fillRect(0, 0, width, height);
   }
+
+  for (let i = 0; i < 150; i += 1) {
+    const baseX = (seeded(i + 11) - 0.5) * width * 2.2;
+    const baseY = (seeded(i + 97) - 0.5) * height * 2.2;
+    const drift = frame * 0.018 * (i % 3);
+    const x = wrapScreenPoint(width / 2 + baseX * bgScale + offsetX + drift, wrapWidth) - 130;
+    const y = wrapScreenPoint(height / 2 + baseY * bgScale + offsetY, wrapHeight) - 130;
+    const alpha = 0.18 + seeded(i + 177) * 0.36;
+    const size = Math.max(0.7, (0.8 + seeded(i + 233) * 1.3) * Math.min(1.35, bgScale));
+    ctx.fillStyle = `rgba(210, 235, 255, ${alpha})`;
+    ctx.fillRect(x, y, size, size);
+  }
+}
+
+function wrapScreenPoint(value: number, span: number) {
+  return ((value % span) + span) % span;
 }
 
 function drawRelationFlows(state: DrawState) {
@@ -405,6 +450,7 @@ function drawTags(state: DrawState) {
   if (!ctx) {
     return;
   }
+  const labelBoxes: Array<{ x: number; y: number; w: number; h: number; required: boolean }> = [];
   for (const tag of props.graph.tags) {
     const point = tagPositions.get(tag.id);
     if (!point) {
@@ -415,19 +461,43 @@ function drawTags(state: DrawState) {
     }
     const active = props.activeTagIds.has(tag.id);
     const relatedToSelected = state.selectedLogTagIds.has(tag.id);
+    const domainFocused = props.domainFocusTagIds?.has(tag.id) ?? false;
     const related = !state.activeRelationMode || active || relatedToSelected || state.relatedTagIds.has(tag.id);
-    const glow = active || relatedToSelected ? 16 : related ? 7 : 0;
+    const priorityRank = tagPriorityRank(tag.id);
+    const priorityActive = hasTagPriority() && shouldShowPriorityBadge(priorityRank);
+    const priorityLevel = priorityActive ? tagPriority(tag.id) : 0;
+    const glow = active || relatedToSelected ? 16 : domainFocused ? 14 : priorityActive ? 10 + priorityLevel * 8 : related ? 7 : 0;
     ctx.save();
     ctx.shadowColor = tag.color;
     ctx.shadowBlur = glow;
     ctx.beginPath();
     ctx.fillStyle = active || relatedToSelected ? tag.color : related ? `${tag.color}dd` : `${tag.color}55`;
-    const visualRadius = point.r * (active || relatedToSelected ? 1.12 : 1);
+    const visualRadius = point.r * (active || relatedToSelected ? 1.12 : 1) * (priorityActive ? 1 + priorityLevel * 0.16 : 1);
     ctx.arc(point.x, point.y, visualRadius, 0, Math.PI * 2);
     ctx.fill();
     ctx.lineWidth = active || relatedToSelected ? 3 / transform.scale : 1.4 / transform.scale;
     ctx.strokeStyle = active || relatedToSelected ? '#ffffff' : 'rgba(255, 255, 255, 0.55)';
     ctx.stroke();
+
+    if (priorityActive) {
+      const pulse = 0.5 + 0.5 * Math.sin(frame * 0.038 + tag.id);
+      ctx.beginPath();
+      ctx.shadowBlur = (8 + priorityLevel * 8) / transform.scale;
+      ctx.strokeStyle = hexToRgba(tag.color, 0.24 + priorityLevel * 0.16 + pulse * 0.08);
+      ctx.lineWidth = (1.5 + priorityLevel * 1.2) / transform.scale;
+      ctx.arc(point.x, point.y, visualRadius * (1.75 + priorityLevel * 0.22 + pulse * 0.1), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    if (domainFocused) {
+      const pulse = 0.5 + 0.5 * Math.sin(frame * 0.05 + tag.id);
+      ctx.beginPath();
+      ctx.shadowBlur = 10 / transform.scale;
+      ctx.strokeStyle = hexToRgba(tag.color, 0.34 + pulse * 0.16);
+      ctx.lineWidth = 2.4 / transform.scale;
+      ctx.arc(point.x, point.y, visualRadius * (2.05 + pulse * 0.18), 0, Math.PI * 2);
+      ctx.stroke();
+    }
 
     if (active || relatedToSelected) {
       const pulse = 0.5 + 0.5 * Math.sin(frame * 0.045 + tag.id);
@@ -440,11 +510,48 @@ function drawTags(state: DrawState) {
     }
     ctx.restore();
 
-    ctx.fillStyle = active || relatedToSelected ? '#ffffff' : related ? 'rgba(232, 243, 255, 0.86)' : 'rgba(232, 243, 255, 0.42)';
+    ctx.fillStyle = active || relatedToSelected || domainFocused ? '#ffffff' : related ? 'rgba(232, 243, 255, 0.86)' : 'rgba(232, 243, 255, 0.42)';
     ctx.font = `${Math.max(12, 14 / transform.scale)}px "Microsoft YaHei", sans-serif`;
     ctx.textAlign = 'center';
-    ctx.fillText(tag.name, point.x, point.y + visualRadius + 18 / transform.scale);
+    const labelY = point.y + visualRadius + 18 / transform.scale;
+    if (shouldDrawTagLabel(tag.name, point.x, labelY, active || relatedToSelected || domainFocused || shouldShowPriorityBadge(priorityRank))) {
+      ctx.fillText(tag.name, point.x, labelY);
+    }
+    if (priorityRank !== null && priorityActive && shouldShowPriorityBadge(priorityRank, active || relatedToSelected || domainFocused)) {
+      const badgeText = `#${priorityRank + 1}`;
+      const badgeX = point.x + visualRadius * 0.72;
+      const badgeY = point.y - visualRadius * 0.72;
+      const badgeR = Math.max(8, 10 / transform.scale);
+      ctx.save();
+      ctx.shadowColor = tag.color;
+      ctx.shadowBlur = 8 / transform.scale;
+      ctx.fillStyle = 'rgba(3, 12, 22, 0.82)';
+      ctx.strokeStyle = hexToRgba(tag.color, 0.72);
+      ctx.lineWidth = 1.2 / transform.scale;
+      ctx.beginPath();
+      ctx.arc(badgeX, badgeY, badgeR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#eef6ff';
+      ctx.font = `${Math.max(9, 10 / transform.scale)}px "Microsoft YaHei", sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(badgeText, badgeX, badgeY);
+      ctx.restore();
+    }
     pickNodes.push({ kind: 'tag', id: tag.id, x: point.x, y: point.y, r: visualRadius + 10 });
+  }
+
+  function shouldDrawTagLabel(name: string, x: number, y: number, required: boolean) {
+    const width = Math.max(42, name.length * Math.max(10, 12 / transform.scale));
+    const height = Math.max(18, 18 / transform.scale);
+    const box = { x: x - width / 2, y: y - height + 4 / transform.scale, w: width, h: height, required };
+    const overlapped = labelBoxes.some((item) => boxesOverlap(box, item));
+    if (overlapped && !required && hasTagPriority()) {
+      return false;
+    }
+    labelBoxes.push(box);
+    return true;
   }
 }
 
@@ -461,23 +568,33 @@ function drawLogs(state: DrawState) {
       continue;
     }
     const selected = props.selectedLogId === log.id;
+    const pulsing = props.focusPulseLogId === log.id;
     const highlighted = state.highlightedLogIds.has(log.id);
     const muted = props.activeTagIds.size === 0 && state.activeRelationMode && !selected && !highlighted;
     ctx.save();
-    ctx.shadowColor = selected ? '#ffffff' : highlighted ? '#9ee7ff' : 'transparent';
-    ctx.shadowBlur = selected ? 8 : highlighted ? 4 : 0;
+    ctx.shadowColor = selected || pulsing ? '#ffffff' : highlighted ? '#9ee7ff' : 'transparent';
+    ctx.shadowBlur = selected ? 8 : pulsing ? 13 : highlighted ? 4 : 0;
     ctx.beginPath();
-    ctx.fillStyle = selected ? '#ffffff' : highlighted ? '#9ee7ff' : muted ? 'rgba(151, 165, 182, 0.16)' : 'rgba(151, 165, 182, 0.38)';
-    const logRadius = selected ? 6.4 : highlighted ? 5.6 : point.r;
+    ctx.fillStyle = selected || pulsing ? '#ffffff' : highlighted ? '#9ee7ff' : muted ? 'rgba(151, 165, 182, 0.16)' : 'rgba(151, 165, 182, 0.38)';
+    const pulse = pulsing ? 0.5 + 0.5 * Math.sin(frame * 0.12) : 0;
+    const logRadius = selected ? 6.4 : pulsing ? 6.2 + pulse * 1.8 : highlighted ? 5.6 : point.r;
     ctx.moveTo(point.x, point.y - logRadius);
     ctx.lineTo(point.x + logRadius, point.y);
     ctx.lineTo(point.x, point.y + logRadius);
     ctx.lineTo(point.x - logRadius, point.y);
     ctx.closePath();
     ctx.fill();
-    ctx.lineWidth = selected ? 2 / transform.scale : 1 / transform.scale;
-    ctx.strokeStyle = selected ? '#55d6ff' : 'rgba(255,255,255,0.28)';
+    ctx.lineWidth = selected || pulsing ? 2 / transform.scale : 1 / transform.scale;
+    ctx.strokeStyle = selected || pulsing ? '#55d6ff' : 'rgba(255,255,255,0.28)';
     ctx.stroke();
+    if (pulsing) {
+      ctx.beginPath();
+      ctx.shadowBlur = 10 / transform.scale;
+      ctx.strokeStyle = 'rgba(98, 214, 255, 0.58)';
+      ctx.lineWidth = 1.4 / transform.scale;
+      ctx.arc(point.x, point.y, logRadius * (2.1 + pulse * 0.35), 0, Math.PI * 2);
+      ctx.stroke();
+    }
     ctx.restore();
     pickNodes.push({ kind: 'log', id: log.id, x: point.x, y: point.y, r: 12 });
   }
@@ -761,13 +878,16 @@ function focusTag(tagId: number) {
 
 function focusLog(logId: number) {
   if (!canvas.value) {
+    pendingFocusLogId = logId;
     return null;
   }
   const point = logPositions.get(logId);
   if (!point) {
+    pendingFocusLogId = logId;
     requestLayout();
     return null;
   }
+  pendingFocusLogId = null;
   const rect = canvas.value.getBoundingClientRect();
   transform.scale = Math.max(transform.scale, 1.12);
   transform.x = rect.width / 2 - point.x * transform.scale;
@@ -904,6 +1024,32 @@ function resolveCategoryTagIds(category: DomainCategory) {
 
 function normalizeText(value: string) {
   return String(value ?? '').trim().toLowerCase();
+}
+
+function hasTagPriority() {
+  return (props.priorityTagIds?.length ?? 0) > 1;
+}
+
+function tagPriorityRank(tagId: number) {
+  return priorityRankByTagId.value.get(tagId) ?? null;
+}
+
+function tagPriority(tagId: number) {
+  const total = props.priorityTagIds?.length ?? 0;
+  if (total <= 1) return 0.5;
+  const rank = tagPriorityRank(tagId);
+  if (rank === null) return 0;
+  return 1 - rank / Math.max(1, total - 1);
+}
+
+function shouldShowPriorityBadge(rank: number | null, force = false) {
+  if (rank === null) return false;
+  const limit = Math.max(0, Math.round(props.priorityDisplayLimit ?? 8));
+  return force || rank < limit;
+}
+
+function boxesOverlap(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
 function pickNodeAt(screenX: number, screenY: number) {

@@ -109,6 +109,12 @@ export const useAuthStore = defineStore('auth', () => {
       insightTopLimit: graphStore.insightTopLimit,
       insightTrendLimit: graphStore.insightTrendLimit,
       insightCooccurrenceLimit: graphStore.insightCooccurrenceLimit,
+      nebulaPriorityDisplayLimit: graphStore.nebulaPriorityDisplayLimit,
+      nebulaHeatWindowDays: graphStore.nebulaHeatWindowDays,
+      nebulaHeatMinimumDelta: graphStore.nebulaHeatMinimumDelta,
+      nebulaHeatMediumDelta: graphStore.nebulaHeatMediumDelta,
+      nebulaHeatStrongDelta: graphStore.nebulaHeatStrongDelta,
+      nebulaHeatFlatOpacity: graphStore.nebulaHeatFlatOpacity,
       sortMode: graphStore.sortMode,
       customStartDate: graphStore.customStartDate,
       customEndDate: graphStore.customEndDate
@@ -143,6 +149,24 @@ export const useAuthStore = defineStore('auth', () => {
       }
       if (typeof preferences?.insightCooccurrenceLimit === 'number') {
         graphStore.setInsightCooccurrenceLimit(preferences.insightCooccurrenceLimit);
+      }
+      if (typeof preferences?.nebulaPriorityDisplayLimit === 'number') {
+        graphStore.setNebulaPriorityDisplayLimit(preferences.nebulaPriorityDisplayLimit);
+      }
+      if (typeof preferences?.nebulaHeatWindowDays === 'number') {
+        graphStore.setNebulaHeatWindowDays(preferences.nebulaHeatWindowDays);
+      }
+      if (typeof preferences?.nebulaHeatMinimumDelta === 'number') {
+        graphStore.setNebulaHeatMinimumDelta(preferences.nebulaHeatMinimumDelta);
+      }
+      if (typeof preferences?.nebulaHeatMediumDelta === 'number') {
+        graphStore.setNebulaHeatMediumDelta(preferences.nebulaHeatMediumDelta);
+      }
+      if (typeof preferences?.nebulaHeatStrongDelta === 'number') {
+        graphStore.setNebulaHeatStrongDelta(preferences.nebulaHeatStrongDelta);
+      }
+      if (typeof preferences?.nebulaHeatFlatOpacity === 'number') {
+        graphStore.setNebulaHeatFlatOpacity(preferences.nebulaHeatFlatOpacity);
       }
       if (preferences?.sortMode) graphStore.setSortMode(preferences.sortMode);
       if (preferences?.customStartDate !== undefined) {

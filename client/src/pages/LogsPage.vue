@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
   ChevronLeft,
@@ -10,7 +10,9 @@ import {
   Download,
   Search,
   X,
-  Plus
+  Plus,
+  Map as MapIcon,
+  Sparkles
 } from 'lucide-vue-next';
 import { useMapsStore } from '../stores/maps';
 import { useGraphStore } from '../stores/graph';
@@ -37,6 +39,14 @@ const READER_FONT_SIZE_MIN = 13;
 const READER_FONT_SIZE_MAX = 22;
 const READER_FONT_SIZE_DEFAULT = 15;
 const readerFontSize = ref(readReaderFontSize());
+const LOG_LIST_PANE_WIDTH_KEY = 'nebula.logsListPaneWidth';
+const LOG_LIST_PANE_WIDTH_MIN = 300;
+const LOG_LIST_PANE_WIDTH_FALLBACK_MAX = 960;
+const LOG_DETAIL_MIN_WIDTH = 360;
+const LOG_LIST_PANE_WIDTH_DEFAULT = 420;
+const logsLayoutRef = ref<HTMLElement | null>(null);
+const listPaneWidth = ref(readLogListPaneWidth());
+const isResizingLayout = ref(false);
 
 onMounted(async () => {
   await mapsStore.fetchMaps();
@@ -58,7 +68,7 @@ watch(mapId, async (id) => {
 });
 
 watch(
-  () => [route.query.edit, route.query.new],
+  () => [route.query.edit, route.query.new, route.query.selected],
   () => openFromRouteQuery()
 );
 
@@ -80,9 +90,18 @@ const logs = computed(() => {
   return [...list].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 });
 
-const selectedLog = computed(() => logs.value.find(log => log.id === selectedLogId.value) ?? null);
+const selectedLog = computed(() => (
+  logs.value.find(log => log.id === selectedLogId.value) ??
+  mapsStore.graph?.logs.find(log => log.id === selectedLogId.value) ??
+  null
+));
+const allLogCount = computed(() => mapsStore.graph?.logs.length ?? 0);
+const tagCount = computed(() => mapsStore.graph?.tags.length ?? 0);
 const readerFontStyle = computed(() => ({
   fontSize: `${readerFontSize.value}px`
+}));
+const logsLayoutStyle = computed(() => ({
+  gridTemplateColumns: `${listPaneWidth.value}px 10px minmax(${LOG_DETAIL_MIN_WIDTH}px, 1fr)`
 }));
 
 function formatDate(iso: string) {
@@ -109,6 +128,51 @@ function resetReaderFontSize() {
   setReaderFontSize(READER_FONT_SIZE_DEFAULT);
 }
 
+function readLogListPaneWidth() {
+  const value = Number(localStorage.getItem(LOG_LIST_PANE_WIDTH_KEY));
+  if (!Number.isFinite(value)) return LOG_LIST_PANE_WIDTH_DEFAULT;
+  return Math.min(LOG_LIST_PANE_WIDTH_FALLBACK_MAX, Math.max(LOG_LIST_PANE_WIDTH_MIN, value));
+}
+
+function clampLogListPaneWidth(value: number) {
+  const layout = logsLayoutRef.value;
+  const max = layout
+    ? Math.max(LOG_LIST_PANE_WIDTH_MIN, layout.clientWidth - LOG_DETAIL_MIN_WIDTH - 10)
+    : LOG_LIST_PANE_WIDTH_FALLBACK_MAX;
+  return Math.round(Math.min(max, Math.max(LOG_LIST_PANE_WIDTH_MIN, value)));
+}
+
+function setLogListPaneWidth(value: number) {
+  const next = clampLogListPaneWidth(value);
+  listPaneWidth.value = next;
+  localStorage.setItem(LOG_LIST_PANE_WIDTH_KEY, String(next));
+}
+
+function startLayoutResize(event: PointerEvent) {
+  isResizingLayout.value = true;
+  if (event.currentTarget instanceof HTMLElement) {
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+  updateLayoutResize(event);
+}
+
+function updateLayoutResize(event: PointerEvent) {
+  if (!isResizingLayout.value || !logsLayoutRef.value) return;
+  const rect = logsLayoutRef.value.getBoundingClientRect();
+  setLogListPaneWidth(event.clientX - rect.left);
+}
+
+function stopLayoutResize(event: PointerEvent) {
+  isResizingLayout.value = false;
+  if (event.currentTarget instanceof HTMLElement && event.currentTarget.hasPointerCapture(event.pointerId)) {
+    event.currentTarget.releasePointerCapture(event.pointerId);
+  }
+}
+
+function resetLayoutResize() {
+  setLogListPaneWidth(LOG_LIST_PANE_WIDTH_DEFAULT);
+}
+
 function startNew() {
   editingLog.value = null;
   selectedLogId.value = null;
@@ -132,6 +196,22 @@ function selectLog(log: LogEntry) {
   editingLog.value = null;
 }
 
+function inspectLog(log: LogEntry) {
+  selectedLogId.value = log.id;
+  showEditor.value = false;
+  editingLog.value = null;
+}
+
+function locateLogInNebula(logId: number) {
+  router.push({
+    path: `/maps/${mapId.value}`,
+    query: {
+      drawer: 'logs',
+      focusLog: String(logId)
+    }
+  });
+}
+
 function switchMap(nextId: number) {
   if (!Number.isFinite(nextId) || nextId === mapId.value) return;
   router.push(`/maps/${nextId}/logs`);
@@ -145,9 +225,20 @@ function openFromRouteQuery() {
   }
   const rawEditId = Array.isArray(route.query.edit) ? route.query.edit[0] : route.query.edit;
   const editId = rawEditId ? Number(rawEditId) : NaN;
-  if (!Number.isFinite(editId)) return;
-  const log = mapsStore.graph?.logs.find(item => item.id === editId);
-  if (log) startEdit(log);
+  if (Number.isFinite(editId)) {
+    const log = mapsStore.graph?.logs.find(item => item.id === editId);
+    if (log) startEdit(log);
+    return;
+  }
+  const rawSelectedId = Array.isArray(route.query.selected) ? route.query.selected[0] : route.query.selected;
+  const selectedId = rawSelectedId ? Number(rawSelectedId) : NaN;
+  if (!Number.isFinite(selectedId)) return;
+  const log = mapsStore.graph?.logs.find(item => item.id === selectedId);
+  if (!log) return;
+  selectedLogId.value = log.id;
+  showEditor.value = false;
+  editingLog.value = null;
+  scrollSelectedLogIntoView(log.id);
 }
 
 function syncSearchFromRoute() {
@@ -155,6 +246,12 @@ function syncSearchFromRoute() {
   if (typeof rawQuery === 'string' && rawQuery.trim()) {
     searchQuery.value = rawQuery.trim();
   }
+}
+
+async function scrollSelectedLogIntoView(logId: number) {
+  await nextTick();
+  const item = document.querySelector<HTMLElement>(`[data-log-id="${logId}"]`);
+  item?.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
 async function handleSave(payload: { title: string; content: string; tagNames: string[] }) {
@@ -259,7 +356,12 @@ function setNotice(msg: string) {
     <div v-if="notice" class="notice-toast">{{ notice }}</div>
 
     <!-- Log + Editor layout -->
-    <div class="logs-layout">
+    <div
+      ref="logsLayoutRef"
+      class="logs-layout"
+      :class="{ resizing: isResizingLayout }"
+      :style="logsLayoutStyle"
+    >
       <div class="logs-list-col">
         <div class="logs-list-head">
           <div>
@@ -272,6 +374,22 @@ function setNotice(msg: string) {
           </button>
         </div>
 
+        <section class="map-context-card">
+          <div class="map-context-copy">
+            <span>当前星图</span>
+            <strong>{{ mapsStore.graph?.map.name ?? '星图' }}</strong>
+            <small>{{ allLogCount }} 篇日志 · {{ tagCount }} 个标签</small>
+          </div>
+          <div class="map-context-actions">
+            <button type="button" title="打开星云图" @click="router.push(`/maps/${mapId}`)">
+              <MapIcon :size="14" />
+            </button>
+            <button type="button" title="查看洞察" @click="router.push(`/maps/${mapId}/insights`)">
+              <Sparkles :size="14" />
+            </button>
+          </div>
+        </section>
+
         <div v-if="logs.length === 0" class="empty-logs">
           <FilePlus2 :size="36" class="empty-icon" />
           <p v-if="searchQuery">没有找到匹配的日志</p>
@@ -282,9 +400,11 @@ function setNotice(msg: string) {
           <article
             v-for="log in logs"
             :key="log.id"
+            :data-log-id="log.id"
             class="log-card"
             :class="{ selected: selectedLogId === log.id }"
             @click="selectLog(log)"
+            @contextmenu.prevent="inspectLog(log)"
           >
             <div class="log-card-tags">
               <span
@@ -309,6 +429,19 @@ function setNotice(msg: string) {
           </article>
         </div>
       </div>
+
+      <div
+        class="logs-resizer"
+        role="separator"
+        aria-label="Resize log list"
+        aria-orientation="vertical"
+        title="Resize log list"
+        @pointerdown="startLayoutResize"
+        @pointermove="updateLayoutResize"
+        @pointerup="stopLayoutResize"
+        @pointercancel="stopLayoutResize"
+        @dblclick="resetLayoutResize"
+      />
 
       <!-- Editor / reader panel -->
       <aside class="detail-panel" :class="{ editing: showEditor, empty: !showEditor && !selectedLog }">
@@ -353,6 +486,7 @@ function setNotice(msg: string) {
                 A+
               </button>
             </div>
+            <button class="icon-button sm" title="在星云中定位" @click="locateLogInNebula(selectedLog.id)"><MapIcon :size="14" /></button>
             <button class="icon-button sm" title="编辑" @click="startEdit(selectedLog)"><Edit3 :size="14" /></button>
             <button class="icon-button sm" title="导出 Markdown" @click="handleExport(selectedLog.id)"><Download :size="14" /></button>
             <button class="icon-button sm danger" title="删除" @click="handleDelete(selectedLog.id)"><Trash2 :size="14" /></button>
@@ -403,6 +537,8 @@ function setNotice(msg: string) {
 }
 
 .page-header {
+  position: relative;
+  z-index: 60;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -472,12 +608,18 @@ function setNotice(msg: string) {
 .logs-layout {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(320px, 0.86fr) minmax(420px, 1.14fr);
+  grid-template-columns: minmax(320px, 0.86fr) 10px minmax(420px, 1.14fr);
   height: 100%;
   min-height: 0;
   overflow: hidden;
   background:
     linear-gradient(135deg, rgba(159, 255, 203, 0.035), transparent 34%, rgba(185, 156, 255, 0.035));
+}
+
+.logs-layout.resizing,
+.logs-layout.resizing * {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .logs-list-col {
@@ -488,6 +630,36 @@ function setNotice(msg: string) {
   overscroll-behavior: contain;
   padding: 18px 22px;
   border-right: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.logs-resizer {
+  position: relative;
+  z-index: 5;
+  min-width: 10px;
+  height: 100%;
+  cursor: col-resize;
+  background:
+    linear-gradient(90deg, transparent, rgba(98, 214, 255, 0.06), transparent);
+}
+
+.logs-resizer::before {
+  content: '';
+  position: absolute;
+  top: 18px;
+  bottom: 18px;
+  left: 50%;
+  width: 2px;
+  border-radius: 999px;
+  background: rgba(98, 214, 255, 0.16);
+  box-shadow: 0 0 16px rgba(98, 214, 255, 0.12);
+  transform: translateX(-50%);
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+.logs-resizer:hover::before,
+.logs-layout.resizing .logs-resizer::before {
+  background: rgba(98, 214, 255, 0.5);
+  box-shadow: 0 0 18px rgba(98, 214, 255, 0.32);
 }
 
 .logs-list-head {
@@ -503,6 +675,66 @@ function setNotice(msg: string) {
   background: linear-gradient(180deg, rgba(8, 17, 31, 0.98), rgba(8, 17, 31, 0.82));
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(16px);
+}
+
+.map-context-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(98, 214, 255, 0.14);
+  background:
+    radial-gradient(circle at 12% 0%, rgba(98, 214, 255, 0.13), transparent 34%),
+    rgba(255, 255, 255, 0.035);
+}
+
+.map-context-copy {
+  min-width: 0;
+}
+
+.map-context-copy span,
+.map-context-copy small {
+  display: block;
+  color: rgba(238, 246, 255, 0.42);
+  font-size: 12px;
+}
+
+.map-context-copy strong {
+  display: block;
+  margin: 4px 0 3px;
+  overflow: hidden;
+  color: #eef6ff;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.map-context-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.map-context-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1px solid rgba(98, 214, 255, 0.18);
+  background: rgba(98, 214, 255, 0.08);
+  color: #8ddfff;
+  cursor: pointer;
+}
+
+.map-context-actions button:hover {
+  color: #08111f;
+  background: #62d6ff;
 }
 
 .logs-list-head strong,
@@ -893,11 +1125,12 @@ function setNotice(msg: string) {
   position: relative;
   z-index: 1;
   flex: 0 0 auto;
-  width: min(860px, calc(100% - 32px));
+  width: 100%;
   height: min(660px, calc(100vh - 168px));
   max-height: calc(100vh - 168px);
-  margin: 0 auto;
+  margin: 0;
   min-height: 0;
+  box-sizing: border-box;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 22px;
@@ -1043,8 +1276,12 @@ function setNotice(msg: string) {
   }
 
   .logs-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: 1fr !important;
     overflow: hidden;
+  }
+
+  .logs-resizer {
+    display: none;
   }
 
   .logs-list-col,
