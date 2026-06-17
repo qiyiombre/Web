@@ -5,6 +5,7 @@ import type {
   DraftLog,
   GraphData,
   Insight,
+  InsightRangePayload,
   LogEntry,
   NebulaMap,
   TagNode,
@@ -222,13 +223,24 @@ export function restoreTag(payload: { id: number; mapId: number; name: string; c
   });
 }
 
-export function getInsights(mapId: number) {
-  return request<Insight>(`/maps/${mapId}/insights`);
+function buildInsightQuery(range?: InsightRangePayload) {
+  if (!range) return '';
+  const params = new URLSearchParams();
+  params.set('timeFilter', range.timeFilter);
+  if (range.customStartDate) params.set('customStartDate', range.customStartDate);
+  if (range.customEndDate) params.set('customEndDate', range.customEndDate);
+  const query = params.toString();
+  return query ? `?${query}` : '';
 }
 
-export function generateAdvice(mapId: number) {
+export function getInsights(mapId: number, range?: InsightRangePayload) {
+  return request<Insight>(`/maps/${mapId}/insights${buildInsightQuery(range)}`);
+}
+
+export function generateAdvice(mapId: number, range?: InsightRangePayload) {
   return request<AdviceResponse>(`/maps/${mapId}/advice`, {
-    method: 'POST'
+    method: 'POST',
+    body: JSON.stringify(range ?? {})
   });
 }
 

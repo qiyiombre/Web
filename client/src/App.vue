@@ -26,6 +26,12 @@ watch(
     graphStore.insightTopLimit,
     graphStore.insightTrendLimit,
     graphStore.insightCooccurrenceLimit,
+    graphStore.nebulaPriorityDisplayLimit,
+    graphStore.nebulaHeatWindowDays,
+    graphStore.nebulaHeatMinimumDelta,
+    graphStore.nebulaHeatMediumDelta,
+    graphStore.nebulaHeatStrongDelta,
+    graphStore.nebulaHeatFlatOpacity,
     graphStore.sortMode,
     graphStore.customStartDate,
     graphStore.customEndDate
@@ -84,7 +90,11 @@ async function confirmGlobalAction() {
       </section>
     </div>
     <main class="app-main">
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <KeepAlive include="MapPage">
+          <component :is="Component" />
+        </KeepAlive>
+      </router-view>
     </main>
     <AssistantPanel />
   </div>

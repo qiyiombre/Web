@@ -30,6 +30,10 @@ interface LabelItem {
   active: boolean;
   heat: 'up' | 'down' | 'flat';
   heatFlat: boolean;
+  heatFlatAlpha: string;
+  priorityRank: number | null;
+  priorityScore: number;
+  domainFocused: boolean;
 }
 
 const props = defineProps<{
@@ -37,7 +41,15 @@ const props = defineProps<{
   layoutMode: LayoutMode;
   activeTagIds: Set<number>;
   selectedLogId: number | null;
+  focusPulseLogId?: number | null;
   priorityTagIds?: number[];
+  priorityDisplayLimit?: number;
+  heatWindowDays?: number;
+  heatMinimumDelta?: number;
+  heatMediumDelta?: number;
+  heatStrongDelta?: number;
+  heatFlatOpacity?: number;
+  domainFocusTagIds?: Set<number>;
 }>();
 
 const emit = defineEmits<{
@@ -71,7 +83,7 @@ const manualLogPositions = new Map<number, { x: number; y: number }>();
 const pickNodes: PickNode[] = [];
 const tagTrendById = computed(() => {
   const now = Date.now();
-  const week = 1000 * 60 * 60 * 24 * 7;
+  const windowMs = 1000 * 60 * 60 * 24 * heatWindowDays();
   const trend = new Map<number, { current: number; previous: number }>();
   for (const tag of props.graph.tags) {
     trend.set(tag.id, { current: 0, previous: 0 });
@@ -83,9 +95,9 @@ const tagTrendById = computed(() => {
       if (!item) {
         continue;
       }
-      if (age <= week) {
+      if (age <= windowMs) {
         item.current += 1;
-      } else if (age <= week * 2) {
+      } else if (age <= windowMs * 2) {
         item.previous += 1;
       }
     }
@@ -126,6 +138,7 @@ let lineCount = 0;
 let raf = 0;
 let latestLayoutRequestId = 0;
 let pendingFocusTagId: number | null = null;
+let pendingFocusLogId: number | null = null;
 let pendingFocusCategory: DomainCategory | null = null;
 let layoutBusy = false;
 let isDragging = false;
@@ -164,7 +177,12 @@ layoutWorker.onmessage = (event: MessageEvent<LayoutResponse>) => {
     logPositions.set(point.id, { x: point.x, y: point.y, r: point.r });
   }
   layoutBusy = false;
-  if (pendingFocusTagId !== null) {
+  if (pendingFocusLogId !== null) {
+    const logId = pendingFocusLogId;
+    pendingFocusLogId = null;
+    pendingFitAllFrontView = false;
+    focusLog(logId);
+  } else if (pendingFocusTagId !== null) {
     const tagId = pendingFocusTagId;
     pendingFocusTagId = null;
     pendingFitAllFrontView = false;
@@ -224,7 +242,7 @@ watch(
 );
 
 watch(
-  () => [props.activeTagIds, props.selectedLogId],
+  () => [props.activeTagIds, props.selectedLogId, props.focusPulseLogId, props.priorityTagIds, props.priorityDisplayLimit, props.domainFocusTagIds],
   () => {
     updateLabels();
   },
@@ -658,6 +676,7 @@ function render(timeMs: number) {
 
 function updateGeometryBuffers() {
   const nodeRows: number[] = [];
+  const pulseTime = Date.now() / 1000;
 
   for (const star of stars) {
     pushNodeInstance(nodeRows, star, star.r, 0, { r: 0.9, g: 0.96, b: 1 }, star.alpha, 0, star.seed, 0);
@@ -676,6 +695,7 @@ function updateGeometryBuffers() {
     const heatPower = heatIntensity(tag.id);
     const color = heatMode.value ? heatColor(heat, heatPower) : hexToRgb(tag.color);
     const active = props.activeTagIds.has(tag.id);
+    const domainFocused = props.domainFocusTagIds?.has(tag.id) ?? false;
     const relatedToSelected = isTagRelatedToSelectedLog(tag.id);
     const related =
       !hasActiveRelationMode() ||
@@ -683,21 +703,50 @@ function updateGeometryBuffers() {
       relatedToSelected ||
       props.graph.logs.some((log) => isLogHighlighted(log) && log.tags.some((item) => item.id === tag.id));
     const flatHeat = heatMode.value && heat === 'flat';
-    const state = heatMode.value ? (flatHeat ? 0.28 : 1) : active || relatedToSelected ? 1 : related ? 0.62 : 0.18;
+    const flatOpacity = heatFlatOpacity();
+    const state = heatMode.value ? (flatHeat ? flatOpacity : 1) : active || relatedToSelected || domainFocused ? 1 : related ? 0.62 : 0.18;
     const depth = 0.92 + seeded(tag.id + 2200) * 0.22;
     const priority = tagPriority(tag.id);
-    const priorityScale = hasTagPriority() ? 0.88 + priority * 0.36 : 1;
-    const priorityAlpha = hasTagPriority() ? 0.72 + priority * 0.36 : 1;
+    const priorityRank = priorityRankByTagId.value.get(tag.id);
+    const priorityActive = hasTagPriority() && shouldShowPriorityBadge(priorityRank ?? null);
+    const priorityScale = priorityActive ? 0.9 + priority * 0.5 : 1;
+    const priorityAlpha = priorityActive ? 0.78 + priority * 0.46 : 1;
     const activeScale = active || relatedToSelected ? 1.22 : related ? 1 : 0.92;
     const coreRadius = point.r * 1.38 * depth * activeScale * priorityScale;
     const world = tagPoint3D(tag.id, point);
+    if (priorityActive) {
+      pushNodeInstance(
+        nodeRows,
+        world,
+        coreRadius * (2.04 + priority * 0.42),
+        3,
+        color,
+        (0.07 + priority * 0.15) * (active || relatedToSelected ? 1.2 : 1),
+        Math.max(state, 0.72),
+        seeded(tag.id + 650),
+        0
+      );
+    }
+    if (domainFocused) {
+      pushNodeInstance(
+        nodeRows,
+        world,
+        coreRadius * 2.22,
+        3,
+        color,
+        0.18,
+        1,
+        seeded(tag.id + 1180),
+        0
+      );
+    }
     pushNodeInstance(
       nodeRows,
       world,
       coreRadius * (active || relatedToSelected ? 1.44 : 1.12),
       3,
       color,
-      (flatHeat ? (active || relatedToSelected ? 0.08 : related ? 0.035 : 0.018) : active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025) * priorityAlpha,
+      (flatHeat ? (active || relatedToSelected ? 0.28 : related ? 0.12 : 0.065) * flatOpacity : active || relatedToSelected ? 0.18 : related ? 0.06 : 0.025) * priorityAlpha,
       state,
       seeded(tag.id + 700),
       0
@@ -708,7 +757,7 @@ function updateGeometryBuffers() {
       coreRadius * (active || relatedToSelected ? 1.82 : 1.48),
       1,
       color,
-      (flatHeat ? (active || relatedToSelected ? 0.56 : related ? 0.38 : 0.24) : active || relatedToSelected ? 1 : related ? 0.92 : 0.46) * priorityAlpha,
+      (flatHeat ? (active || relatedToSelected ? 1.15 : related ? 0.82 : 0.52) * flatOpacity : active || relatedToSelected ? 1 : related ? 0.92 : 0.46) * priorityAlpha,
       state,
       seeded(tag.id + 800),
       0
@@ -724,11 +773,13 @@ function updateGeometryBuffers() {
       continue;
     }
     const selected = props.selectedLogId === log.id;
+    const pulsing = props.focusPulseLogId === log.id;
     const highlighted = isLogHighlighted(log);
-    const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !highlighted;
-    const state = selected ? 1 : highlighted ? 0.92 : muted ? 0.08 : 0.38;
-    const radius = selected ? 15.2 : highlighted ? 14.4 : 8.8;
-    const coreAlpha = selected ? 1 : highlighted ? 1 : muted ? 0.28 : 0.72;
+    const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !pulsing && !highlighted;
+    const pulse = pulsing ? 0.5 + 0.5 * Math.sin(pulseTime * 7.5 + log.id) : 0;
+    const state = selected || pulsing ? 1 : highlighted ? 0.92 : muted ? 0.08 : 0.38;
+    const radius = selected ? 15.2 : pulsing ? 15.4 + pulse * 2.6 : highlighted ? 14.4 : 8.8;
+    const coreAlpha = selected || pulsing ? 1 : highlighted ? 1 : muted ? 0.28 : 0.72;
     const logColor = logVisualRgb(log);
     const world = logPoint3D(log, point);
     const seed = seeded(log.id + 1900);
@@ -744,6 +795,19 @@ function updateGeometryBuffers() {
       seed,
       tilt
     );
+    if (pulsing) {
+      pushNodeInstance(
+        nodeRows,
+        world,
+        radius * (5.4 + pulse * 0.7),
+        4.0,
+        logColor,
+        0.34,
+        1,
+        seed + 0.25,
+        tilt
+      );
+    }
   }
   nodeCount = Math.max(0, nodeRows.length / 12 - starCount);
   writeDynamicBuffer('node', new Float32Array(nodeRows), 48);
@@ -1300,14 +1364,17 @@ function focusTag(tagId: number) {
 
 function focusLog(logId: number) {
   if (!canvas.value) {
+    pendingFocusLogId = logId;
     return null;
   }
   const point = logPositions.get(logId);
   const log = props.graph.logs.find((item) => item.id === logId);
   if (!point || !log) {
+    pendingFocusLogId = logId;
     requestLayout();
     return null;
   }
+  pendingFocusLogId = null;
   const rect = canvas.value.getBoundingClientRect();
   const nextScale = Math.max(transform.scale, 1.2);
   const world = logPoint3D(log, point);
@@ -1383,6 +1450,7 @@ function updateLabels() {
   }
   const rect = canvas.value.getBoundingClientRect();
   const nextLabels: LabelItem[] = [];
+  const labelCandidates: LabelItem[] = [];
   pickNodes.length = 0;
 
   for (const tag of props.graph.tags) {
@@ -1396,10 +1464,17 @@ function updateLabels() {
     const screen = projectWorldToScreen(tagPoint3D(tag.id, point));
     const heat = heatMode.value ? heatState(tag.id) : 'flat';
     const active = props.activeTagIds.has(tag.id);
-    const radius = Math.max(active ? 32 : 24, point.r * transform.scale * screen.perspective * (active ? 2.1 : 1.72));
+    const domainFocused = props.domainFocusTagIds?.has(tag.id) ?? false;
+    const priorityRank = priorityRankByTagId.value.get(tag.id);
+    const priorityActive = hasTagPriority() && shouldShowPriorityBadge(priorityRank ?? null);
+    const priorityScore = priorityActive ? tagPriority(tag.id) : 0;
+    const radius = Math.max(
+      active ? 32 : priorityActive ? 27 : 24,
+      point.r * transform.scale * screen.perspective * (active ? 2.1 : priorityActive ? 1.9 + priorityScore * 0.14 : 1.72)
+    );
     if (screen.x > -140 && screen.x < rect.width + 140 && screen.y > -140 && screen.y < rect.height + 140) {
       pickNodes.push({ kind: 'tag', id: tag.id, x: screen.x, y: screen.y, r: radius });
-      nextLabels.push({
+      labelCandidates.push({
         id: tag.id,
         name: tag.name,
         x: screen.x,
@@ -1407,8 +1482,25 @@ function updateLabels() {
         color: heatMode.value ? heatLabelColor(heat, heatIntensity(tag.id)) : tag.color,
         active,
         heat,
-        heatFlat: heatMode.value && heat === 'flat'
+        heatFlat: heatMode.value && heat === 'flat',
+        heatFlatAlpha: clamp(heatFlatOpacity() + 0.22, 0.28, 0.82).toFixed(2),
+        priorityRank: priorityActive ? priorityRank ?? null : null,
+        priorityScore,
+        domainFocused
       });
+    }
+  }
+
+  const occupiedLabels: Array<{ x: number; y: number; w: number; h: number }> = [];
+  for (const label of labelCandidates.sort(compareLabelsForVisibility)) {
+    const required = label.active || label.domainFocused || shouldShowPriorityBadge(label.priorityRank);
+    const width = Math.max(54, label.name.length * 14 + (label.priorityRank !== null ? 34 : 0));
+    const height = 26;
+    const box = { x: label.x - width / 2, y: label.y - height / 2, w: width, h: height };
+    const overlapped = occupiedLabels.some((item) => boxesOverlap(box, item));
+    if (!overlapped || required || !hasTagPriority()) {
+      nextLabels.push(label);
+      occupiedLabels.push(box);
     }
   }
 
@@ -1801,6 +1893,24 @@ function tagPriority(tagId: number) {
   return 1 - rank / Math.max(1, total - 1);
 }
 
+function shouldShowPriorityBadge(rank: number | null, force = false) {
+  if (rank === null) return false;
+  const limit = Math.max(0, Math.round(props.priorityDisplayLimit ?? 8));
+  return force || rank < limit;
+}
+
+function compareLabelsForVisibility(a: LabelItem, b: LabelItem) {
+  const score = (item: LabelItem) =>
+    (item.active ? 10000 : 0) +
+    (item.domainFocused ? 8000 : 0) +
+    (item.priorityRank !== null ? 5000 - item.priorityRank * 40 : 0);
+  return score(b) - score(a);
+}
+
+function boxesOverlap(a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
 function tagDepth(tagId: number) {
   const priorityDepth = hasTagPriority() ? (0.5 - tagPriority(tagId)) * 420 : 0;
   return (seeded(tagId + 4321) - 0.5) * 320 + priorityDepth;
@@ -1822,10 +1932,11 @@ function heatState(tagId: number): 'up' | 'down' | 'flat' {
     return 'flat';
   }
   const delta = item.current - item.previous;
-  if (delta > 0) {
+  const minimum = heatMinimumDelta();
+  if (delta >= minimum) {
     return 'up';
   }
-  if (item.previous > 0 && delta < 0) {
+  if (item.previous > 0 && delta <= -minimum) {
     return 'down';
   }
   return 'flat';
@@ -1837,17 +1948,38 @@ function heatIntensity(tagId: number) {
     return 0;
   }
   const delta = item.current - item.previous;
-  if (!(delta > 0 || (item.previous > 0 && delta < 0))) {
+  const minimum = heatMinimumDelta();
+  if (!(delta >= minimum || (item.previous > 0 && delta <= -minimum))) {
     return 0;
   }
   const absoluteDelta = Math.abs(delta);
-  if (absoluteDelta >= 4) {
+  if (absoluteDelta >= heatStrongDelta()) {
     return 1;
   }
-  if (absoluteDelta >= 2) {
+  if (absoluteDelta >= heatMediumDelta()) {
     return 0.66;
   }
   return 0.32;
+}
+
+function heatWindowDays() {
+  return clamp(Math.round(Number(props.heatWindowDays ?? 7) || 7), 1, 90);
+}
+
+function heatMinimumDelta() {
+  return clamp(Math.round(Number(props.heatMinimumDelta ?? 1) || 1), 1, 99);
+}
+
+function heatMediumDelta() {
+  return clamp(Math.round(Number(props.heatMediumDelta ?? 2) || 2), heatMinimumDelta(), 99);
+}
+
+function heatStrongDelta() {
+  return clamp(Math.round(Number(props.heatStrongDelta ?? 4) || 4), heatMediumDelta(), 99);
+}
+
+function heatFlatOpacity() {
+  return clamp(Number(props.heatFlatOpacity ?? 28) / 100, 0.05, 0.8);
 }
 
 function heatColor(heat: 'up' | 'down' | 'flat', intensity = 0) {
@@ -1863,7 +1995,7 @@ function heatColor(heat: 'up' | 'down' | 'flat', intensity = 0) {
 
 function heatLabelColor(heat: 'up' | 'down' | 'flat', intensity = 0) {
   if (heat === 'flat') {
-    return 'rgba(232, 243, 255, 0.56)';
+    return `rgba(232, 243, 255, ${clamp(heatFlatOpacity() + 0.18, 0.26, 0.82).toFixed(2)})`;
   }
   return rgbToCss(heatColor(heat, intensity));
 }
@@ -2035,7 +2167,10 @@ const backgroundShader = `
   fn fs(input: VertexOut) -> @location(0) vec4f {
     let time = u.viewport.w;
     let aspect = max(0.4, u.viewport.x / max(1.0, u.viewport.y));
-    let screen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0);
+    let rawScreen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0);
+    let skyZoom = max(0.28, pow(max(u.viewport.z, 0.05), 0.62));
+    let skyPan = vec2f(u.camera.x, u.camera.y) * 0.00042;
+    let screen = rawScreen / skyZoom + skyPan;
     let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
     let dir = rotateSky(viewDir);
     let lon = atan2(dir.x, dir.z);
@@ -2452,15 +2587,27 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
         v-for="label in labels"
         :key="label.id"
         class="webgpu-label"
-        :class="{ active: label.active, up: label.heat === 'up', down: label.heat === 'down', heatFlat: label.heatFlat }"
-        :style="{ left: `${label.x}px`, top: `${label.y}px`, '--label-color': label.color }"
+        :class="{
+          active: label.active,
+          up: label.heat === 'up',
+          down: label.heat === 'down',
+          heatFlat: label.heatFlat,
+          priority: label.priorityRank !== null,
+          priorityTop: label.priorityRank !== null && label.priorityRank < 3,
+          domainFocus: label.domainFocused
+        }"
+        :style="{ left: `${label.x}px`, top: `${label.y}px`, '--label-color': label.color, '--heat-flat-alpha': label.heatFlatAlpha }"
         @pointerdown.stop="onLabelPointerDown(label.id, $event)"
         @pointermove.stop="onPointerMove"
         @pointerup.stop="onLabelPointerUp(label.id, $event)"
         @pointercancel.stop="onLabelPointerUp(label.id, $event, true)"
         @contextmenu.prevent.stop="inspectTagLabel(label.id, $event)"
       >
-        {{ label.name }}
+        <span
+          v-if="shouldShowPriorityBadge(label.priorityRank, label.active || label.domainFocused)"
+          class="webgpu-priority-badge"
+        >#{{ (label.priorityRank ?? 0) + 1 }}</span>
+        <span class="webgpu-label-name">{{ label.name }}</span>
       </button>
     </div>
 

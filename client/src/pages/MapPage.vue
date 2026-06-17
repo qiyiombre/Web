@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue';
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
   ChevronLeft,
@@ -11,9 +11,12 @@ import {
   Undo2,
   Redo2,
   FilePlus2,
+  FileText,
   Tags,
   Link2,
   Layers,
+  FolderTree,
+  SlidersHorizontal,
   X,
   Check,
   List,
@@ -33,7 +36,9 @@ import TagManager from '../components/TagManager.vue';
 import InsightPanel from '../components/InsightPanel.vue';
 import DomainCategoryManager from '../components/DomainCategoryManager.vue';
 import { createLog, updateLog, deleteLog } from '../services/api';
-import type { NebulaMap, DomainCategory, LogEntry, DraftLog } from '../types/domain';
+import type { NebulaMap, DomainCategory, LogEntry, DraftLog, TagNode } from '../types/domain';
+
+defineOptions({ name: 'MapPage' });
 
 const auth = useAuthStore();
 const mapsStore = useMapsStore();
@@ -44,14 +49,38 @@ const router = useRouter();
 
 const canvasRef = ref<any>(null);
 const showDrawer = ref(false);
-type DrawerTab = 'tags' | 'related' | 'manage' | 'insights' | 'domains' | 'maps';
+type DrawerTab = 'tags' | 'related' | 'manage' | 'insights' | 'domains' | 'maps' | 'logs';
 const drawerTab = ref<DrawerTab | null>(null);
 const selectedLogId = ref<number | null>(null);
+const priorityRankCollapsed = ref(localStorage.getItem('nebula.priorityRankCollapsed') === 'true');
+const focusPulseLogId = ref<number | null>(null);
+let focusPulseTimer: number | null = null;
+let shortcutsBound = false;
 
 const mapId = computed(() => Number(route.params.id));
 const visibleGraph = computed(() => graphStore.filteredGraph);
+const drawerLogs = computed(() => (
+  [...graphStore.filteredLogs]
+    .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())
+));
+const priorityRankItems = computed<Array<{ rank: number; tag: TagNode }>>(() => {
+  if (!visibleGraph.value || graphStore.priorityTagIds.length === 0) return [];
+  const tagById = new Map(visibleGraph.value.tags.map((tag) => [tag.id, tag]));
+  return graphStore.priorityTagIds
+    .map((id, index) => ({ rank: index + 1, tag: tagById.get(id) }))
+    .filter((item): item is { rank: number; tag: TagNode } => Boolean(item.tag));
+});
+const priorityRankTitle = computed(() => {
+  if (graphStore.sortMode === 'frequency') return '高频排名';
+  if (graphStore.sortMode === 'lowFrequency') return '低频排名';
+  if (graphStore.sortMode === 'recent') return '最近活跃';
+  return '';
+});
+const priorityRankVisibleItems = computed(() => (
+  priorityRankCollapsed.value ? [] : priorityRankItems.value
+));
 const drawerTitle = computed(() => {
-  const titles: Record<DrawerTab, string> = {
+  const titles: Partial<Record<DrawerTab, string>> = {
     tags: '激活标签',
     related: '相关标签',
     manage: '标签管理',
@@ -59,36 +88,57 @@ const drawerTitle = computed(() => {
     domains: '领域大类',
     maps: '星图'
   };
-  return drawerTab.value ? titles[drawerTab.value] : '';
+  return drawerTab.value ? (titles[drawerTab.value] ?? '日志定位') : '';
 });
 
 onMounted(async () => {
-  window.addEventListener('keydown', handleNebulaShortcut);
+  bindNebulaShortcuts();
   await mapsStore.fetchMaps();
-  if (mapId.value) {
-    if (!isNaN(mapId.value)) {
-      mapsStore.activeMapId = mapId.value;
-      await mapsStore.selectMap(mapId.value);
-      applyDrawerQuery();
-    }
-  }
+  await ensureMapSelected();
+  applyDrawerQuery();
+  await applyFocusLogQuery();
+});
+
+onActivated(async () => {
+  bindNebulaShortcuts();
+  await ensureMapSelected();
+  applyDrawerQuery();
+  void applyFocusLogQuery();
+});
+
+onDeactivated(() => {
+  unbindNebulaShortcuts();
 });
 
 onBeforeUnmount(() => {
-  window.removeEventListener('keydown', handleNebulaShortcut);
+  unbindNebulaShortcuts();
+  if (focusPulseTimer !== null) {
+    window.clearTimeout(focusPulseTimer);
+    focusPulseTimer = null;
+  }
 });
 
 watch(mapId, async (id) => {
   if (id && !isNaN(id)) {
-    mapsStore.activeMapId = id;
-    await mapsStore.selectMap(id);
+    await ensureMapSelected(id);
     applyDrawerQuery();
+    await applyFocusLogQuery();
   }
 });
 
 watch(
   () => route.query.drawer,
-  () => applyDrawerQuery()
+  () => {
+    applyDrawerQuery();
+    void applyFocusLogQuery();
+  }
+);
+
+watch(
+  () => route.query.focusLog,
+  () => {
+    void applyFocusLogQuery();
+  }
 );
 
 function toggleDrawer(tab: DrawerTab) {
@@ -98,16 +148,25 @@ function toggleDrawer(tab: DrawerTab) {
     drawerTab.value = tab;
     showDrawer.value = true;
   }
+  if (tab === 'logs' && showDrawer.value && selectedLogId.value !== null) {
+    void scrollDrawerLogIntoView(selectedLogId.value);
+  }
 }
 
 function closeDrawer() {
   showDrawer.value = false;
 }
 
+async function ensureMapSelected(id = mapId.value) {
+  if (!id || Number.isNaN(id)) return;
+  mapsStore.activeMapId = id;
+  await mapsStore.selectMap(id);
+}
+
 function applyDrawerQuery() {
   const drawer = route.query.drawer;
   if (typeof drawer !== 'string') return;
-  if (!['tags', 'related', 'manage', 'insights', 'domains', 'maps'].includes(drawer)) return;
+  if (!['tags', 'related', 'manage', 'insights', 'domains', 'maps', 'logs'].includes(drawer)) return;
   drawerTab.value = drawer as DrawerTab;
   showDrawer.value = true;
 }
@@ -117,20 +176,17 @@ function handleTagToggle(tagId: number) {
 }
 
 function handleLogOpen(logId: number) {
-  if (selectedLogId.value === logId) {
-    selectedLogId.value = null;
-    graphStore.nebulaLogCard = null;
-    return;
+  selectedLogId.value = selectedLogId.value === logId ? null : logId;
+  graphStore.nebulaLogCard = null;
+  if (selectedLogId.value !== null && showDrawer.value && drawerTab.value === 'logs') {
+    void scrollDrawerLogIntoView(logId);
   }
-  selectedLogId.value = logId;
 }
 
 function handleLogInspect(payload: { logId: number; x: number; y: number; width: number; height: number }) {
-  selectedLogId.value = selectedLogId.value === payload.logId ? null : payload.logId;
-  if (selectedLogId.value === null) {
-    graphStore.nebulaLogCard = null;
-    return;
-  }
+  selectedLogId.value = payload.logId;
+  drawerTab.value = 'logs';
+  showDrawer.value = true;
   const width = payload.width ?? window.innerWidth;
   const height = payload.height ?? window.innerHeight;
   const maxX = Math.max(16, width - 356);
@@ -142,6 +198,24 @@ function handleLogInspect(payload: { logId: number; x: number; y: number; width:
     width,
     height
   };
+  void scrollDrawerLogIntoView(payload.logId);
+}
+
+function focusLogFromDrawer(logId: number) {
+  if (selectedLogId.value === logId) {
+    selectedLogId.value = null;
+    graphStore.nebulaLogCard = null;
+    return;
+  }
+  selectedLogId.value = logId;
+  graphStore.nebulaLogCard = null;
+  canvasRef.value?.focusLog?.(logId);
+  markLogFocus(logId);
+  void scrollDrawerLogIntoView(logId);
+}
+
+function openLogFromDrawer(logId: number) {
+  router.push({ path: `/maps/${mapId.value}/logs`, query: { selected: String(logId) } });
 }
 
 function handleLayoutDirty(dirty: boolean) {
@@ -160,6 +234,67 @@ function focusDomainCategory(cat: DomainCategory) {
   if (canvasRef.value?.focusDomainCategory) {
     canvasRef.value.focusDomainCategory(cat);
   }
+}
+
+async function applyFocusLogQuery() {
+  const drawer = Array.isArray(route.query.drawer) ? route.query.drawer[0] : route.query.drawer;
+  if (drawer !== 'logs') return;
+  const raw = Array.isArray(route.query.focusLog) ? route.query.focusLog[0] : route.query.focusLog;
+  const logId = raw ? Number(raw) : NaN;
+  if (!Number.isFinite(logId)) return;
+  const visibleLog = graphStore.filteredLogs.find((item) => item.id === logId);
+  const log = visibleLog ?? mapsStore.graph?.logs.find((item) => item.id === logId);
+  if (!log) return;
+  drawerTab.value = 'logs';
+  showDrawer.value = true;
+  if (!visibleLog) {
+    selectedLogId.value = null;
+    graphStore.nebulaLogCard = null;
+    ui.showNotice('该日志不在当前筛选范围内');
+    return;
+  }
+  selectedLogId.value = log.id;
+  graphStore.nebulaLogCard = null;
+  await nextTick();
+  canvasRef.value?.focusLog?.(log.id);
+  markLogFocus(log.id);
+  await scrollDrawerLogIntoView(log.id);
+}
+
+function togglePriorityRankCollapsed() {
+  priorityRankCollapsed.value = !priorityRankCollapsed.value;
+  localStorage.setItem('nebula.priorityRankCollapsed', String(priorityRankCollapsed.value));
+}
+
+async function scrollDrawerLogIntoView(logId: number) {
+  await nextTick();
+  const item = document.querySelector<HTMLElement>(`[data-drawer-log-id="${logId}"]`);
+  item?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function markLogFocus(logId: number) {
+  focusPulseLogId.value = logId;
+  if (focusPulseTimer !== null) {
+    window.clearTimeout(focusPulseTimer);
+  }
+  focusPulseTimer = window.setTimeout(() => {
+    if (focusPulseLogId.value === logId) {
+      focusPulseLogId.value = null;
+    }
+    focusPulseTimer = null;
+  }, 1800);
+}
+
+function bindNebulaShortcuts() {
+  if (shortcutsBound) return;
+  window.addEventListener('keydown', handleNebulaShortcut);
+  shortcutsBound = true;
+}
+
+function unbindNebulaShortcuts() {
+  if (!shortcutsBound) return;
+  window.removeEventListener('keydown', handleNebulaShortcut);
+  shortcutsBound = false;
 }
 
 function refreshNebulaView() {
@@ -377,10 +512,11 @@ const layoutAiStatus = computed(() => {
           <FilePlus2 :size="15" />
           新日志
         </button>
+        <button class="icon-button" title="日志定位" @click="toggleDrawer('logs')"><FileText :size="16" /></button>
         <button class="icon-button" title="星图列表" @click="toggleDrawer('maps')"><MapIcon :size="16" /></button>
         <button class="icon-button" title="标签" @click="toggleDrawer('tags')"><Tags :size="16" /></button>
-        <button class="icon-button" title="管理" @click="toggleDrawer('manage')"><Layers :size="16" /></button>
-        <button class="icon-button" title="领域大类" @click="toggleDrawer('domains')"><Layers :size="16" /></button>
+        <button class="icon-button" title="管理" @click="toggleDrawer('manage')"><SlidersHorizontal :size="16" /></button>
+        <button class="icon-button" title="领域大类" @click="toggleDrawer('domains')"><FolderTree :size="16" /></button>
         <button class="icon-button" title="洞察" @click="toggleDrawer('insights')"><List :size="16" /></button>
       </div>
     </header>
@@ -395,6 +531,15 @@ const layoutAiStatus = computed(() => {
         :layout-mode="auth.layoutMode"
         :active-tag-ids="graphStore.activeTagIds"
         :selected-log-id="selectedLogId"
+        :focus-pulse-log-id="focusPulseLogId"
+        :priority-tag-ids="graphStore.priorityTagIds"
+        :priority-display-limit="graphStore.nebulaPriorityDisplayLimit"
+        :heat-window-days="graphStore.nebulaHeatWindowDays"
+        :heat-minimum-delta="graphStore.nebulaHeatMinimumDelta"
+        :heat-medium-delta="graphStore.nebulaHeatMediumDelta"
+        :heat-strong-delta="graphStore.nebulaHeatStrongDelta"
+        :heat-flat-opacity="graphStore.nebulaHeatFlatOpacity"
+        :domain-focus-tag-ids="graphStore.domainFocusTagIds"
         @tag-toggle="handleTagToggle"
         @tag-context="(p: any) => ui.openTagMenu(p.tagId, p.x, p.y, p.width, p.height)"
         @log-open="handleLogOpen"
@@ -455,6 +600,7 @@ const layoutAiStatus = computed(() => {
             <div class="nebula-log-card-head">
               <span>日志星卡</span>
               <div class="nebula-log-card-actions">
+                <button class="icon-button" title="查看详情" @click.stop="openLogFromDrawer(graphStore.nebulaCardLog.log.id)"><FileText :size="15" /></button>
                 <button class="icon-button" title="编辑" @click.stop="startEditLog(graphStore.nebulaCardLog.log.id)"><Edit3 :size="15" /></button>
                 <button class="icon-button" title="导出 Markdown" @click.stop="exportLog(graphStore.nebulaCardLog.log.id)"><Download :size="15" /></button>
                 <button class="icon-button danger" title="删除" @click.stop="removeLog(graphStore.nebulaCardLog.log.id)"><Trash2 :size="15" /></button>
@@ -485,7 +631,10 @@ const layoutAiStatus = computed(() => {
         :layout-mode="auth.layoutMode"
         :active-tag-ids="graphStore.activeTagIds"
         :selected-log-id="selectedLogId"
+        :focus-pulse-log-id="focusPulseLogId"
         :priority-tag-ids="graphStore.priorityTagIds"
+        :priority-display-limit="graphStore.nebulaPriorityDisplayLimit"
+        :domain-focus-tag-ids="graphStore.domainFocusTagIds"
         @tag-toggle="handleTagToggle"
         @tag-context="(p: any) => ui.openTagMenu(p.tagId, p.x, p.y, p.width, p.height)"
         @log-open="handleLogOpen"
@@ -546,6 +695,7 @@ const layoutAiStatus = computed(() => {
             <div class="nebula-log-card-head">
               <span>日志星卡</span>
               <div class="nebula-log-card-actions">
+                <button class="icon-button" title="查看详情" @click.stop="openLogFromDrawer(graphStore.nebulaCardLog.log.id)"><FileText :size="15" /></button>
                 <button class="icon-button" title="编辑" @click.stop="startEditLog(graphStore.nebulaCardLog.log.id)"><Edit3 :size="15" /></button>
                 <button class="icon-button" title="导出 Markdown" @click.stop="exportLog(graphStore.nebulaCardLog.log.id)"><Download :size="15" /></button>
                 <button class="icon-button danger" title="删除" @click.stop="removeLog(graphStore.nebulaCardLog.log.id)"><Trash2 :size="15" /></button>
@@ -572,6 +722,41 @@ const layoutAiStatus = computed(() => {
         <p v-if="mapsStore.loading">加载中...</p>
         <p v-else-if="mapsStore.error">{{ mapsStore.error }}</p>
         <p v-else>选择一个星图开始探索</p>
+      </div>
+      <div v-if="priorityRankItems.length" class="priority-rank-panel" :class="{ collapsed: priorityRankCollapsed }">
+        <div class="priority-rank-head">
+          <button type="button" class="priority-rank-toggle" @click="togglePriorityRankCollapsed">
+            <ChevronRight v-if="priorityRankCollapsed" :size="14" />
+            <ChevronLeft v-else :size="14" />
+            <span>{{ priorityRankTitle }}</span>
+          </button>
+          <small>全部 {{ priorityRankItems.length }}</small>
+        </div>
+        <div v-if="!priorityRankCollapsed" class="priority-rank-control">
+          <span>星云标记 {{ graphStore.nebulaPriorityDisplayLimit }} 个</span>
+          <input
+            v-model.number="graphStore.nebulaPriorityDisplayLimit"
+            type="range"
+            min="0"
+            max="30"
+            @change="graphStore.setNebulaPriorityDisplayLimit(graphStore.nebulaPriorityDisplayLimit)"
+          />
+        </div>
+        <div v-if="!priorityRankCollapsed" class="priority-rank-list">
+          <button
+            v-for="item in priorityRankVisibleItems"
+            :key="item.tag.id"
+            type="button"
+            class="priority-rank-item"
+            :class="{ active: graphStore.activeTagIds.has(item.tag.id) }"
+            @click="focusTag(item.tag.id)"
+          >
+            <span class="priority-rank-no">#{{ item.rank }}</span>
+            <i :style="{ backgroundColor: item.tag.color }"></i>
+            <span>{{ item.tag.name }}</span>
+            <small>{{ item.tag.count }}</small>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -669,6 +854,47 @@ const layoutAiStatus = computed(() => {
                 <button class="icon-button sm danger" title="删除" @click="requestDeleteMap(map)"><Trash2 :size="14" /></button>
               </template>
             </div>
+          </template>
+
+          <template v-if="drawerTab === 'logs' && mapId">
+            <div class="drawer-section compact">
+              <h4>日志定位</h4>
+              <p class="muted drawer-hint">显示当前筛选命中的日志，点击后会在星云图中定位并打开详情。</p>
+            </div>
+            <div v-if="drawerLogs.length" class="drawer-log-list">
+              <div
+                v-for="log in drawerLogs"
+                :key="log.id"
+                role="button"
+                tabindex="0"
+                :data-drawer-log-id="log.id"
+                class="drawer-log-item"
+                :class="{ active: selectedLogId === log.id, pulse: focusPulseLogId === log.id }"
+                @click="focusLogFromDrawer(log.id)"
+                @keydown.enter.prevent="focusLogFromDrawer(log.id)"
+                @keydown.space.prevent="focusLogFromDrawer(log.id)"
+              >
+                <span class="drawer-log-title">{{ log.title || '无标题' }}</span>
+                <span class="drawer-log-meta">{{ formatDate(log.updatedAt || log.createdAt) }}</span>
+                <span class="drawer-log-tags">
+                  <i
+                    v-for="tag in log.tags.slice(0, 4)"
+                    :key="tag.id"
+                    :style="{ borderColor: tag.color, color: tag.color }"
+                  >
+                    {{ tag.name }}
+                  </i>
+                  <small v-if="log.tags.length > 4">+{{ log.tags.length - 4 }}</small>
+                </span>
+                <span class="drawer-log-actions" @click.stop>
+                  <button type="button" @click="openLogFromDrawer(log.id)">
+                    <FileText :size="12" />
+                    详情
+                  </button>
+                </span>
+              </div>
+            </div>
+            <p v-else class="muted">当前筛选下暂无日志</p>
           </template>
 
           <template v-if="drawerTab === 'insights' && mapId">
@@ -858,6 +1084,139 @@ const layoutAiStatus = computed(() => {
   font-size: 16px;
 }
 
+.priority-rank-panel {
+  position: absolute;
+  left: 16px;
+  bottom: 16px;
+  z-index: 8;
+  width: min(270px, calc(100% - 32px));
+  max-height: min(42vh, 330px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 14px;
+  border: 1px solid rgba(98, 214, 255, 0.14);
+  background: rgba(6, 15, 28, 0.76);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(14px);
+}
+
+.priority-rank-panel.collapsed {
+  width: auto;
+  max-width: min(270px, calc(100% - 32px));
+}
+
+.priority-rank-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px 8px;
+  color: rgba(238, 246, 255, 0.88);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.priority-rank-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.priority-rank-toggle span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.priority-rank-head small {
+  color: rgba(238, 246, 255, 0.42);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.priority-rank-control {
+  display: grid;
+  grid-template-columns: auto minmax(82px, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px 7px;
+  color: rgba(238, 246, 255, 0.56);
+  font-size: 11px;
+}
+
+.priority-rank-control input {
+  width: 100%;
+  accent-color: #62d6ff;
+}
+
+.priority-rank-list {
+  overflow-y: auto;
+  padding: 0 8px 9px;
+}
+
+.priority-rank-item {
+  display: grid;
+  grid-template-columns: 38px 9px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 31px;
+  margin-top: 5px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.028);
+  color: rgba(238, 246, 255, 0.72);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.16s, background 0.16s, transform 0.16s;
+}
+
+.priority-rank-item:hover,
+.priority-rank-item.active {
+  border-color: rgba(98, 214, 255, 0.22);
+  background: rgba(98, 214, 255, 0.075);
+  color: #eef6ff;
+}
+
+.priority-rank-item:hover {
+  transform: translateX(2px);
+}
+
+.priority-rank-no {
+  color: rgba(98, 214, 255, 0.88);
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+}
+
+.priority-rank-item i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  box-shadow: 0 0 10px currentColor;
+}
+
+.priority-rank-item span:nth-child(3) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.priority-rank-item small {
+  color: rgba(238, 246, 255, 0.42);
+  font-size: 11px;
+}
+
 /* Drawer */
 .drawer {
   position: absolute;
@@ -903,12 +1262,129 @@ const layoutAiStatus = computed(() => {
   margin-top: 20px;
 }
 
+.drawer-section.compact {
+  margin-top: 0;
+}
+
 .drawer-section h4 {
   font-size: 12px;
   color: rgba(238, 246, 255, 0.4);
   margin: 0 0 10px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+
+.drawer-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.drawer-log-item {
+  width: 100%;
+  padding: 11px 12px;
+  border-radius: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.16s, background 0.16s, transform 0.16s;
+}
+
+.drawer-log-item:hover,
+.drawer-log-item.active {
+  border-color: rgba(98, 214, 255, 0.28);
+  background: rgba(98, 214, 255, 0.075);
+}
+
+.drawer-log-item.pulse {
+  border-color: rgba(98, 214, 255, 0.62);
+  box-shadow:
+    0 0 0 1px rgba(98, 214, 255, 0.22),
+    0 0 22px rgba(98, 214, 255, 0.18);
+  animation: drawer-log-pulse 0.9s ease-in-out 2;
+}
+
+.drawer-log-item:hover {
+  transform: translateX(-2px);
+}
+
+.drawer-log-title,
+.drawer-log-meta,
+.drawer-log-tags {
+  display: block;
+}
+
+.drawer-log-title {
+  overflow: hidden;
+  color: #eef6ff;
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drawer-log-meta {
+  margin-top: 4px;
+  color: rgba(238, 246, 255, 0.34);
+  font-size: 11px;
+}
+
+.drawer-log-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.drawer-log-tags i,
+.drawer-log-tags small {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  background: rgba(255, 255, 255, 0.025);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.drawer-log-tags small {
+  border-color: rgba(238, 246, 255, 0.14);
+  color: rgba(238, 246, 255, 0.45);
+}
+
+.drawer-log-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 9px;
+}
+
+.drawer-log-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: #62d6ff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.drawer-log-actions button:hover {
+  color: #9be9ff;
+}
+
+@keyframes drawer-log-pulse {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  50% {
+    transform: translateX(-3px);
+  }
 }
 
 .chip-list {

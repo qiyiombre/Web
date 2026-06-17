@@ -53,6 +53,14 @@ export interface TagSimilarity {
 
 export type LayoutMode = 'semantic' | 'domain';
 
+export type InsightTimeFilter = 'week' | 'month' | 'quarter' | 'custom';
+
+export interface InsightRangePayload {
+  timeFilter: InsightTimeFilter;
+  customStartDate?: string;
+  customEndDate?: string;
+}
+
 export interface UserPreferences {
   rendererMode: 'canvas' | 'webgpu';
   layoutMode: LayoutMode;
@@ -63,6 +71,12 @@ export interface UserPreferences {
   insightTopLimit: number;
   insightTrendLimit: number;
   insightCooccurrenceLimit: number;
+  nebulaPriorityDisplayLimit: number;
+  nebulaHeatWindowDays: number;
+  nebulaHeatMinimumDelta: number;
+  nebulaHeatMediumDelta: number;
+  nebulaHeatStrongDelta: number;
+  nebulaHeatFlatOpacity: number;
   sortMode: 'layout' | 'frequency' | 'lowFrequency' | 'recent';
   customStartDate: string;
   customEndDate: string;
@@ -179,12 +193,14 @@ export interface Insight {
   cooccurrence: Array<{ tagA: string; tagB: string; count: number }>;
   suggestions: string[];
   adviceMeta?: AiMeta;
+  range?: InsightRangePayload;
 }
 
 export interface AdviceResponse {
   cached: boolean;
   suggestions: string[];
   aiMeta: AiMeta;
+  range?: InsightRangePayload;
 }
 
 export interface DraftLog {

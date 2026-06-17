@@ -43,7 +43,10 @@ export const useMapsStore = defineStore('maps', () => {
     return graph.value;
   });
 
-  async function fetchMaps() {
+  async function fetchMaps(options: { force?: boolean } = {}) {
+    if (!options.force && maps.value.length > 0) {
+      return;
+    }
     loading.value = true;
     error.value = '';
     try {
@@ -55,9 +58,12 @@ export const useMapsStore = defineStore('maps', () => {
     }
   }
 
-  async function selectMap(id: number) {
+  async function selectMap(id: number, options: { force?: boolean } = {}) {
     activeMapId.value = id;
     localStorage.setItem('nebula.lastActiveMapId', String(id));
+    if (!options.force && graph.value?.map.id === id) {
+      return;
+    }
     layoutDirty.value = false;
     error.value = '';
     loading.value = true;
@@ -130,7 +136,7 @@ export const useMapsStore = defineStore('maps', () => {
 
   async function refreshData() {
     if (activeMapId.value) {
-      await selectMap(activeMapId.value);
+      await selectMap(activeMapId.value, { force: true });
     }
   }
 

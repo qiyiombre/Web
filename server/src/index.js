@@ -273,7 +273,15 @@ app.get(
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
-    res.json(await buildInsights(mapId));
+    const range =
+      'timeFilter' in req.query || 'customStartDate' in req.query || 'customEndDate' in req.query
+        ? {
+            timeFilter: firstQueryValue(req.query.timeFilter),
+            customStartDate: firstQueryValue(req.query.customStartDate),
+            customEndDate: firstQueryValue(req.query.customEndDate)
+          }
+        : null;
+    res.json(await buildInsights(mapId, range));
   })
 );
 
@@ -285,7 +293,7 @@ app.post(
       res.status(404).json({ message: '星云图不存在' });
       return;
     }
-    res.json(await generateAdvice(mapId));
+    res.json(await generateAdvice(mapId, req.body ?? {}));
   })
 );
 
@@ -1061,6 +1069,15 @@ function normalizeUserPreferences(body) {
     clampInteger(source.lowFrequencyMaximum, 1, 98, 1),
     Math.max(1, highFrequencyMinimum - 1)
   );
+  const nebulaHeatMinimumDelta = clampInteger(source.nebulaHeatMinimumDelta, 1, 99, 1);
+  const nebulaHeatMediumDelta = Math.max(
+    nebulaHeatMinimumDelta,
+    clampInteger(source.nebulaHeatMediumDelta, 1, 99, 2)
+  );
+  const nebulaHeatStrongDelta = Math.max(
+    nebulaHeatMediumDelta,
+    clampInteger(source.nebulaHeatStrongDelta, 1, 99, 4)
+  );
   return {
     rendererMode: source.rendererMode === 'webgpu' ? 'webgpu' : 'canvas',
     layoutMode: source.layoutMode === 'domain' ? 'domain' : 'semantic',
@@ -1071,6 +1088,12 @@ function normalizeUserPreferences(body) {
     insightTopLimit: clampInteger(source.insightTopLimit, 3, 20, 8),
     insightTrendLimit: clampInteger(source.insightTrendLimit, 3, 20, 5),
     insightCooccurrenceLimit: clampInteger(source.insightCooccurrenceLimit, 3, 20, 8),
+    nebulaPriorityDisplayLimit: clampInteger(source.nebulaPriorityDisplayLimit, 0, 30, 8),
+    nebulaHeatWindowDays: clampInteger(source.nebulaHeatWindowDays, 1, 90, 7),
+    nebulaHeatMinimumDelta,
+    nebulaHeatMediumDelta,
+    nebulaHeatStrongDelta,
+    nebulaHeatFlatOpacity: clampInteger(source.nebulaHeatFlatOpacity, 5, 80, 28),
     sortMode: ['frequency', 'lowFrequency', 'recent'].includes(source.sortMode) ? source.sortMode : 'layout',
     customStartDate: normalizeIsoDate(source.customStartDate),
     customEndDate: normalizeIsoDate(source.customEndDate)
@@ -1088,6 +1111,10 @@ function clampInteger(value, min, max, fallback) {
 function normalizeIsoDate(value) {
   const clean = String(value ?? '').trim();
   return /^\d{4}-\d{2}-\d{2}$/.test(clean) ? clean : '';
+}
+
+function firstQueryValue(value) {
+  return Array.isArray(value) ? value[0] : value;
 }
 
 function normalizeLogPayload(body, { requireMapId }) {

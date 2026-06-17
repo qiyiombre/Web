@@ -15,6 +15,12 @@ const DEFAULT_LOW_FREQUENCY_MAXIMUM = 1;
 const DEFAULT_INSIGHT_TOP_LIMIT = 8;
 const DEFAULT_INSIGHT_TREND_LIMIT = 5;
 const DEFAULT_INSIGHT_COOCCURRENCE_LIMIT = 8;
+const DEFAULT_NEBULA_PRIORITY_DISPLAY_LIMIT = 8;
+const DEFAULT_NEBULA_HEAT_WINDOW_DAYS = 7;
+const DEFAULT_NEBULA_HEAT_MINIMUM_DELTA = 1;
+const DEFAULT_NEBULA_HEAT_MEDIUM_DELTA = 2;
+const DEFAULT_NEBULA_HEAT_STRONG_DELTA = 4;
+const DEFAULT_NEBULA_HEAT_FLAT_OPACITY = 28;
 
 function readPositiveInteger(key: string, fallback: number, min: number, max = 99): number {
   const raw = Number(localStorage.getItem(key));
@@ -83,6 +89,26 @@ function matchesFrequencyFilter(count: number, thresholds: { high: number; low: 
   return count > 0 && count <= thresholds.low;
 }
 
+function resolveDomainCategoryTagIds(category: DomainCategory, graph: GraphData | null) {
+  if (!graph) return [];
+  const cleanName = String(category.name ?? '').trim().toLowerCase();
+  const matchingGroup = graph.tagGroups.find((group) => group.name.trim().toLowerCase() === cleanName);
+  if (matchingGroup?.tagIds.length) {
+    const visibleIds = new Set(graph.tags.map((tag) => tag.id));
+    return matchingGroup.tagIds.filter((id) => visibleIds.has(id));
+  }
+  const keywords = [category.name, ...(category.keywords ?? [])]
+    .map((value) => String(value ?? '').trim().toLowerCase())
+    .filter(Boolean);
+  if (keywords.length === 0) return [];
+  return graph.tags
+    .filter((tag) => {
+      const name = tag.name.trim().toLowerCase();
+      return keywords.some((keyword) => name.includes(keyword) || keyword.includes(name));
+    })
+    .map((tag) => tag.id);
+}
+
 function sortTagsForPriority(tags: TagNode[], logs: LogEntry[], mode: NebulaSortMode): TagNode[] {
   const stats = buildTagUsageStats(logs);
   const list = [...tags].map(t => ({ tag: t, stats: stats.get(t.id) }));
@@ -108,11 +134,19 @@ export const useGraphStore = defineStore('graph', () => {
   const insightTopLimit = ref(readPositiveInteger('nebula.insightTopLimit', DEFAULT_INSIGHT_TOP_LIMIT, 3, 20));
   const insightTrendLimit = ref(readPositiveInteger('nebula.insightTrendLimit', DEFAULT_INSIGHT_TREND_LIMIT, 3, 20));
   const insightCooccurrenceLimit = ref(readPositiveInteger('nebula.insightCooccurrenceLimit', DEFAULT_INSIGHT_COOCCURRENCE_LIMIT, 3, 20));
+  const nebulaPriorityDisplayLimit = ref(readPositiveInteger('nebula.priorityDisplayLimit', DEFAULT_NEBULA_PRIORITY_DISPLAY_LIMIT, 0, 30));
+  const nebulaHeatWindowDays = ref(readPositiveInteger('nebula.heatWindowDays', DEFAULT_NEBULA_HEAT_WINDOW_DAYS, 1, 90));
+  const nebulaHeatMinimumDelta = ref(readPositiveInteger('nebula.heatMinimumDelta', DEFAULT_NEBULA_HEAT_MINIMUM_DELTA, 1, 99));
+  const nebulaHeatMediumDelta = ref(readPositiveInteger('nebula.heatMediumDelta', DEFAULT_NEBULA_HEAT_MEDIUM_DELTA, 1, 99));
+  const nebulaHeatStrongDelta = ref(readPositiveInteger('nebula.heatStrongDelta', DEFAULT_NEBULA_HEAT_STRONG_DELTA, 1, 99));
+  const nebulaHeatFlatOpacity = ref(readPositiveInteger('nebula.heatFlatOpacity', DEFAULT_NEBULA_HEAT_FLAT_OPACITY, 5, 80));
   const sortMode = ref<NebulaSortMode>('layout');
   const customStartDate = ref('');
   const customEndDate = ref('');
   const relatedPage = ref(0);
   const nebulaLogCard = ref<{ logId: number; x: number; y: number; width?: number; height?: number } | null>(null);
+  const domainFocusTagIds = ref<Set<number>>(new Set());
+  let domainFocusTimer: number | null = null;
 
   function initFromLocalStorage() {
     const savedTimeFilter = localStorage.getItem('nebula.timeFilter');
@@ -136,6 +170,18 @@ export const useGraphStore = defineStore('graph', () => {
     insightTopLimit.value = readPositiveInteger('nebula.insightTopLimit', DEFAULT_INSIGHT_TOP_LIMIT, 3, 20);
     insightTrendLimit.value = readPositiveInteger('nebula.insightTrendLimit', DEFAULT_INSIGHT_TREND_LIMIT, 3, 20);
     insightCooccurrenceLimit.value = readPositiveInteger('nebula.insightCooccurrenceLimit', DEFAULT_INSIGHT_COOCCURRENCE_LIMIT, 3, 20);
+    nebulaPriorityDisplayLimit.value = readPositiveInteger('nebula.priorityDisplayLimit', DEFAULT_NEBULA_PRIORITY_DISPLAY_LIMIT, 0, 30);
+    nebulaHeatWindowDays.value = readPositiveInteger('nebula.heatWindowDays', DEFAULT_NEBULA_HEAT_WINDOW_DAYS, 1, 90);
+    nebulaHeatMinimumDelta.value = readPositiveInteger('nebula.heatMinimumDelta', DEFAULT_NEBULA_HEAT_MINIMUM_DELTA, 1, 99);
+    nebulaHeatMediumDelta.value = Math.max(
+      nebulaHeatMinimumDelta.value,
+      readPositiveInteger('nebula.heatMediumDelta', DEFAULT_NEBULA_HEAT_MEDIUM_DELTA, 1, 99)
+    );
+    nebulaHeatStrongDelta.value = Math.max(
+      nebulaHeatMediumDelta.value,
+      readPositiveInteger('nebula.heatStrongDelta', DEFAULT_NEBULA_HEAT_STRONG_DELTA, 1, 99)
+    );
+    nebulaHeatFlatOpacity.value = readPositiveInteger('nebula.heatFlatOpacity', DEFAULT_NEBULA_HEAT_FLAT_OPACITY, 5, 80);
     if (savedSortMode === 'frequency' || savedSortMode === 'lowFrequency' || savedSortMode === 'recent') {
       sortMode.value = savedSortMode;
     }
@@ -151,6 +197,12 @@ export const useGraphStore = defineStore('graph', () => {
     localStorage.setItem('nebula.insightTopLimit', String(insightTopLimit.value));
     localStorage.setItem('nebula.insightTrendLimit', String(insightTrendLimit.value));
     localStorage.setItem('nebula.insightCooccurrenceLimit', String(insightCooccurrenceLimit.value));
+    localStorage.setItem('nebula.priorityDisplayLimit', String(nebulaPriorityDisplayLimit.value));
+    localStorage.setItem('nebula.heatWindowDays', String(nebulaHeatWindowDays.value));
+    localStorage.setItem('nebula.heatMinimumDelta', String(nebulaHeatMinimumDelta.value));
+    localStorage.setItem('nebula.heatMediumDelta', String(nebulaHeatMediumDelta.value));
+    localStorage.setItem('nebula.heatStrongDelta', String(nebulaHeatStrongDelta.value));
+    localStorage.setItem('nebula.heatFlatOpacity', String(nebulaHeatFlatOpacity.value));
     localStorage.setItem('nebula.sortMode', sortMode.value);
     localStorage.setItem('nebula.customStartDate', customStartDate.value);
     localStorage.setItem('nebula.customEndDate', customEndDate.value);
@@ -197,6 +249,63 @@ export const useGraphStore = defineStore('graph', () => {
     persistToLocalStorage();
   }
 
+  function setNebulaPriorityDisplayLimit(value: number) {
+    const parsed = Math.round(Number(value));
+    nebulaPriorityDisplayLimit.value = Number.isFinite(parsed)
+      ? Math.min(30, Math.max(0, parsed))
+      : DEFAULT_NEBULA_PRIORITY_DISPLAY_LIMIT;
+    persistToLocalStorage();
+  }
+
+  function setNebulaHeatWindowDays(value: number) {
+    const parsed = Math.round(Number(value));
+    nebulaHeatWindowDays.value = Number.isFinite(parsed)
+      ? Math.min(90, Math.max(1, parsed))
+      : DEFAULT_NEBULA_HEAT_WINDOW_DAYS;
+    persistToLocalStorage();
+  }
+
+  function setNebulaHeatMinimumDelta(value: number) {
+    const parsed = Math.round(Number(value));
+    nebulaHeatMinimumDelta.value = Number.isFinite(parsed)
+      ? Math.min(99, Math.max(1, parsed))
+      : DEFAULT_NEBULA_HEAT_MINIMUM_DELTA;
+    if (nebulaHeatMediumDelta.value < nebulaHeatMinimumDelta.value) {
+      nebulaHeatMediumDelta.value = nebulaHeatMinimumDelta.value;
+    }
+    if (nebulaHeatStrongDelta.value < nebulaHeatMediumDelta.value) {
+      nebulaHeatStrongDelta.value = nebulaHeatMediumDelta.value;
+    }
+    persistToLocalStorage();
+  }
+
+  function setNebulaHeatMediumDelta(value: number) {
+    const parsed = Math.round(Number(value));
+    nebulaHeatMediumDelta.value = Number.isFinite(parsed)
+      ? Math.min(99, Math.max(nebulaHeatMinimumDelta.value, parsed))
+      : DEFAULT_NEBULA_HEAT_MEDIUM_DELTA;
+    if (nebulaHeatStrongDelta.value < nebulaHeatMediumDelta.value) {
+      nebulaHeatStrongDelta.value = nebulaHeatMediumDelta.value;
+    }
+    persistToLocalStorage();
+  }
+
+  function setNebulaHeatStrongDelta(value: number) {
+    const parsed = Math.round(Number(value));
+    nebulaHeatStrongDelta.value = Number.isFinite(parsed)
+      ? Math.min(99, Math.max(nebulaHeatMediumDelta.value, parsed))
+      : DEFAULT_NEBULA_HEAT_STRONG_DELTA;
+    persistToLocalStorage();
+  }
+
+  function setNebulaHeatFlatOpacity(value: number) {
+    const parsed = Math.round(Number(value));
+    nebulaHeatFlatOpacity.value = Number.isFinite(parsed)
+      ? Math.min(80, Math.max(5, parsed))
+      : DEFAULT_NEBULA_HEAT_FLAT_OPACITY;
+    persistToLocalStorage();
+  }
+
   function setSortMode(mode: NebulaSortMode) {
     sortMode.value = mode;
     persistToLocalStorage();
@@ -222,11 +331,15 @@ export const useGraphStore = defineStore('graph', () => {
 
   function focusDomainCategory(category: DomainCategory) {
     const mapsStore = useMapsStore();
-    if (!mapsStore.graph) return;
-    const matchIds = mapsStore.graph.tags
-      .filter(tag => category.keywords.some(kw => tag.name.toLowerCase().includes(kw.toLowerCase())))
-      .map(t => t.id);
-    activeTagIds.value = new Set(matchIds);
+    const matchIds = resolveDomainCategoryTagIds(category, filteredGraph.value ?? mapsStore.graph);
+    domainFocusTagIds.value = new Set(matchIds);
+    if (domainFocusTimer !== null) {
+      window.clearTimeout(domainFocusTimer);
+    }
+    domainFocusTimer = window.setTimeout(() => {
+      domainFocusTagIds.value = new Set();
+      domainFocusTimer = null;
+    }, 2200);
   }
 
   // --- Computed filtered graph ---
@@ -389,11 +502,18 @@ export const useGraphStore = defineStore('graph', () => {
     insightTopLimit,
     insightTrendLimit,
     insightCooccurrenceLimit,
+    nebulaPriorityDisplayLimit,
+    nebulaHeatWindowDays,
+    nebulaHeatMinimumDelta,
+    nebulaHeatMediumDelta,
+    nebulaHeatStrongDelta,
+    nebulaHeatFlatOpacity,
     sortMode,
     customStartDate,
     customEndDate,
     relatedPage,
     nebulaLogCard,
+    domainFocusTagIds,
     filteredGraph,
     filteredLogs,
     activeTags,
@@ -415,6 +535,12 @@ export const useGraphStore = defineStore('graph', () => {
     setInsightTopLimit,
     setInsightTrendLimit,
     setInsightCooccurrenceLimit,
+    setNebulaPriorityDisplayLimit,
+    setNebulaHeatWindowDays,
+    setNebulaHeatMinimumDelta,
+    setNebulaHeatMediumDelta,
+    setNebulaHeatStrongDelta,
+    setNebulaHeatFlatOpacity,
     setSortMode,
     toggleTag,
     clearActiveTags,

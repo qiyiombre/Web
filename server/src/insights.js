@@ -1,13 +1,25 @@
 import { getAiCache, listLogs, listTagTrends, listTags, listTopTagPairs, setAiCache } from './db.js';
 import { callDeepSeekJson, hasDeepSeekKey } from './deepseek.js';
 
-export async function buildInsights(mapId) {
-  const [stats, recentLogs] = await Promise.all([buildInsightStats(mapId), buildRecentLogs(mapId)]);
-  const cached = await getCachedAdvice(mapId, stats, recentLogs);
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export async function buildInsights(mapId, rangeInput = null) {
+  const range = rangeInput ? normalizeInsightRange(rangeInput, 'week') : null;
+  const [stats, recentLogs] = range
+    ? await Promise.all([buildRangeInsightStats(mapId, range), buildRecentLogs(mapId, range)])
+    : await Promise.all([buildInsightStats(mapId), buildRecentLogs(mapId)]);
+  const cached = await getCachedAdvice(mapId, stats, recentLogs, range);
 
   return {
     ...stats,
     suggestions: cached,
+    range: range
+      ? {
+          timeFilter: range.timeFilter,
+          customStartDate: range.customStartDate,
+          customEndDate: range.customEndDate
+        }
+      : undefined,
     adviceMeta:
       cached.length > 0
         ? {
@@ -25,14 +37,20 @@ export async function buildInsights(mapId) {
   };
 }
 
-export async function generateAdvice(mapId) {
-  const [stats, recentLogs] = await Promise.all([buildInsightStats(mapId), buildRecentLogs(mapId)]);
-  const cached = await getCachedAdvice(mapId, stats, recentLogs);
+export async function generateAdvice(mapId, rangeInput = {}) {
+  const range = normalizeInsightRange(rangeInput, 'month');
+  const [stats, recentLogs] = await Promise.all([buildRangeInsightStats(mapId, range), buildRecentLogs(mapId, range)]);
+  const cached = await getCachedAdvice(mapId, stats, recentLogs, range);
 
   if (cached.length > 0) {
     return {
       cached: true,
       suggestions: cached,
+      range: {
+        timeFilter: range.timeFilter,
+        customStartDate: range.customStartDate,
+        customEndDate: range.customEndDate
+      },
       aiMeta: {
         feature: 'advice',
         source: 'cache',
@@ -46,6 +64,11 @@ export async function generateAdvice(mapId) {
     return {
       cached: false,
       suggestions: ['未配置 DeepSeek API Key，暂不生成 AI 建议。'],
+      range: {
+        timeFilter: range.timeFilter,
+        customStartDate: range.customStartDate,
+        customEndDate: range.customEndDate
+      },
       aiMeta: {
         feature: 'advice',
         source: 'local',
@@ -81,11 +104,16 @@ ${JSON.stringify(recentLogs)}`,
     const value = {
       suggestions: suggestions.length > 0 ? suggestions : ['DeepSeek 暂未生成有效建议，请继续记录更多日志。']
     };
-    await setAiCache(buildAdviceCacheKey(mapId, stats, recentLogs), value);
+    await setAiCache(buildAdviceCacheKey(mapId, stats, recentLogs, range), value);
 
     return {
       cached: false,
       suggestions: value.suggestions,
+      range: {
+        timeFilter: range.timeFilter,
+        customStartDate: range.customStartDate,
+        customEndDate: range.customEndDate
+      },
       aiMeta: {
         feature: 'advice',
         source: 'deepseek',
@@ -98,6 +126,11 @@ ${JSON.stringify(recentLogs)}`,
     return {
       cached: false,
       suggestions: ['DeepSeek 建议生成失败，请检查 API Key 或网络后重试。'],
+      range: {
+        timeFilter: range.timeFilter,
+        customStartDate: range.customStartDate,
+        customEndDate: range.customEndDate
+      },
       aiMeta: {
         feature: 'advice',
         source: 'local',
@@ -108,13 +141,14 @@ ${JSON.stringify(recentLogs)}`,
   }
 }
 
-async function getCachedAdvice(mapId, stats, recentLogs) {
-  const cached = await getAiCache(buildAdviceCacheKey(mapId, stats, recentLogs));
+async function getCachedAdvice(mapId, stats, recentLogs, range = null) {
+  const cached = await getAiCache(buildAdviceCacheKey(mapId, stats, recentLogs, range));
   return normalizeSuggestions(cached?.suggestions);
 }
 
-async function buildRecentLogs(mapId) {
+async function buildRecentLogs(mapId, range = null) {
   return (await listLogs(mapId))
+    .filter((log) => matchesPeriod(log, range?.current))
     .slice(0, 8)
     .map((log) => ({
       title: log.title,
@@ -122,6 +156,51 @@ async function buildRecentLogs(mapId) {
       tags: log.tags.map((tag) => tag.name),
       createdAt: log.createdAt
     }));
+}
+
+async function buildRangeInsightStats(mapId, range) {
+  const [tags, logs] = await Promise.all([listTags(mapId), listLogs(mapId)]);
+  const currentLogs = logs.filter((log) => matchesPeriod(log, range.current));
+  const previousLogs = logs.filter((log) => matchesPeriod(log, range.previous));
+  const currentUsage = buildUsageByTag(currentLogs);
+  const previousUsage = buildUsageByTag(previousLogs);
+  const topTags = tags
+    .map((tag) => ({ ...tag, count: currentUsage.get(tag.id) ?? 0 }))
+    .filter((tag) => tag.count > 0)
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, 6);
+  const trendRows = tags.map((tag) => {
+    const current = currentUsage.get(tag.id) ?? 0;
+    const previous = previousUsage.get(tag.id) ?? 0;
+    return {
+      id: tag.id,
+      name: tag.name,
+      color: tag.color,
+      current,
+      previous,
+      delta: current - previous
+    };
+  });
+  const risingTags = trendRows
+    .filter((row) => row.delta > 0)
+    .sort((a, b) => b.delta - a.delta || b.current - a.current)
+    .slice(0, 4);
+  const fallingTags = trendRows
+    .filter((row) => row.previous > 0 && row.delta < 0)
+    .sort((a, b) => a.delta - b.delta || b.previous - a.previous)
+    .slice(0, 4);
+
+  return {
+    topTags,
+    risingTags,
+    fallingTags,
+    cooccurrence: buildCooccurrence(currentLogs).slice(0, 6),
+    range: {
+      timeFilter: range.timeFilter,
+      customStartDate: range.customStartDate,
+      customEndDate: range.customEndDate
+    }
+  };
 }
 
 async function buildInsightStats(mapId) {
@@ -159,8 +238,93 @@ function normalizeSuggestions(items) {
     .slice(0, 5);
 }
 
-function buildAdviceCacheKey(mapId, stats, recentLogs) {
-  return `deepseek:advice:${mapId}:${hashString(JSON.stringify({ stats, recentLogs }))}`;
+function buildUsageByTag(logs) {
+  const usage = new Map();
+  for (const log of logs) {
+    const seen = new Set();
+    for (const tag of log.tags ?? []) {
+      if (seen.has(tag.id)) continue;
+      seen.add(tag.id);
+      usage.set(tag.id, (usage.get(tag.id) ?? 0) + 1);
+    }
+  }
+  return usage;
+}
+
+function buildCooccurrence(logs) {
+  const pairs = new Map();
+  for (const log of logs) {
+    const tags = [...(log.tags ?? [])].sort((a, b) => a.id - b.id);
+    for (let i = 0; i < tags.length; i += 1) {
+      for (let j = i + 1; j < tags.length; j += 1) {
+        const key = `${tags[i].id}:${tags[j].id}`;
+        const item = pairs.get(key) ?? { tagA: tags[i].name, tagB: tags[j].name, count: 0 };
+        item.count += 1;
+        pairs.set(key, item);
+      }
+    }
+  }
+  return [...pairs.values()].sort((a, b) => b.count - a.count || a.tagA.localeCompare(b.tagA));
+}
+
+function normalizeInsightRange(input = {}, fallback = 'month') {
+  const timeFilter = ['week', 'month', 'quarter', 'custom'].includes(input.timeFilter)
+    ? input.timeFilter
+    : fallback;
+  const customStartDate = normalizeDate(input.customStartDate);
+  const customEndDate = normalizeDate(input.customEndDate);
+  const current = buildCurrentPeriod(timeFilter, customStartDate, customEndDate);
+  return {
+    timeFilter,
+    customStartDate,
+    customEndDate,
+    current,
+    previous: buildPreviousPeriod(current)
+  };
+}
+
+function normalizeDate(value) {
+  const text = String(value ?? '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : '';
+}
+
+function buildCurrentPeriod(timeFilter, customStartDate, customEndDate) {
+  const now = Date.now();
+  if (timeFilter === 'custom') {
+    const start = dateBoundary(customStartDate);
+    const end = dateBoundary(customEndDate, true);
+    if (start === null && end === null) return null;
+    return { start, end };
+  }
+  const ms = timeFilter === 'week' ? 7 * DAY_MS : timeFilter === 'quarter' ? 90 * DAY_MS : 30 * DAY_MS;
+  return { start: now - ms, end: now };
+}
+
+function buildPreviousPeriod(period) {
+  if (!period || period.start === null || period.end === null || period.end <= period.start) {
+    return null;
+  }
+  const duration = period.end - period.start;
+  return { start: period.start - duration, end: period.start };
+}
+
+function dateBoundary(value, endOfDay = false) {
+  if (!value) return null;
+  const time = new Date(`${value}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}`).getTime();
+  return Number.isNaN(time) ? null : time;
+}
+
+function matchesPeriod(log, period) {
+  if (!period) return true;
+  const time = new Date(log.createdAt).getTime();
+  if (Number.isNaN(time)) return true;
+  if (period.start !== null && time < period.start) return false;
+  if (period.end !== null && time > period.end) return false;
+  return true;
+}
+
+function buildAdviceCacheKey(mapId, stats, recentLogs, range = null) {
+  return `deepseek:advice:${mapId}:${hashString(JSON.stringify({ range, stats, recentLogs }))}`;
 }
 
 function hashString(value) {
