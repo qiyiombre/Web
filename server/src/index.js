@@ -1081,6 +1081,7 @@ function normalizeUserPreferences(body) {
   return {
     rendererMode: source.rendererMode === 'webgpu' ? 'webgpu' : 'canvas',
     layoutMode: source.layoutMode === 'domain' ? 'domain' : 'semantic',
+    themeMode: ['obsidian', 'ember', 'moss', 'burgundy'].includes(source.themeMode) ? source.themeMode : 'deepSpace',
     timeFilter: ['week', 'month', 'quarter', 'custom'].includes(source.timeFilter) ? source.timeFilter : 'all',
     frequencyFilter: source.frequencyFilter === 'high' || source.frequencyFilter === 'low' ? source.frequencyFilter : 'all',
     highFrequencyMinimum,
@@ -1094,6 +1095,7 @@ function normalizeUserPreferences(body) {
     nebulaHeatMediumDelta,
     nebulaHeatStrongDelta,
     nebulaHeatFlatOpacity: clampInteger(source.nebulaHeatFlatOpacity, 5, 80, 28),
+    nebulaLogDensityMode: source.nebulaLogDensityMode === 'single' ? 'single' : 'auto',
     sortMode: ['frequency', 'lowFrequency', 'recent'].includes(source.sortMode) ? source.sortMode : 'layout',
     customStartDate: normalizeIsoDate(source.customStartDate),
     customEndDate: normalizeIsoDate(source.customEndDate)

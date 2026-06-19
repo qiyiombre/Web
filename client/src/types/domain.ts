@@ -52,6 +52,7 @@ export interface TagSimilarity {
 }
 
 export type LayoutMode = 'semantic' | 'domain';
+export type ThemeMode = 'deepSpace' | 'obsidian' | 'ember' | 'moss' | 'burgundy';
 
 export type InsightTimeFilter = 'week' | 'month' | 'quarter' | 'custom';
 
@@ -64,6 +65,7 @@ export interface InsightRangePayload {
 export interface UserPreferences {
   rendererMode: 'canvas' | 'webgpu';
   layoutMode: LayoutMode;
+  themeMode: ThemeMode;
   timeFilter: 'all' | 'week' | 'month' | 'quarter' | 'custom';
   frequencyFilter: 'all' | 'high' | 'low';
   highFrequencyMinimum: number;
@@ -77,6 +79,7 @@ export interface UserPreferences {
   nebulaHeatMediumDelta: number;
   nebulaHeatStrongDelta: number;
   nebulaHeatFlatOpacity: number;
+  nebulaLogDensityMode: 'auto' | 'single';
   sortMode: 'layout' | 'frequency' | 'lowFrequency' | 'recent';
   customStartDate: string;
   customEndDate: string;

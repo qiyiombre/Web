@@ -41,6 +41,9 @@ const adviceLoading = ref(false);
 const advice = ref<string[]>([]);
 const adviceCached = ref(false);
 const adviceRangeAtGeneration = ref('');
+const topTagsTimeFilter = ref<InsightTimeFilter>('month');
+const topTagsCustomStartDate = ref('');
+const topTagsCustomEndDate = ref('');
 const trendTimeFilter = ref<InsightTimeFilter>('week');
 const trendCustomStartDate = ref('');
 const trendCustomEndDate = ref('');
@@ -77,7 +80,20 @@ watch([adviceTimeFilter, adviceCustomStartDate, adviceCustomEndDate], () => {
 
 const insights = computed(() => mapsStore.insights);
 const graph = computed(() => mapsStore.graph);
-const topTags = computed(() => insights.value?.topTags.slice(0, graphStore.insightTopLimit) ?? []);
+const topTagsRangeLogs = computed(() =>
+  filterLogsByRange(
+    graph.value?.logs ?? [],
+    topTagsTimeFilter.value,
+    topTagsCustomStartDate.value,
+    topTagsCustomEndDate.value
+  )
+);
+const topTags = computed(() =>
+  buildTagUsageRows(graph.value?.tags ?? [], topTagsRangeLogs.value)
+    .filter((tag) => tag.count > 0)
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, graphStore.insightTopLimit)
+);
 const trendLogs = computed(() =>
   currentAndPreviousLogs(
     graph.value?.logs ?? [],
@@ -139,8 +155,37 @@ const recentActivityDays = computed(() =>
 );
 const maxRecentActivity = computed(() => Math.max(1, ...recentActivityDays.value.map(day => day.count)));
 const activeRecentDayCount = computed(() => recentActivityDays.value.filter(day => day.count > 0).length);
+const averageRecentActivity = computed(() => {
+  const days = recentActivityDays.value;
+  if (!days.length) return 0;
+  return days.reduce((sum, day) => sum + day.count, 0) / days.length;
+});
+const activityAverageLabel = computed(() => averageRecentActivity.value.toFixed(1));
+const activityAveragePercent = computed(() => {
+  if (!maxRecentActivity.value) return 0;
+  return Math.max(6, Math.min(100, Math.round((averageRecentActivity.value / maxRecentActivity.value) * 100)));
+});
+const activityAverageOffset = computed(() => `${Math.max(0, Math.round(58 - (activityAveragePercent.value / 100) * 58))}px`);
+const activityCoveragePercent = computed(() => {
+  const total = recentActivityDays.value.length;
+  if (!total) return 0;
+  return Math.round((activeRecentDayCount.value / total) * 100);
+});
+const longestInactiveStreak = computed(() => {
+  let current = 0;
+  let longest = 0;
+  for (const day of recentActivityDays.value) {
+    if (day.count === 0) {
+      current += 1;
+      longest = Math.max(longest, current);
+    } else {
+      current = 0;
+    }
+  }
+  return longest;
+});
 const mostActiveRecentDay = computed(() => (
-  recentActivityDays.value.reduce((best, day) => (day.count > best.count ? day : best), recentActivityDays.value[0] ?? { label: '-', count: 0 })
+  recentActivityDays.value.reduce((best, day) => (day.count > best.count ? day : best), recentActivityDays.value[0] ?? { key: '-', label: '-', count: 0 })
 ));
 const latestActivityLabel = computed(() => {
   const latest = recentLogs.value[0];
@@ -152,13 +197,23 @@ const latestActivityLabel = computed(() => {
 });
 const cooccurrenceMax = computed(() => Math.max(1, cooccurrenceItems.value[0]?.count ?? 1));
 const cooccurrenceStrengths = computed(() => (
-  cooccurrenceItems.value.slice(0, 5).map(pair => ({
+  cooccurrenceItems.value.slice(0, graphStore.insightCooccurrenceLimit).map(pair => ({
     ...pair,
     percent: Math.max(8, Math.round((pair.count / cooccurrenceMax.value) * 100))
   }))
 ));
+const topTagsRangeLabel = computed(() => rangeLabel(topTagsTimeFilter.value, topTagsCustomStartDate.value, topTagsCustomEndDate.value));
 const trendRangeLabel = computed(() => rangeLabel(trendTimeFilter.value, trendCustomStartDate.value, trendCustomEndDate.value));
 const activityRangeLabel = computed(() => rangeLabel(activityTimeFilter.value, activityCustomStartDate.value, activityCustomEndDate.value));
+const activityColumnCount = computed(() => {
+  const count = recentActivityDays.value.length;
+  if (activityTimeFilter.value === 'week') return Math.max(1, Math.min(7, count));
+  if (activityTimeFilter.value === 'month') return 5;
+  if (activityTimeFilter.value === 'quarter') return 6;
+  if (count <= 7) return Math.max(1, count);
+  if (count <= 15) return 5;
+  return 6;
+});
 const cooccurrenceRangeLabel = computed(() => rangeLabel(cooccurrenceTimeFilter.value, cooccurrenceCustomStartDate.value, cooccurrenceCustomEndDate.value));
 const adviceRangeLabel = computed(() => rangeLabel(adviceTimeFilter.value, adviceCustomStartDate.value, adviceCustomEndDate.value));
 
@@ -330,6 +385,14 @@ function buildUsageByTag(logs: LogEntry[]) {
   return usage;
 }
 
+function buildTagUsageRows(tags: TagNode[], logs: LogEntry[]): TagNode[] {
+  const usage = buildUsageByTag(logs);
+  return tags.map((tag) => ({
+    ...tag,
+    count: usage.get(tag.id) ?? 0
+  }));
+}
+
 function buildCooccurrenceItems(logs: LogEntry[]): CooccurrenceRow[] {
   const pairs = new Map<string, CooccurrenceRow>();
   for (const log of logs) {
@@ -364,7 +427,7 @@ function buildActivityBuckets(
         : new Date(today.getTime() - 6 * DAY_MS);
   const end = period.end !== null ? startOfDay(new Date(period.end)) : today;
   const dayCount = Math.max(1, Math.floor((end.getTime() - start.getTime()) / DAY_MS) + 1);
-  const bucketCount = timeFilter === 'week' ? Math.min(7, dayCount) : Math.min(12, dayCount);
+  const bucketCount = activityBucketCount(timeFilter, dayCount);
   const bucketSize = Math.max(1, Math.ceil(dayCount / bucketCount));
   const buckets: ActivityBucket[] = [];
 
@@ -382,6 +445,16 @@ function buildActivityBuckets(
     });
   }
   return buckets;
+}
+
+function activityBucketCount(timeFilter: InsightTimeFilter, dayCount: number) {
+  if (timeFilter === 'week') return Math.min(7, dayCount);
+  if (timeFilter === 'month') return Math.min(15, dayCount);
+  if (timeFilter === 'quarter') return Math.min(18, dayCount);
+  if (dayCount <= 14) return dayCount;
+  if (dayCount <= 45) return Math.min(15, dayCount);
+  if (dayCount <= 120) return Math.min(18, dayCount);
+  return Math.min(24, dayCount);
 }
 
 function startOfDay(date: Date) {
@@ -440,7 +513,7 @@ function formatBucketDate(date: Date) {
 
       <!-- Data quality -->
       <section class="insight-section quality-section">
-        <div class="section-icon" style="background: rgba(140,240,180,0.1); color: #8cf0b4;">
+        <div class="section-icon section-icon--success">
           <Tag :size="20" />
         </div>
         <div class="section-body">
@@ -474,7 +547,7 @@ function formatBucketDate(date: Date) {
             </div>
             <div class="activity-panel">
               <div class="activity-panel-head">
-                <div>
+                <div class="activity-title-block">
                   <span>写入节奏</span>
                   <strong>{{ activeRecentDayCount }}/{{ recentActivityDays.length }} 段</strong>
                 </div>
@@ -490,13 +563,52 @@ function formatBucketDate(date: Date) {
                   </button>
                 </div>
               </div>
+              <div class="activity-insight-row">
+                <div class="activity-stat-pill primary">
+                  <span>峰值</span>
+                  <strong>{{ mostActiveRecentDay.label }}</strong>
+                  <small>{{ mostActiveRecentDay.count }} 篇</small>
+                </div>
+                <div class="activity-stat-pill">
+                  <span>均值</span>
+                  <strong>{{ activityAverageLabel }}</strong>
+                  <small>篇 / 段</small>
+                </div>
+                <div class="activity-stat-pill">
+                  <span>覆盖</span>
+                  <strong>{{ activityCoveragePercent }}%</strong>
+                  <small>{{ activeRecentDayCount }} 个活跃段</small>
+                </div>
+                <div class="activity-stat-pill">
+                  <span>最长空档</span>
+                  <strong>{{ longestInactiveStreak }}</strong>
+                  <small>连续空段</small>
+                </div>
+              </div>
               <div v-if="activityTimeFilter === 'custom'" class="insight-custom-range">
                 <input v-model="activityCustomStartDate" type="date" aria-label="写入节奏开始日期" />
                 <span>至</span>
                 <input v-model="activityCustomEndDate" type="date" aria-label="写入节奏结束日期" />
               </div>
-              <div class="activity-bars" aria-label="日志写入节奏">
-                <div v-for="day in recentActivityDays" :key="day.key" class="activity-day">
+              <div
+                class="activity-bars"
+                :class="`activity-bars--${activityTimeFilter}`"
+                :style="{
+                  '--activity-columns': activityColumnCount,
+                  '--activity-average-offset': activityAverageOffset
+                }"
+                aria-label="日志写入节奏"
+              >
+                <div class="activity-average-line" :style="{ top: activityAverageOffset }">
+                  <span>均值 {{ activityAverageLabel }}</span>
+                </div>
+                <div
+                  v-for="day in recentActivityDays"
+                  :key="day.key"
+                  class="activity-day"
+                  :class="{ active: day.count > 0, peak: day.key === mostActiveRecentDay.key && mostActiveRecentDay.count > 0 }"
+                  :title="`${day.label} · ${day.count} 篇`"
+                >
                   <i>
                     <span :style="{ height: `${Math.max(8, (day.count / maxRecentActivity) * 100)}%` }" />
                   </i>
@@ -506,7 +618,7 @@ function formatBucketDate(date: Date) {
               </div>
               <div class="activity-summary">
                 <span>范围：{{ activityRangeLabel }} · 最近记录：{{ latestActivityLabel }}</span>
-                <span>峰值：{{ mostActiveRecentDay.label }} · {{ mostActiveRecentDay.count }} 篇</span>
+                <span>活跃覆盖：{{ activityCoveragePercent }}% · 最长空档 {{ longestInactiveStreak }} 段</span>
               </div>
             </div>
           </div>
@@ -515,7 +627,7 @@ function formatBucketDate(date: Date) {
 
       <!-- Recent activity -->
       <section class="insight-section recent-section">
-        <div class="section-icon" style="background: rgba(98,214,255,0.1); color: #62d6ff;">
+        <div class="section-icon section-icon--primary">
           <CalendarDays :size="20" />
         </div>
         <div class="section-body">
@@ -544,11 +656,30 @@ function formatBucketDate(date: Date) {
 
       <!-- Top tags -->
       <section class="insight-section">
-        <div class="section-icon" style="background: rgba(98,214,255,0.1); color: #62d6ff;">
+        <div class="section-icon section-icon--primary">
           <Activity :size="20" />
         </div>
         <div class="section-body">
-          <h3>高频标签</h3>
+          <div class="section-title-row">
+            <h3>高频标签</h3>
+            <div class="insight-time-control" aria-label="高频标签时间范围">
+              <button
+                v-for="option in insightTimeOptions"
+                :key="`top-tags-${option.value}`"
+                type="button"
+                :class="{ active: topTagsTimeFilter === option.value }"
+                @click="topTagsTimeFilter = option.value"
+              >
+                {{ option.label }}
+              </button>
+            </div>
+          </div>
+          <div v-if="topTagsTimeFilter === 'custom'" class="insight-custom-range">
+            <input v-model="topTagsCustomStartDate" type="date" aria-label="高频标签开始日期" />
+            <span>至</span>
+            <input v-model="topTagsCustomEndDate" type="date" aria-label="高频标签结束日期" />
+          </div>
+          <small class="section-range-hint">只统计 {{ topTagsRangeLabel }} 内的标签使用频率</small>
           <div class="tag-bars">
             <div
               v-for="tag in topTags"
@@ -568,14 +699,14 @@ function formatBucketDate(date: Date) {
               <span class="bar-count">{{ tag.count }}</span>
             </div>
           </div>
-          <p v-if="insights.topTags.length === 0" class="muted">暂无数据</p>
+          <p v-if="topTags.length === 0" class="muted">暂无数据</p>
         </div>
       </section>
 
       <!-- Rising / Falling tags -->
       <div class="insight-grid">
         <section class="insight-section">
-          <div class="section-icon" style="background: rgba(140,240,180,0.1); color: #8cf0b4;">
+          <div class="section-icon section-icon--success">
             <TrendingUp :size="20" />
           </div>
           <div class="section-body">
@@ -611,7 +742,7 @@ function formatBucketDate(date: Date) {
         </section>
 
         <section class="insight-section">
-          <div class="section-icon" style="background: rgba(255,143,163,0.1); color: #ff8fa3;">
+          <div class="section-icon section-icon--danger">
             <TrendingDown :size="20" />
           </div>
           <div class="section-body">
@@ -649,7 +780,7 @@ function formatBucketDate(date: Date) {
 
       <!-- Co-occurrence -->
       <section class="insight-section">
-        <div class="section-icon" style="background: rgba(185,156,255,0.1); color: #b99cff;">
+        <div class="section-icon section-icon--secondary">
           <Activity :size="20" />
         </div>
         <div class="section-body">
@@ -704,8 +835,8 @@ function formatBucketDate(date: Date) {
       </section>
 
       <!-- AI Advice -->
-      <section class="insight-section">
-        <div class="section-icon" style="background: rgba(247,215,116,0.1); color: #f7d774;">
+      <section class="insight-section advice-section" :class="{ loading: adviceLoading }">
+        <div class="section-icon section-icon--warning">
           <Sparkles :size="20" />
         </div>
         <div class="section-body">
@@ -740,7 +871,7 @@ function formatBucketDate(date: Date) {
             </p>
           </div>
           <p v-else class="muted">点击生成后，会基于当前范围的统计和最近日志摘要生成建议。</p>
-          <button class="generate-btn" :disabled="adviceLoading" @click="handleGenerateAdvice">
+          <button class="generate-btn" :class="{ loading: adviceLoading }" :disabled="adviceLoading" @click="handleGenerateAdvice">
             <RefreshCw :size="14" :class="{ spinning: adviceLoading }" />
             {{ adviceLoading ? '生成中...' : advice.length ? '重新生成' : '生成 AI 建议' }}
           </button>
@@ -763,8 +894,8 @@ function formatBucketDate(date: Date) {
   align-items: center;
   justify-content: space-between;
   padding: 12px 20px;
-  background: rgba(10, 20, 36, 0.9);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: color-mix(in srgb, var(--panel-bg-strong) 92%, transparent);
+  border-bottom: 1px solid var(--panel-border);
   flex-shrink: 0;
 }
 
@@ -790,18 +921,19 @@ function formatBucketDate(date: Date) {
   font-size: 11px;
   padding: 4px 12px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.05);
-  color: rgba(238, 246, 255, 0.4);
+  background: var(--control-bg);
+  color: var(--text-muted);
+  border: 1px solid var(--control-border);
 }
 
 .source-badge.AI {
-  background: rgba(185, 156, 255, 0.15);
-  color: #b99cff;
+  background: color-mix(in srgb, var(--accent-secondary) 15%, transparent);
+  color: var(--accent-secondary);
 }
 
 .source-badge.缓存 {
-  background: rgba(98, 214, 255, 0.1);
-  color: #62d6ff;
+  background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  color: var(--accent-primary);
 }
 
 .page-loading {
@@ -809,7 +941,7 @@ function formatBucketDate(date: Date) {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: rgba(238, 246, 255, 0.3);
+  color: var(--text-muted);
 }
 
 .insights-content {
@@ -836,23 +968,34 @@ function formatBucketDate(date: Date) {
 .summary-card {
   padding: 15px 16px;
   border-radius: 13px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--panel-border);
   background:
-    linear-gradient(135deg, rgba(140, 240, 180, 0.065), rgba(185, 156, 255, 0.04)),
-    rgba(255, 255, 255, 0.028);
+    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--accent-primary) 10%, transparent), transparent 44%),
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent-tertiary) 7%, transparent),
+      color-mix(in srgb, var(--accent-secondary) 4%, transparent)
+    ),
+    color-mix(in srgb, var(--panel-bg) 80%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-strong) 2%, transparent);
+  animation: insightCardIn 0.42s ease both;
 }
+
+.summary-card:nth-child(2) { animation-delay: 45ms; }
+.summary-card:nth-child(3) { animation-delay: 90ms; }
+.summary-card:nth-child(4) { animation-delay: 135ms; }
 
 .summary-card span,
 .summary-card small {
   display: block;
-  color: rgba(238, 246, 255, 0.42);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .summary-card strong {
   display: block;
   margin: 6px 0 3px;
-  color: #eef6ff;
+  color: var(--text-strong);
   font-size: 24px;
 }
 
@@ -876,8 +1019,8 @@ function formatBucketDate(date: Date) {
   min-width: 0;
   padding: 12px;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
 }
 
 .quality-head {
@@ -892,14 +1035,14 @@ function formatBucketDate(date: Date) {
 .quality-stat span,
 .quality-main small,
 .quality-stat small {
-  color: rgba(238, 246, 255, 0.42);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .quality-head strong,
 .quality-stat strong {
   display: block;
-  color: #eef6ff;
+  color: var(--text-strong);
   font-size: 20px;
 }
 
@@ -908,7 +1051,7 @@ function formatBucketDate(date: Date) {
   margin-bottom: 8px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
+  background: color-mix(in srgb, var(--text-strong) 8%, transparent);
 }
 
 .quality-meter span {
@@ -916,7 +1059,10 @@ function formatBucketDate(date: Date) {
   height: 100%;
   min-width: 4px;
   border-radius: inherit;
-  background: linear-gradient(90deg, #62d6ff, #8cf0b4);
+  background: linear-gradient(90deg, var(--accent-primary), var(--accent-tertiary));
+  transform-origin: left center;
+  animation: insightBarGrow 0.72s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  transition: width 0.34s ease;
 }
 
 .quality-stat strong {
@@ -936,12 +1082,14 @@ function formatBucketDate(date: Date) {
 .activity-panel {
   grid-column: 1 / -1;
   min-width: 0;
-  padding: 12px 13px;
-  border-radius: 12px;
-  border: 1px solid rgba(98, 214, 255, 0.09);
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 13%, transparent);
   background:
-    radial-gradient(circle at 12% 24%, rgba(98, 214, 255, 0.11), transparent 36%),
-    rgba(255, 255, 255, 0.028);
+    radial-gradient(circle at 10% 18%, color-mix(in srgb, var(--accent-primary) 12%, transparent), transparent 38%),
+    radial-gradient(circle at 92% 8%, color-mix(in srgb, var(--accent-tertiary) 8%, transparent), transparent 34%),
+    color-mix(in srgb, var(--panel-bg) 78%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-strong) 2%, transparent);
 }
 
 .activity-panel-head,
@@ -953,39 +1101,141 @@ function formatBucketDate(date: Date) {
   flex-wrap: wrap;
 }
 
-.activity-panel-head > div:first-child {
+.activity-panel-head {
+  margin-bottom: 12px;
+}
+
+.activity-title-block {
   display: grid;
   gap: 3px;
 }
 
 .activity-panel-head span,
 .activity-summary span {
-  color: rgba(238, 246, 255, 0.42);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .activity-panel-head strong {
-  color: #eef6ff;
+  color: var(--text-strong);
   font-size: 15px;
 }
 
-.activity-bars {
+.activity-insight-row {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(34px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.activity-stat-pill {
+  min-width: 0;
+  padding: 9px 10px;
+  border-radius: 11px;
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
+}
+
+.activity-stat-pill.primary {
+  border-color: color-mix(in srgb, var(--accent-primary) 17%, transparent);
+  background:
+    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--accent-primary) 12%, transparent), transparent 52%),
+    color-mix(in srgb, var(--accent-primary) 5%, transparent);
+}
+
+.activity-stat-pill span,
+.activity-stat-pill small {
+  display: block;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-stat-pill strong {
+  display: block;
+  margin: 3px 0 2px;
+  overflow: hidden;
+  color: var(--text-strong);
+  font-size: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-bars {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(var(--activity-columns, 6), minmax(36px, 1fr));
   gap: 8px;
   align-items: end;
-  margin: 12px 0 9px;
+  margin: 4px 0 10px;
+  padding: 8px 10px 9px;
+  max-height: min(286px, 42vh);
+  border-radius: 13px;
+  border: 1px solid var(--control-border);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--text-strong) 3%, transparent), transparent),
+    color-mix(in srgb, var(--app-bg) 22%, transparent);
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-color: color-mix(in srgb, var(--accent-primary) 30%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+.activity-bars::-webkit-scrollbar {
+  width: 8px;
+}
+
+.activity-bars::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-primary) 24%, transparent);
+}
+
+.activity-bars::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.activity-average-line {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  z-index: 0;
+  top: 6px !important;
+  height: auto;
+  border-top: 0;
+  pointer-events: none;
+}
+
+.activity-average-line span {
+  position: absolute;
+  top: 0;
+  right: 0;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--warning) 22%, transparent);
+  background: color-mix(in srgb, var(--panel-bg-strong) 88%, transparent);
+  color: color-mix(in srgb, var(--warning) 72%, var(--text-muted));
+  font-size: 10px;
 }
 
 .activity-day {
+  position: relative;
+  z-index: 1;
   display: grid;
   grid-template-rows: 58px auto auto;
   justify-items: center;
   gap: 4px;
   min-width: 0;
+  transition: transform 0.16s ease, opacity 0.16s ease;
+}
+
+.activity-day:hover {
+  transform: translateY(-2px);
 }
 
 .activity-day i {
+  position: relative;
   display: flex;
   align-items: end;
   width: 100%;
@@ -993,22 +1243,57 @@ function formatBucketDate(date: Date) {
   height: 58px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.055);
+  background: color-mix(in srgb, var(--text-strong) 6%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--text-strong) 3%, transparent);
+}
+
+.activity-day i::after {
+  content: "";
+  position: absolute;
+  left: -3px;
+  right: -3px;
+  top: var(--activity-average-offset, 58px);
+  border-top: 1px dashed rgba(247, 215, 116, 0.34);
+  pointer-events: none;
 }
 
 .activity-day i span {
   display: block;
   width: 100%;
   border-radius: inherit;
-  background: linear-gradient(180deg, #8cf0b4, #62d6ff);
-  box-shadow: 0 0 12px rgba(98, 214, 255, 0.2);
+  background:
+    linear-gradient(
+      180deg,
+      var(--accent-tertiary),
+      var(--accent-primary) 58%,
+      color-mix(in srgb, var(--accent-primary) 64%, transparent)
+    );
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent-primary) 20%, transparent);
+  transform-origin: bottom center;
+  animation: insightBarGrowY 0.68s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  transition: height 0.34s ease;
+}
+
+.activity-day.peak i {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--warning) 24%, transparent),
+    0 0 18px color-mix(in srgb, var(--warning) 10%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--text-strong) 4%, transparent);
+}
+
+.activity-day.peak i span {
+  background: linear-gradient(180deg, var(--warning), var(--accent-tertiary) 54%, var(--accent-primary));
+}
+
+.activity-day:not(.active) {
+  opacity: 0.58;
 }
 
 .activity-day small,
 .activity-day em {
   overflow: hidden;
   max-width: 100%;
-  color: rgba(238, 246, 255, 0.38);
+  color: color-mix(in srgb, var(--text-muted) 78%, transparent);
   font-size: 10px;
   font-style: normal;
   text-overflow: ellipsis;
@@ -1016,7 +1301,7 @@ function formatBucketDate(date: Date) {
 }
 
 .activity-day em {
-  color: rgba(238, 246, 255, 0.58);
+  color: var(--text-muted);
 }
 
 .recent-log-list {
@@ -1033,8 +1318,8 @@ function formatBucketDate(date: Date) {
   width: 100%;
   padding: 9px 10px;
   border-radius: 11px;
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(255, 255, 255, 0.055);
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
   color: inherit;
   font: inherit;
   text-align: left;
@@ -1044,13 +1329,13 @@ function formatBucketDate(date: Date) {
 
 .recent-log-item:hover,
 .recent-log-item:focus-visible {
-  border-color: rgba(98, 214, 255, 0.28);
-  background: rgba(98, 214, 255, 0.07);
+  border-color: color-mix(in srgb, var(--accent-primary) 30%, transparent);
+  background: color-mix(in srgb, var(--accent-primary) 8%, transparent);
   transform: translateX(2px);
 }
 
 .recent-log-item:focus-visible {
-  outline: 2px solid rgba(98, 214, 255, 0.26);
+  outline: 2px solid color-mix(in srgb, var(--accent-primary) 28%, transparent);
   outline-offset: 2px;
 }
 
@@ -1058,7 +1343,7 @@ function formatBucketDate(date: Date) {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  color: rgba(98, 214, 255, 0.82);
+  color: color-mix(in srgb, var(--accent-primary) 82%, var(--text-strong));
   font-size: 12px;
 }
 
@@ -1075,13 +1360,13 @@ function formatBucketDate(date: Date) {
 }
 
 .recent-log-copy strong {
-  color: #eef6ff;
+  color: var(--text-strong);
   font-size: 13px;
   margin-bottom: 2px;
 }
 
 .recent-log-copy span {
-  color: rgba(238, 246, 255, 0.38);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
@@ -1091,9 +1376,20 @@ function formatBucketDate(date: Date) {
   gap: 10px;
   padding: 16px;
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: color-mix(in srgb, var(--panel-bg) 76%, transparent);
+  border: 1px solid var(--panel-border);
   min-width: 0;
+  animation: insightSectionIn 0.44s ease both;
+}
+
+.insights-content > .insight-section:nth-of-type(2),
+.insight-grid .insight-section:nth-child(2) {
+  animation-delay: 60ms;
+}
+
+.insights-content > .insight-section:nth-of-type(3),
+.insight-grid .insight-section:nth-child(3) {
+  animation-delay: 110ms;
 }
 
 .section-icon {
@@ -1104,6 +1400,31 @@ function formatBucketDate(date: Date) {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+}
+
+.section-icon--primary {
+  background: color-mix(in srgb, var(--accent-primary) 11%, transparent);
+  color: var(--accent-primary);
+}
+
+.section-icon--secondary {
+  background: color-mix(in srgb, var(--accent-secondary) 12%, transparent);
+  color: var(--accent-secondary);
+}
+
+.section-icon--success {
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+  color: var(--success);
+}
+
+.section-icon--danger {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.section-icon--warning {
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  color: var(--warning);
 }
 
 .section-icon svg {
@@ -1140,8 +1461,8 @@ function formatBucketDate(date: Date) {
   gap: 4px;
   padding: 3px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
   flex-shrink: 0;
 }
 
@@ -1149,7 +1470,7 @@ function formatBucketDate(date: Date) {
   border: 0;
   border-radius: 999px;
   padding: 4px 8px;
-  color: rgba(238, 246, 255, 0.58);
+  color: var(--text-muted);
   background: transparent;
   font: inherit;
   font-size: 11px;
@@ -1160,14 +1481,14 @@ function formatBucketDate(date: Date) {
 
 .insight-time-control button:hover,
 .insight-time-control button:focus-visible {
-  color: #eef6ff;
-  background: rgba(98, 214, 255, 0.12);
+  color: var(--text-strong);
+  background: color-mix(in srgb, var(--accent-primary) 13%, transparent);
 }
 
 .insight-time-control button.active {
-  color: #061421;
-  background: #62d6ff;
-  box-shadow: 0 0 14px rgba(98, 214, 255, 0.22);
+  color: var(--app-bg);
+  background: var(--accent-primary);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent-primary) 22%, transparent);
 }
 
 .insight-custom-range {
@@ -1175,7 +1496,7 @@ function formatBucketDate(date: Date) {
   align-items: center;
   gap: 8px;
   margin: 0 0 10px;
-  color: rgba(238, 246, 255, 0.42);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
@@ -1185,15 +1506,15 @@ function formatBucketDate(date: Date) {
   height: 30px;
   padding: 0 8px;
   border-radius: 9px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  background: rgba(2, 9, 18, 0.48);
-  color: #eef6ff;
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
+  color: var(--text-strong);
 }
 
 .section-range-hint {
   display: block;
   margin: -2px 0 10px;
-  color: rgba(238, 246, 255, 0.42);
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -1224,19 +1545,21 @@ function formatBucketDate(date: Date) {
   flex: 1;
   height: 8px;
   border-radius: 4px;
-  background: rgba(255, 255, 255, 0.06);
+  background: color-mix(in srgb, var(--text-strong) 7%, transparent);
   overflow: hidden;
 }
 
 .bar-fill {
   height: 100%;
   border-radius: 4px;
+  transform-origin: left center;
+  animation: insightBarGrow 0.68s cubic-bezier(0.2, 0.8, 0.2, 1) both;
   transition: width 0.4s ease;
 }
 
 .bar-count {
   font-size: 12px;
-  color: rgba(238, 246, 255, 0.4);
+  color: var(--text-muted);
   width: 28px;
   text-align: left;
 }
@@ -1259,7 +1582,13 @@ function formatBucketDate(date: Date) {
   gap: 8px;
   padding: 4px 0;
   font-size: 13px;
+  animation: trendItemIn 0.34s ease both;
 }
+
+.trend-item:nth-child(2) { animation-delay: 35ms; }
+.trend-item:nth-child(3) { animation-delay: 70ms; }
+.trend-item:nth-child(4) { animation-delay: 105ms; }
+.trend-item:nth-child(n + 5) { animation-delay: 140ms; }
 
 .tag-dot {
   width: 8px;
@@ -1270,14 +1599,14 @@ function formatBucketDate(date: Date) {
 
 .trend-up {
   margin-left: auto;
-  color: #8cf0b4;
+  color: var(--success);
   font-weight: 600;
   font-size: 12px;
 }
 
 .trend-down {
   margin-left: auto;
-  color: #ff8fa3;
+  color: var(--danger);
   font-weight: 600;
   font-size: 12px;
 }
@@ -1295,16 +1624,16 @@ function formatBucketDate(date: Date) {
   gap: 8px;
   padding: 6px 12px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.04);
+  background: var(--control-bg);
   font-size: 12px;
 }
 
 .co-tag {
-  color: #eef6ff;
+  color: var(--text-strong);
 }
 
 .co-count {
-  color: rgba(238, 246, 255, 0.35);
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -1314,7 +1643,7 @@ function formatBucketDate(date: Date) {
   gap: 9px;
   margin-top: 14px;
   padding-top: 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  border-top: 1px solid var(--panel-border);
 }
 
 .cooccur-strength-row {
@@ -1337,14 +1666,14 @@ function formatBucketDate(date: Date) {
 }
 
 .cooccur-strength-copy span {
-  color: #eef6ff;
+  color: var(--text-strong);
   font-size: 12px;
   font-weight: 600;
 }
 
 .cooccur-strength-copy small {
   margin-top: 2px;
-  color: rgba(238, 246, 255, 0.35);
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -1352,14 +1681,17 @@ function formatBucketDate(date: Date) {
   height: 7px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
+  background: color-mix(in srgb, var(--text-strong) 8%, transparent);
 }
 
 .cooccur-strength-track span {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #b99cff, #62d6ff);
+  background: linear-gradient(90deg, var(--accent-secondary), var(--accent-primary));
+  transform-origin: left center;
+  animation: insightBarGrow 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  transition: width 0.34s ease;
 }
 
 /* Advice */
@@ -1373,40 +1705,79 @@ function formatBucketDate(date: Date) {
 .advice-item {
   margin: 0;
   font-size: 13px;
-  color: rgba(238, 246, 255, 0.6);
+  color: var(--text-muted);
   line-height: 1.5;
   display: flex;
   align-items: flex-start;
   gap: 6px;
+  animation: adviceItemIn 0.36s ease both;
 }
+
+.advice-item:nth-child(2) { animation-delay: 50ms; }
+.advice-item:nth-child(3) { animation-delay: 100ms; }
+.advice-item:nth-child(n + 4) { animation-delay: 150ms; }
 
 .advice-item svg {
   flex-shrink: 0;
   margin-top: 2px;
-  color: #f7d774;
+  color: var(--warning);
 }
 
 .generate-btn {
+  position: relative;
+  overflow: hidden;
   display: flex;
   align-items: center;
   gap: 7px;
   padding: 8px 16px;
   border-radius: 8px;
-  background: rgba(247, 215, 116, 0.1);
-  color: #f7d774;
-  border: 1px solid rgba(247, 215, 116, 0.2);
+  background: color-mix(in srgb, var(--warning) 11%, transparent);
+  color: var(--warning);
+  border: 1px solid color-mix(in srgb, var(--warning) 22%, transparent);
   font-size: 13px;
   cursor: pointer;
-  transition: background 0.15s;
+  transition: background 0.15s, border-color 0.15s, transform 0.15s, box-shadow 0.15s;
 }
 
 .generate-btn:hover:not(:disabled) {
-  background: rgba(247, 215, 116, 0.2);
+  background: color-mix(in srgb, var(--warning) 20%, transparent);
+  transform: translateY(-1px);
+  box-shadow: 0 10px 26px color-mix(in srgb, var(--warning) 10%, transparent);
 }
 
 .generate-btn:disabled {
-  opacity: 0.5;
+  opacity: 0.72;
   cursor: not-allowed;
+}
+
+.generate-btn.loading::after,
+.advice-section.loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(
+      110deg,
+      transparent 0%,
+      color-mix(in srgb, var(--warning) 12%, transparent) 42%,
+      color-mix(in srgb, var(--accent-primary) 10%, transparent) 50%,
+      transparent 64%
+    );
+  transform: translateX(-110%);
+  animation: insightScan 1.45s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.advice-section {
+  position: relative;
+  overflow: hidden;
+}
+
+.advice-section.loading {
+  border-color: color-mix(in srgb, var(--warning) 18%, transparent);
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--warning) 6%, transparent),
+    0 0 34px color-mix(in srgb, var(--warning) 5%, transparent);
 }
 
 .spinning {
@@ -1417,8 +1788,67 @@ function formatBucketDate(date: Date) {
   to { transform: rotate(360deg); }
 }
 
+@keyframes insightCardIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes insightSectionIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.995);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes insightBarGrow {
+  from { transform: scaleX(0); }
+  to { transform: scaleX(1); }
+}
+
+@keyframes insightBarGrowY {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+
+@keyframes trendItemIn {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes adviceItemIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes insightScan {
+  0% { transform: translateX(-110%); }
+  58%, 100% { transform: translateX(110%); }
+}
+
 .muted {
-  color: rgba(238, 246, 255, 0.3);
+  color: var(--text-muted);
   font-size: 13px;
 }
 
@@ -1431,12 +1861,38 @@ function formatBucketDate(date: Date) {
   border-radius: 8px;
   background: transparent;
   border: none;
-  color: rgba(238, 246, 255, 0.5);
+  color: var(--text-muted);
   cursor: pointer;
   transition: all 0.15s;
 }
 
-.icon-button:hover { color: #eef6ff; background: rgba(255, 255, 255, 0.06); }
+.icon-button:hover { color: var(--text-strong); background: var(--control-bg); }
+
+@media (prefers-reduced-motion: reduce) {
+  .summary-card,
+  .insight-section,
+  .quality-meter span,
+  .activity-day i span,
+  .activity-day,
+  .bar-fill,
+  .trend-item,
+  .cooccur-strength-track span,
+  .advice-item,
+  .generate-btn.loading::after,
+  .advice-section.loading::after,
+  .spinning {
+    animation: none;
+  }
+
+  .generate-btn,
+  .quality-meter span,
+  .activity-day i span,
+  .activity-day,
+  .bar-fill,
+  .cooccur-strength-track span {
+    transition: none;
+  }
+}
 
 @media (max-width: 700px) {
   .insights-content {
@@ -1450,6 +1906,10 @@ function formatBucketDate(date: Date) {
 
   .quality-grid {
     grid-template-columns: 1fr;
+  }
+
+  .activity-insight-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .insight-grid {

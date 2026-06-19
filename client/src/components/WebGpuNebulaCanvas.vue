@@ -2,10 +2,12 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { Maximize2, Minimize2 } from 'lucide-vue-next';
 import type { DomainCategory, GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
+import { buildLogClusters, shouldClusterLogs, type ClusterPoint } from '../utils/logClusters';
 
 type PickNode =
   | { kind: 'tag'; id: number; x: number; y: number; r: number }
-  | { kind: 'log'; id: number; x: number; y: number; r: number };
+  | { kind: 'log'; id: number; x: number; y: number; r: number }
+  | { kind: 'cluster'; id: string; x: number; y: number; r: number; logIds: number[] };
 
 type LayoutPoint = { x: number; y: number; r: number };
 type Point3D = { x: number; y: number; z: number };
@@ -36,6 +38,26 @@ interface LabelItem {
   domainFocused: boolean;
 }
 
+interface ClusterLabelItem {
+  id: string;
+  count: number;
+  x: number;
+  y: number;
+  color: string;
+  active: boolean;
+  level: 'parent' | 'child';
+  size: number;
+  logIds: number[];
+}
+
+interface RelationMarkerItem {
+  key: string;
+  x: number;
+  y: number;
+  color: string;
+  kind: 'tag-source' | 'log-source' | 'tag-target';
+}
+
 const props = defineProps<{
   graph: GraphData;
   layoutMode: LayoutMode;
@@ -49,6 +71,8 @@ const props = defineProps<{
   heatMediumDelta?: number;
   heatStrongDelta?: number;
   heatFlatOpacity?: number;
+  logClusteringEnabled?: boolean;
+  activeClusterLogIds?: Set<number> | null;
   domainFocusTagIds?: Set<number>;
 }>();
 
@@ -57,6 +81,7 @@ const emit = defineEmits<{
   tagContext: [payload: { tagId: number; x: number; y: number; width: number; height: number }];
   logOpen: [logId: number];
   logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
+  logClusterOpen: [payload: { logIds: number[]; x: number; y: number; width: number; height: number }];
   layoutDirty: [dirty: boolean];
 }>();
 
@@ -67,6 +92,8 @@ const UNIFORM_BYTE_SIZE = 80;
 const wrap = ref<HTMLDivElement | null>(null);
 const canvas = ref<HTMLCanvasElement | null>(null);
 const labels = ref<LabelItem[]>([]);
+const clusterLabels = ref<ClusterLabelItem[]>([]);
+const relationMarkers = ref<RelationMarkerItem[]>([]);
 const webgpuReady = ref(false);
 const webgpuMessage = ref('正在初始化 WebGPU...');
 const webgpuError = ref('');
@@ -152,6 +179,8 @@ let moved = false;
 let lastPointer = { x: 0, y: 0 };
 let dragButton = 0;
 let stars: Array<{ x: number; y: number; z: number; r: number; alpha: number; seed: number }> = [];
+let renderClusters: ClusterPoint[] = [];
+let renderClusteredLogIds = new Set<number>();
 let cameraTarget: CameraTarget | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let dragSnapshot: LayoutSnapshot | null = null;
@@ -242,7 +271,16 @@ watch(
 );
 
 watch(
-  () => [props.activeTagIds, props.selectedLogId, props.focusPulseLogId, props.priorityTagIds, props.priorityDisplayLimit, props.domainFocusTagIds],
+  () => [
+    props.activeTagIds,
+    props.selectedLogId,
+    props.focusPulseLogId,
+    props.priorityTagIds,
+    props.priorityDisplayLimit,
+    props.logClusteringEnabled,
+    props.activeClusterLogIds,
+    props.domainFocusTagIds
+  ],
   () => {
     updateLabels();
   },
@@ -764,6 +802,42 @@ function updateGeometryBuffers() {
     );
   }
 
+  const visibleLogs = props.graph.logs.filter((log) => logPositions.has(log.id) && isLogVisible(log));
+  const clusterState = buildRenderClusterState(visibleLogs);
+  renderClusters = clusterState.clusters;
+  renderClusteredLogIds = clusterState.clusteredLogIds;
+
+  for (const cluster of renderClusters) {
+    const color = clusterColorRgb(cluster);
+    const active = cluster.logIds.some((id) => props.activeClusterLogIds?.has(id));
+    const child = cluster.level === 'child';
+    const radius = cluster.r * (child ? 1.12 : 1.34) * (active ? 1.12 : 1);
+    const world = clusterPoint3D(cluster);
+    const seed = seeded(cluster.count * 31 + cluster.x * 0.13 + cluster.y * 0.17);
+    pushNodeInstance(
+      nodeRows,
+      world,
+      radius * (active ? 4.9 : child ? 3.2 : 3.9),
+      3,
+      color,
+      active ? 0.3 : child ? 0.18 : 0.2,
+      active ? 1 : 0.82,
+      seed,
+      0
+    );
+    pushNodeInstance(
+      nodeRows,
+      world,
+      radius * (active ? 1.46 : child ? 0.98 : 1.12),
+      4,
+      color,
+      active ? 0.92 : child ? 0.68 : 0.72,
+      active ? 1 : 0.78,
+      seed + 0.4,
+      0.28
+    );
+  }
+
   for (const log of props.graph.logs) {
     const point = logPositions.get(log.id);
     if (!point) {
@@ -775,6 +849,9 @@ function updateGeometryBuffers() {
     const selected = props.selectedLogId === log.id;
     const pulsing = props.focusPulseLogId === log.id;
     const highlighted = isLogHighlighted(log);
+    if (renderClusteredLogIds.has(log.id) && !selected && !pulsing && !highlighted) {
+      continue;
+    }
     const muted = props.activeTagIds.size === 0 && hasActiveRelationMode() && !selected && !pulsing && !highlighted;
     const pulse = pulsing ? 0.5 + 0.5 * Math.sin(pulseTime * 7.5 + log.id) : 0;
     const state = selected || pulsing ? 1 : highlighted ? 0.92 : muted ? 0.08 : 0.38;
@@ -821,6 +898,13 @@ function updateGeometryBuffers() {
       if (!tagPoint || !logPoint || !logEntry) {
         continue;
       }
+      if (
+        renderClusteredLogIds.has(logEntry.id) &&
+        props.selectedLogId !== logEntry.id &&
+        props.focusPulseLogId !== logEntry.id
+      ) {
+        continue;
+      }
       const relation = relationFlowState(edge.tagId, logEntry);
       if (!relation.visible) {
         continue;
@@ -839,9 +923,10 @@ function updateGeometryBuffers() {
         tagPoint3D(edge.tagId, tagPoint),
         logPoint3D(logEntry, logPoint),
         color,
-        relation.selected ? 6.4 : 4.6,
+        relation.direction === 'log-to-tag' ? 6.2 : relation.selected ? 6.4 : 4.6,
         relation.selected ? 1 : 0.72,
-        seeded(edge.tagId * 31 + edge.logId)
+        seeded(edge.tagId * 31 + edge.logId),
+        relation.direction === 'log-to-tag' ? 1 : 0
       );
     }
   }
@@ -870,7 +955,8 @@ function pushLineInstance(
   color: number[],
   width: number,
   state: number,
-  seed: number
+  seed: number,
+  relationType = 0
 ) {
   rows.push(
     start.x,
@@ -886,7 +972,7 @@ function pushLineInstance(
     width,
     state,
     seed,
-    0,
+    relationType,
     0,
     0
   );
@@ -979,6 +1065,28 @@ function isLogVisible(log: LogEntry) {
   return visibleByTags || visibleBySelectedLog;
 }
 
+function buildRenderClusterState(visibleLogs: LogEntry[]) {
+  if (!shouldClusterLogs(visibleLogs.length, transform.scale, props.logClusteringEnabled !== false)) {
+    return { clusters: [] as ClusterPoint[], clusteredLogIds: new Set<number>() };
+  }
+  const clusterState = buildLogClusters(visibleLogs, logPositions, tagPositions, {
+    selectedLogId: props.selectedLogId,
+    focusPulseLogId: props.focusPulseLogId ?? null,
+    activeTagIds: props.activeTagIds,
+    expandedLogIds: props.activeClusterLogIds
+  });
+  const clusteredLogIds = new Set<number>();
+  for (const cluster of clusterState.clusters) {
+    for (const logId of cluster.logIds) {
+      clusteredLogIds.add(logId);
+    }
+  }
+  for (const logId of clusterState.singleLogIds) {
+    clusteredLogIds.delete(logId);
+  }
+  return { clusters: clusterState.clusters, clusteredLogIds };
+}
+
 function isTagVisible(tagId: number) {
   const tagModeActive = props.activeTagIds.size > 0;
   const logModeActive = props.selectedLogId !== null;
@@ -1005,7 +1113,11 @@ function isTagRelatedToSelectedLog(tagId: number) {
 function relationFlowState(tagId: number, log: LogEntry) {
   const selected = props.selectedLogId === log.id;
   const active = props.activeTagIds.has(tagId) && isLogHighlighted(log);
-  return { visible: (selected && isLogVisible(log) && isTagVisible(tagId)) || active, selected };
+  return {
+    visible: (selected && isLogVisible(log) && isTagVisible(tagId)) || active,
+    selected,
+    direction: selected ? 'log-to-tag' : 'tag-to-log'
+  };
 }
 
 function onPointerDown(event: PointerEvent) {
@@ -1147,6 +1259,10 @@ function onPointerUp(event: PointerEvent) {
   if (!picked) {
     return;
   }
+  if (picked.kind === 'cluster') {
+    openLogCluster(picked, event);
+    return;
+  }
   if (button === 2) {
     if (picked.kind === 'log') {
       inspectLogAt(picked.id, event);
@@ -1160,6 +1276,18 @@ function onPointerUp(event: PointerEvent) {
   } else {
     emit('logOpen', picked.id);
   }
+}
+
+function openLogCluster(cluster: Extract<PickNode, { kind: 'cluster' }>, event: PointerEvent | MouseEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  const point = canvasPointFromPointer(event);
+  emit('logClusterOpen', {
+    logIds: cluster.logIds,
+    x: point.x,
+    y: point.y,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
 }
 
 function onLabelPointerDown(tagId: number, event: PointerEvent) {
@@ -1445,11 +1573,14 @@ function pickNodeAt(screenX: number, screenY: number) {
 function updateLabels() {
   if (!canvas.value) {
     labels.value = [];
+    clusterLabels.value = [];
+    relationMarkers.value = [];
     pickNodes.length = 0;
     return;
   }
   const rect = canvas.value.getBoundingClientRect();
   const nextLabels: LabelItem[] = [];
+  const nextClusterLabels: ClusterLabelItem[] = [];
   const labelCandidates: LabelItem[] = [];
   pickNodes.length = 0;
 
@@ -1504,6 +1635,27 @@ function updateLabels() {
     }
   }
 
+  for (const cluster of renderClusters) {
+    const screen = projectWorldToScreen(clusterPoint3D(cluster));
+    const active = cluster.logIds.some((id) => props.activeClusterLogIds?.has(id));
+    const child = cluster.level === 'child';
+    const radius = Math.max(child ? 20 : 26, cluster.r * transform.scale * screen.perspective * (active ? 1.75 : child ? 1.22 : 1.42));
+    if (screen.x > -110 && screen.x < rect.width + 110 && screen.y > -110 && screen.y < rect.height + 110) {
+      pickNodes.push({ kind: 'cluster', id: cluster.id, x: screen.x, y: screen.y, r: radius + 8, logIds: cluster.logIds });
+      nextClusterLabels.push({
+        id: cluster.id,
+        count: cluster.count,
+        x: screen.x,
+        y: screen.y,
+        color: clusterColorHex(cluster),
+        active,
+        level: cluster.level,
+        size: Math.max(child ? 34 : 42, Math.min(child ? 58 : 76, radius * (child ? 1.6 : 1.48))),
+        logIds: cluster.logIds
+      });
+    }
+  }
+
   for (const log of props.graph.logs) {
     const point = logPositions.get(log.id);
     if (!point) {
@@ -1515,6 +1667,10 @@ function updateLabels() {
     const screen = projectWorldToScreen(logPoint3D(log, point));
     const selected = props.selectedLogId === log.id;
     const highlighted = isLogHighlighted(log);
+    const pulsing = props.focusPulseLogId === log.id;
+    if (renderClusteredLogIds.has(log.id) && !selected && !pulsing && !highlighted) {
+      continue;
+    }
     const radius = Math.max(15, (highlighted || selected ? 13 : 10) * transform.scale * screen.perspective);
     if (screen.x > -90 && screen.x < rect.width + 90 && screen.y > -90 && screen.y < rect.height + 90) {
       pickNodes.push({ kind: 'log', id: log.id, x: screen.x, y: screen.y, r: radius + 8 });
@@ -1522,6 +1678,68 @@ function updateLabels() {
   }
 
   labels.value = nextLabels;
+  clusterLabels.value = nextClusterLabels;
+  relationMarkers.value = buildRelationMarkers(rect);
+}
+
+function buildRelationMarkers(rect: DOMRect) {
+  if (!hasActiveRelationMode()) {
+    return [];
+  }
+  const markerMap = new Map<string, RelationMarkerItem>();
+  for (const edge of props.graph.edges) {
+    const tagPoint = tagPositions.get(edge.tagId);
+    const logPoint = logPositions.get(edge.logId);
+    const logEntry = props.graph.logs.find((item) => item.id === edge.logId);
+    const tagEntry = props.graph.tags.find((item) => item.id === edge.tagId);
+    if (!tagPoint || !logPoint || !logEntry || !tagEntry) {
+      continue;
+    }
+    if (
+      renderClusteredLogIds.has(logEntry.id) &&
+      props.selectedLogId !== logEntry.id &&
+      props.focusPulseLogId !== logEntry.id
+    ) {
+      continue;
+    }
+    const relation = relationFlowState(edge.tagId, logEntry);
+    if (!relation.visible) {
+      continue;
+    }
+    const tagScreen = projectWorldToScreen(tagPoint3D(edge.tagId, tagPoint));
+    const logScreen = projectWorldToScreen(logPoint3D(logEntry, logPoint));
+    const markerInBounds = (screen: { x: number; y: number }) =>
+      screen.x > -70 && screen.x < rect.width + 70 && screen.y > -70 && screen.y < rect.height + 70;
+    if (relation.direction === 'log-to-tag') {
+      if (markerInBounds(logScreen)) {
+        markerMap.set(`log-source-${logEntry.id}`, {
+          key: `log-source-${logEntry.id}`,
+          x: logScreen.x,
+          y: logScreen.y,
+          color: tagEntry.color,
+          kind: 'log-source'
+        });
+      }
+      if (markerInBounds(tagScreen)) {
+        markerMap.set(`tag-target-${edge.tagId}`, {
+          key: `tag-target-${edge.tagId}`,
+          x: tagScreen.x,
+          y: tagScreen.y,
+          color: tagEntry.color,
+          kind: 'tag-target'
+        });
+      }
+    } else if (markerInBounds(tagScreen)) {
+      markerMap.set(`tag-source-${edge.tagId}`, {
+        key: `tag-source-${edge.tagId}`,
+        x: tagScreen.x,
+        y: tagScreen.y,
+        color: tagEntry.color,
+        kind: 'tag-source'
+      });
+    }
+  }
+  return Array.from(markerMap.values()).slice(0, 64);
 }
 
 function tagPositionStorageKey() {
@@ -1875,6 +2093,46 @@ function logPoint3D(log: LogEntry, point: LayoutPoint): Point3D {
     y: point.y,
     z: base * 0.58 + (seeded(log.id + 854) - 0.5) * 190
   };
+}
+
+function clusterPoint3D(cluster: ClusterPoint): Point3D {
+  const depth = cluster.primaryTagId ? tagDepth(cluster.primaryTagId) * 0.48 : 0;
+  return {
+    x: cluster.x,
+    y: cluster.y,
+    z: depth + (seeded(cluster.count * 41 + cluster.x * 0.09 + cluster.y * 0.11) - 0.5) * 120
+  };
+}
+
+function clusterColorRgb(cluster: ClusterPoint) {
+  const tagColor = cluster.primaryTagId
+    ? props.graph.tags.find((tag) => tag.id === cluster.primaryTagId)?.color
+    : null;
+  if (tagColor) {
+    return hexToRgb(tagColor);
+  }
+  const log = cluster.logIds.map((id) => props.graph.logs.find((item) => item.id === id)).find(Boolean);
+  return log?.tags[0]?.color ? hexToRgb(log.tags[0].color) : hexToRgb(themeColor('--accent-primary', '#62d6ff'));
+}
+
+function clusterColorHex(cluster: ClusterPoint) {
+  const tagColor = cluster.primaryTagId
+    ? props.graph.tags.find((tag) => tag.id === cluster.primaryTagId)?.color
+    : null;
+  if (tagColor) {
+    return tagColor;
+  }
+  const log = cluster.logIds.map((id) => props.graph.logs.find((item) => item.id === id)).find(Boolean);
+  return log?.tags[0]?.color ?? themeColor('--accent-primary', '#62d6ff');
+}
+
+function themeColor(name: string, fallback: string) {
+  const target = wrap.value;
+  if (!target) {
+    return fallback;
+  }
+  const value = getComputedStyle(target).getPropertyValue(name).trim();
+  return value.startsWith('#') ? value : fallback;
 }
 
 function hasTagPriority() {
@@ -2493,7 +2751,8 @@ struct VertexOut {
   @location(2) side: f32,
   @location(3) state: f32,
   @location(4) seed: f32,
-  @location(5) time: f32
+  @location(5) time: f32,
+  @location(6) relationType: f32
 };
 
 fn lineCorner(index: u32) -> vec2f {
@@ -2535,32 +2794,43 @@ fn vs(input: LineIn, @builtin(vertex_index) vertexIndex: u32) -> VertexOut {
   out.state = input.lineInfo.y;
   out.seed = input.lineInfo.z;
   out.time = u.viewport.w;
+  out.relationType = input.lineInfo.w;
   return out;
 }
 
 @fragment
 fn fs(input: VertexOut) -> @location(0) vec4f {
   let fade = smoothstep(0.02, 0.16, input.along) * (1.0 - smoothstep(0.84, 0.99, input.along));
-  let flow = input.along * (5.2 + input.state * 1.25) - input.time * (0.52 + input.state * 0.34) + input.seed;
+  let relation = step(0.5, input.relationType);
+  let flowAlong = mix(input.along, 1.0 - input.along, relation);
+  let flow = flowAlong * (5.2 + input.state * 1.25) - input.time * (0.52 + input.state * 0.34) + input.seed;
   let wave = fract(flow);
   let bead = smoothstep(0.5, 0.68, wave) * (1.0 - smoothstep(0.68, 0.92, wave));
   let echoWave = fract(flow + 0.38);
   let echo = smoothstep(0.54, 0.72, echoWave) * (1.0 - smoothstep(0.72, 0.95, echoWave));
+  let dashWave = fract(input.along * 8.5 - input.time * 0.22 + input.seed);
+  let dashMask = smoothstep(0.025, 0.11, dashWave) * (1.0 - smoothstep(0.54, 0.7, dashWave));
+  let lineMask = mix(1.0, dashMask, relation);
+  let tagSource = (1.0 - relation) * (1.0 - smoothstep(0.0, 0.12, input.along));
+  let logSource = relation * smoothstep(0.86, 1.0, input.along);
+  let tagTarget = relation * (1.0 - smoothstep(0.0, 0.1, input.along));
+  let endpoint = max(max(tagSource, logSource), tagTarget);
   let side = abs(input.side);
   let inner = 1.0 - smoothstep(0.02, 0.18, side);
   let core = 1.0 - smoothstep(0.06, 0.42, side);
   let halo = 1.0 - smoothstep(0.28, 1.0, side);
   let pulse = 0.88 + sin(input.time * 2.15 + input.seed * 6.283 + input.along * 4.4) * 0.08;
-  let alpha = fade * input.color.a * (
-    halo * 0.26 +
-    core * (0.36 + input.state * 0.22) * pulse +
-    bead * inner * (0.86 + input.state * 0.72) +
-    echo * inner * (0.18 + input.state * 0.18)
+  let alpha = fade * lineMask * input.color.a * (
+    halo * (0.26 + endpoint * 0.32) +
+    core * (0.36 + input.state * 0.22 + relation * 0.08) * pulse +
+    bead * inner * (0.86 + input.state * 0.72 + relation * 0.18) +
+    echo * inner * (0.18 + input.state * 0.18) +
+    endpoint * inner * (0.42 + relation * 0.18)
   );
   if (alpha < 0.007) {
     discard;
   }
-  let intensity = 0.68 + halo * 0.12 + core * 0.28 + bead * (0.62 + input.state * 0.4) + echo * 0.18;
+  let intensity = 0.68 + relation * 0.08 + endpoint * 0.36 + halo * 0.12 + core * 0.28 + bead * (0.62 + input.state * 0.4) + echo * 0.18;
   let color = min(input.color.rgb * intensity, vec3f(1.0));
   return vec4f(color, min(0.92, alpha));
 }
@@ -2581,6 +2851,43 @@ fn fs(input: VertexOut) -> @location(0) vec4f {
       @wheel="onWheel"
     ></canvas>
     <slot name="overlay"></slot>
+
+    <div v-if="hasActiveRelationMode()" class="webgpu-relation-legend" aria-hidden="true">
+      <span><i class="solid"></i>标签 → 日志</span>
+      <span><i class="dashed"></i>日志 → 标签</span>
+    </div>
+
+    <div v-if="relationMarkers.length" class="webgpu-relation-marker-layer" aria-hidden="true">
+      <span
+        v-for="marker in relationMarkers"
+        :key="marker.key"
+        class="webgpu-relation-marker"
+        :class="marker.kind"
+        :style="{ left: `${marker.x}px`, top: `${marker.y}px`, '--marker-color': marker.color }"
+      />
+    </div>
+
+    <div class="webgpu-cluster-layer">
+      <button
+        v-for="cluster in clusterLabels"
+        :key="cluster.id"
+        class="webgpu-log-cluster"
+        :class="{ active: cluster.active, child: cluster.level === 'child' }"
+        :style="{ left: `${cluster.x}px`, top: `${cluster.y}px`, '--cluster-color': cluster.color, '--cluster-size': `${cluster.size}px` }"
+        :title="`日志星团 · ${cluster.count} 条`"
+        :aria-label="`打开日志星团，${cluster.count} 条日志`"
+        @pointerdown.stop
+        @click.stop="openLogCluster({ kind: 'cluster', id: cluster.id, x: cluster.x, y: cluster.y, r: 0, logIds: cluster.logIds }, $event)"
+      >
+        <span class="webgpu-cluster-core" aria-hidden="true"></span>
+        <span class="webgpu-cluster-ring ring-a" aria-hidden="true"></span>
+        <span class="webgpu-cluster-ring ring-b" aria-hidden="true"></span>
+        <span class="webgpu-cluster-dust dust-a" aria-hidden="true"></span>
+        <span class="webgpu-cluster-dust dust-b" aria-hidden="true"></span>
+        <span class="webgpu-cluster-dust dust-c" aria-hidden="true"></span>
+        <span class="webgpu-cluster-count">{{ cluster.count }}条</span>
+      </button>
+    </div>
 
     <div class="webgpu-label-layer">
       <button

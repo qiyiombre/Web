@@ -16,6 +16,7 @@ import {
   LogOut,
   Map as MapIcon,
   Orbit,
+  Palette,
   RotateCcw,
   Save,
   SlidersHorizontal,
@@ -27,6 +28,9 @@ import { useAuthStore } from '../stores/auth';
 import { useGraphStore } from '../stores/graph';
 import { useMapsStore } from '../stores/maps';
 import { useUiStore } from '../stores/ui';
+import { THEME_OPTIONS } from '../constants/themes';
+
+type SettingsSection = 'overview' | 'appearance' | 'nebula' | 'insights' | 'security';
 
 const auth = useAuthStore();
 const graphStore = useGraphStore();
@@ -35,6 +39,14 @@ const ui = useUiStore();
 const router = useRouter();
 
 const savingPrefs = ref(false);
+const activeSection = ref<SettingsSection>('overview');
+const settingsSections: Array<{ id: SettingsSection; label: string; description: string }> = [
+  { id: 'overview', label: '概览', description: '账号、当前星图和快捷入口' },
+  { id: 'appearance', label: '外观', description: '主题、渲染和布局' },
+  { id: 'nebula', label: '星云与筛选', description: '筛选、排序、密集显示' },
+  { id: 'insights', label: '洞察展示', description: '分析模块数量和口径' },
+  { id: 'security', label: '账号安全', description: '密码和登录状态' }
+];
 
 // Password change state
 const pwForm = ref({ current: '', newPw: '', confirm: '' });
@@ -74,6 +86,7 @@ const activeMap = computed(() => (
 ));
 
 const rendererLabel = computed(() => (auth.rendererMode === 'webgpu' ? 'WebGPU' : 'Canvas'));
+const themeLabel = computed(() => THEME_OPTIONS.find(theme => theme.id === auth.themeMode)?.label ?? '深空蓝');
 const layoutLabel = computed(() => (auth.layoutMode === 'domain' ? '领域布局' : '语义布局'));
 const timeFilterLabel = computed(() => {
   if (graphStore.timeFilter === 'week') return '近 7 天';
@@ -168,6 +181,7 @@ function openCurrentLogs() {
 function resetDisplayPreferences() {
   auth.setRendererMode('canvas');
   auth.setLayoutMode('semantic');
+  auth.setThemeMode('deepSpace');
   graphStore.setTimeFilter('all');
   graphStore.setFrequencyFilter('all');
   graphStore.setHighFrequencyMinimum(2);
@@ -181,6 +195,7 @@ function resetDisplayPreferences() {
   graphStore.setNebulaHeatMediumDelta(2);
   graphStore.setNebulaHeatStrongDelta(4);
   graphStore.setNebulaHeatFlatOpacity(28);
+  graphStore.setNebulaLogDensityMode('auto');
   graphStore.setSortMode('layout');
   graphStore.customStartDate = '';
   graphStore.customEndDate = '';
@@ -208,9 +223,47 @@ async function handleLogout() {
     </header>
 
     <div class="settings-content">
+      <aside class="settings-sidebar">
+        <button
+          v-for="section in settingsSections"
+          :key="section.id"
+          type="button"
+          class="settings-section-tab"
+          :class="{ active: activeSection === section.id }"
+          @click="activeSection = section.id"
+        >
+          <strong>{{ section.label }}</strong>
+          <span>{{ section.description }}</span>
+        </button>
+      </aside>
+
       <main class="settings-main">
+        <section v-show="activeSection === 'appearance'" class="setting-card main-card theme-card">
+          <div class="card-head">
+            <Palette :size="18" />
+            <h3>外观主题</h3>
+          </div>
+          <div class="card-body">
+            <div class="theme-choice-grid">
+              <button
+                v-for="theme in THEME_OPTIONS"
+                :key="theme.id"
+                type="button"
+                class="theme-choice"
+                :class="[`theme-choice--${theme.id}`, { active: auth.themeMode === theme.id }]"
+                @click="auth.setThemeMode(theme.id)"
+              >
+                <span class="theme-swatch">
+                  <i v-for="color in theme.swatches" :key="color" :style="{ color, background: color }" />
+                </span>
+                <strong>{{ theme.label }}</strong>
+                <small>{{ theme.description }}</small>
+              </button>
+            </div>
+          </div>
+        </section>
   <!-- Renderer preferences -->
-        <section class="setting-card main-card renderer-card">
+        <section v-show="activeSection === 'appearance'" class="setting-card main-card renderer-card">
           <div class="card-head">
             <Cpu :size="18" />
             <h3>渲染引擎</h3>
@@ -246,7 +299,7 @@ async function handleLogout() {
         </section>
 
   <!-- Layout preferences -->
-        <section class="setting-card main-card layout-card">
+        <section v-show="activeSection === 'appearance'" class="setting-card main-card layout-card">
           <div class="card-head">
             <Globe :size="18" />
             <h3>星云布局</h3>
@@ -282,10 +335,10 @@ async function handleLogout() {
         </section>
 
   <!-- Filter preferences -->
-        <section class="setting-card main-card preferences-card">
+        <section v-show="activeSection === 'nebula'" class="setting-card main-card preferences-card">
           <div class="card-head">
             <SlidersHorizontal :size="18" />
-            <h3>显示偏好</h3>
+            <h3>筛选与排序</h3>
           </div>
           <div class="card-body">
             <div class="setting-row stacked">
@@ -354,6 +407,36 @@ async function handleLogout() {
                 <button :class="{ active: graphStore.sortMode === 'recent' }" @click="graphStore.setSortMode('recent')">最近活跃</button>
               </div>
             </div>
+          </div>
+        </section>
+
+        <section v-show="activeSection === 'nebula'" class="setting-card main-card density-heat-card">
+          <div class="card-head">
+            <Flame :size="18" />
+            <h3>日志密集与热力</h3>
+          </div>
+          <div class="card-body">
+            <div class="setting-row stacked">
+              <div>
+                <strong><SlidersHorizontal :size="14" /> 日志密集显示</strong>
+                <small>控制大数据量星图中日志节点是自动聚合，还是始终显示单条日志。</small>
+              </div>
+              <div class="segmented-control">
+                <button
+                  :class="{ active: graphStore.nebulaLogDensityMode === 'auto' }"
+                  @click="graphStore.setNebulaLogDensityMode('auto')"
+                >
+                  自动聚合
+                </button>
+                <button
+                  :class="{ active: graphStore.nebulaLogDensityMode === 'single' }"
+                  @click="graphStore.setNebulaLogDensityMode('single')"
+                >
+                  始终单条
+                </button>
+              </div>
+              <p class="setting-hint">自动聚合只影响星云视觉层；日志列表、洞察统计、删除和编辑仍然按真实日志处理。</p>
+            </div>
             <div class="setting-row stacked">
               <div>
                 <strong><Flame :size="14" /> WebGPU 热力参数</strong>
@@ -420,10 +503,19 @@ async function handleLogout() {
                 例如窗口为 7 天时，会比较最近 7 天和上一个 7 天；差值小于“最小变化”会视为无变化。
               </p>
             </div>
+          </div>
+        </section>
+
+        <section v-show="activeSection === 'insights'" class="setting-card main-card insight-display-card">
+          <div class="card-head">
+            <Sparkles :size="18" />
+            <h3>洞察展示数量</h3>
+          </div>
+          <div class="card-body">
             <div class="setting-row stacked">
               <div>
                 <strong><Sparkles :size="14" /> 洞察展示数量</strong>
-                <small>控制洞察页和星图抽屉里默认展示多少条分析结果</small>
+                <small>控制洞察页默认展示多少条分析结果</small>
               </div>
               <div class="insight-limit-grid">
                 <label class="threshold-field">
@@ -460,7 +552,7 @@ async function handleLogout() {
                   <span>条</span>
                 </label>
                 <label class="threshold-field">
-                  <span>星云标记</span>
+                  <span>星云排行</span>
                   <input
                     v-model.number="graphStore.nebulaPriorityDisplayLimit"
                     type="number"
@@ -471,12 +563,13 @@ async function handleLogout() {
                   <span>个</span>
                 </label>
               </div>
+              <p class="setting-hint">星云排行控制高频优先、低频优先、最近活跃模式里显示多少个排名标记；设为 0 可以隐藏排行。</p>
             </div>
           </div>
         </section>
 
   <!-- Password -->
-        <section class="setting-card main-card password-card">
+        <section v-show="activeSection === 'security'" class="setting-card main-card password-card">
           <div class="card-head">
             <KeyRound :size="18" />
             <h3>修改密码</h3>
@@ -513,7 +606,7 @@ async function handleLogout() {
 
       <aside class="settings-side">
   <!-- Account section -->
-        <section class="setting-card side-card account-card">
+        <section v-show="activeSection === 'overview'" class="setting-card side-card account-card">
           <div class="card-head">
             <UserRound :size="18" />
             <h3>账户</h3>
@@ -553,7 +646,7 @@ async function handleLogout() {
         </section>
 
   <!-- Current map overview -->
-        <section class="setting-card side-card current-map-card">
+        <section v-show="activeSection === 'overview'" class="setting-card side-card current-map-card">
           <div class="card-head">
             <Orbit :size="18" />
             <h3>当前星图</h3>
@@ -590,7 +683,7 @@ async function handleLogout() {
         </section>
 
   <!-- Quick management -->
-        <section class="setting-card side-card manage-card">
+        <section v-show="activeSection === 'overview'" class="setting-card side-card manage-card">
           <div class="card-head">
             <ArrowRight :size="18" />
             <h3>快捷管理</h3>
@@ -614,7 +707,7 @@ async function handleLogout() {
         </section>
 
   <!-- Preference overview -->
-        <section class="setting-card side-card preference-overview-card">
+        <section v-show="activeSection === 'overview'" class="setting-card side-card preference-overview-card">
           <div class="card-head">
             <Sparkles :size="18" />
             <h3>偏好预览</h3>
@@ -624,6 +717,10 @@ async function handleLogout() {
               <div class="preference-token">
                 <small>渲染</small>
                 <strong>{{ rendererLabel }}</strong>
+              </div>
+              <div class="preference-token">
+                <small>主题</small>
+                <strong>{{ themeLabel }}</strong>
               </div>
               <div class="preference-token">
                 <small>布局</small>
@@ -650,14 +747,14 @@ async function handleLogout() {
         </section>
 
   <!-- Sync -->
-        <section class="setting-card side-card sync-card">
+        <section v-show="activeSection === 'overview'" class="setting-card side-card sync-card">
           <div class="card-head">
             <Save :size="18" />
             <h3>偏好同步</h3>
           </div>
           <div class="card-body">
             <p class="muted">渲染和布局偏好会在切换时自动同步到云端。</p>
-            <button class="secondary-button" :disabled="savingPrefs" @click="savePreferences">
+            <button class="secondary-button sync-button" :class="{ loading: savingPrefs }" :disabled="savingPrefs" @click="savePreferences">
               <Save :size="15" />
               {{ savingPrefs ? '同步中...' : '立即同步' }}
             </button>
@@ -685,7 +782,7 @@ async function handleLogout() {
   display: flex;
   align-items: center;
   padding: 12px 20px;
-  background: rgba(10, 20, 36, 0.9);
+  background: color-mix(in srgb, var(--panel-bg-strong) 92%, transparent);
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   position: sticky;
   top: 0;
@@ -706,30 +803,152 @@ async function handleLogout() {
 
 .settings-content {
   width: 100%;
-  max-width: 1180px;
+  max-width: 1240px;
   box-sizing: border-box;
   margin: 0 auto;
   padding: 24px 28px 60px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: 220px minmax(0, 1fr);
   align-items: start;
   gap: 16px;
 }
 
+.settings-sidebar {
+  position: sticky;
+  top: 76px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--panel-bg-strong) 82%, transparent), color-mix(in srgb, var(--panel-bg) 74%, transparent));
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.16);
+}
+
+.settings-section-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text-muted);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.settings-section-tab strong {
+  font-size: 13px;
+  color: color-mix(in srgb, var(--text-strong) 86%, transparent);
+}
+
+.settings-section-tab span {
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.settings-section-tab:hover {
+  transform: translateX(1px);
+  background: var(--control-bg);
+  border-color: var(--control-border);
+}
+
+.settings-section-tab.active {
+  background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
+  border-color: color-mix(in srgb, var(--accent-primary) 34%, var(--control-border));
+  color: var(--text-strong);
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent-primary) 76%, transparent);
+}
+
 .settings-main,
 .settings-side {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
+  grid-column: 2;
+  grid-row: 1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 16px;
+  min-width: 0;
+}
+
+.setting-card {
+  min-width: 0;
+}
+
+.theme-card,
+.preferences-card,
+.density-heat-card,
+.insight-display-card,
+.password-card {
+  grid-column: 1 / -1;
+}
+
+.account-card,
+.current-map-card,
+.manage-card {
+  align-self: stretch;
+}
+
+.settings-main .setting-card:nth-child(2) {
+  animation-delay: 55ms;
+}
+
+.settings-main .setting-card:nth-child(3) {
+  animation-delay: 110ms;
+}
+
+.settings-main .setting-card:nth-child(4) {
+  animation-delay: 165ms;
+}
+
+.settings-side .setting-card:nth-child(1) {
+  animation-delay: 80ms;
+}
+
+.settings-side .setting-card:nth-child(2) {
+  animation-delay: 135ms;
+}
+
+.settings-side .setting-card:nth-child(3) {
+  animation-delay: 190ms;
+}
+
+.settings-side .setting-card:nth-child(4) {
+  animation-delay: 245ms;
+}
+
+.settings-side .setting-card:nth-child(5) {
+  animation-delay: 300ms;
 }
 
 /* Cards */
 .setting-card {
   border-radius: 14px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.05);
+  background: color-mix(in srgb, var(--panel-bg) 76%, rgba(255, 255, 255, 0.02));
+  border: 1px solid var(--panel-border);
   overflow: hidden;
+  animation: settingsCardIn 0.42s ease both;
+  transition:
+    transform 0.18s ease,
+    border-color 0.18s ease,
+    background 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.setting-card:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent-primary) 28%, rgba(255, 255, 255, 0.1));
+  background: rgba(255, 255, 255, 0.026);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.16);
 }
 
 .card-head {
@@ -749,6 +968,94 @@ async function handleLogout() {
 
 .card-body {
   padding: 16px 18px;
+}
+
+.theme-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+}
+
+.theme-choice {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 5px 12px;
+  min-height: 92px;
+  padding: 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.018)),
+    rgba(6, 13, 22, 0.48);
+  color: #edf7ff;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    background 0.16s ease;
+}
+
+.theme-choice:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent-primary) 36%, rgba(255, 255, 255, 0.12));
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
+}
+
+.theme-choice.active {
+  border-color: color-mix(in srgb, var(--accent-primary) 68%, rgba(255, 255, 255, 0.14));
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-primary) 14%, transparent), rgba(255, 255, 255, 0.035)),
+    rgba(6, 13, 22, 0.54);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-primary) 18%, transparent),
+    0 16px 34px rgba(0, 0, 0, 0.22);
+}
+
+.theme-choice strong {
+  align-self: end;
+  font-size: 14px;
+}
+
+.theme-choice small {
+  grid-column: 2;
+  align-self: start;
+  color: rgba(214, 228, 242, 0.68);
+  line-height: 1.5;
+}
+
+.theme-swatch {
+  grid-row: span 2;
+  display: grid;
+  grid-template-columns: repeat(3, 18px);
+  align-items: end;
+  gap: 3px;
+  width: 70px;
+  height: 50px;
+  padding: 9px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.theme-swatch i {
+  display: block;
+  border-radius: 999px;
+  box-shadow: 0 0 12px currentColor;
+}
+
+.theme-swatch i:nth-child(1) {
+  height: 30px;
+}
+
+.theme-swatch i:nth-child(2) {
+  height: 22px;
+}
+
+.theme-swatch i:nth-child(3) {
+  height: 14px;
 }
 
 .setting-row {
@@ -790,18 +1097,28 @@ async function handleLogout() {
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: rgba(238, 246, 255, 0.5);
   cursor: pointer;
-  transition: all 0.15s;
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
   white-space: nowrap;
   flex-shrink: 0;
 }
 
 .toggle-btn.active {
-  background: rgba(98, 214, 255, 0.15);
-  border-color: rgba(98, 214, 255, 0.3);
-  color: #62d6ff;
+  background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent-primary) 34%, rgba(255, 255, 255, 0.08));
+  color: var(--accent-primary);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-primary) 10%, transparent),
+    0 0 18px color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  animation: settingsActivePulse 1.8s ease-in-out infinite;
 }
 
 .toggle-btn:hover:not(.active) {
+  transform: translateY(-1px);
   background: rgba(255, 255, 255, 0.08);
 }
 
@@ -818,13 +1135,17 @@ async function handleLogout() {
   height: 56px;
   border-radius: 50%;
   background:
-    linear-gradient(135deg, rgba(98, 214, 255, 0.22), rgba(185, 156, 255, 0.14)),
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, var(--accent-primary) 22%, transparent),
+      color-mix(in srgb, var(--accent-secondary) 14%, transparent)
+    ),
     rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(98, 214, 255, 0.24);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 26%, transparent);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #62d6ff;
+  color: var(--accent-primary);
   font-size: 18px;
   font-weight: 800;
   letter-spacing: 0;
@@ -862,11 +1183,21 @@ async function handleLogout() {
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid rgba(255, 255, 255, 0.06);
   color: rgba(238, 246, 255, 0.5);
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease;
+}
+
+.mini-stat:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent-primary) 17%, transparent);
+  background: color-mix(in srgb, var(--accent-primary) 5%, transparent);
 }
 
 .mini-stat svg {
   grid-area: icon;
-  color: #62d6ff;
+  color: var(--accent-primary);
 }
 
 .mini-stat span {
@@ -897,11 +1228,15 @@ async function handleLogout() {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  color: #62d6ff;
+  color: var(--accent-primary);
   background:
-    radial-gradient(circle at 50% 50%, rgba(98, 214, 255, 0.26), rgba(98, 214, 255, 0.06) 62%),
+    radial-gradient(
+      circle at 50% 50%,
+      color-mix(in srgb, var(--accent-primary) 26%, transparent),
+      color-mix(in srgb, var(--accent-primary) 6%, transparent) 62%
+    ),
     rgba(255, 255, 255, 0.035);
-  border: 1px solid rgba(98, 214, 255, 0.18);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 20%, transparent);
 }
 
 .map-overview-copy {
@@ -948,10 +1283,20 @@ async function handleLogout() {
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid rgba(255, 255, 255, 0.06);
   font-size: 12px;
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease;
+}
+
+.quick-stat-row span:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent-primary) 15%, transparent);
+  background: color-mix(in srgb, var(--accent-primary) 5%, transparent);
 }
 
 .quick-stat-row svg {
-  color: #62d6ff;
+  color: var(--accent-primary);
 }
 
 .side-action-row {
@@ -978,6 +1323,16 @@ async function handleLogout() {
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.035);
   border: 1px solid rgba(255, 255, 255, 0.06);
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease;
+}
+
+.preference-token:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent-primary) 15%, transparent);
+  background: color-mix(in srgb, var(--accent-primary) 5%, transparent);
 }
 
 .preference-token.wide {
@@ -1030,6 +1385,12 @@ async function handleLogout() {
   cursor: pointer;
   flex: 1;
   white-space: nowrap;
+  transition:
+    transform 0.14s ease,
+    background 0.14s ease,
+    color 0.14s ease,
+    border-color 0.14s ease,
+    box-shadow 0.14s ease;
 }
 
 .segmented-control.wrap button {
@@ -1044,8 +1405,18 @@ async function handleLogout() {
 }
 
 .segmented-control button.active {
-  background: rgba(98, 214, 255, 0.16);
-  color: #62d6ff;
+  background: color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  color: var(--accent-primary);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent-primary) 10%, transparent);
+}
+
+.segmented-control button:hover:not(.active) {
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(238, 246, 255, 0.78);
+}
+
+.segmented-control.wrap button:hover:not(.active) {
+  transform: translateY(-1px);
 }
 
 .date-input-row {
@@ -1063,6 +1434,16 @@ async function handleLogout() {
   border: 1px solid rgba(255, 255, 255, 0.1);
   color: #eef6ff;
   font-size: 12px;
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.date-input-row input:focus {
+  border-color: color-mix(in srgb, var(--accent-primary) 34%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 8%, transparent);
+  outline: none;
 }
 
 .threshold-grid {
@@ -1088,6 +1469,14 @@ async function handleLogout() {
   border: 1px solid rgba(255, 255, 255, 0.07);
   color: rgba(238, 246, 255, 0.55);
   font-size: 12px;
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease;
+}
+
+.threshold-field:focus-within {
+  border-color: color-mix(in srgb, var(--accent-primary) 23%, transparent);
+  background: color-mix(in srgb, var(--accent-primary) 5%, transparent);
 }
 
 .threshold-field input {
@@ -1095,12 +1484,20 @@ async function handleLogout() {
   min-width: 0;
   padding: 5px 7px;
   border-radius: 7px;
-  border: 1px solid rgba(98, 214, 255, 0.2);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 22%, transparent);
   background: rgba(8, 17, 31, 0.68);
   color: #eef6ff;
   font-weight: 700;
   text-align: center;
   outline: none;
+  transition:
+    border-color 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.threshold-field input:focus {
+  border-color: color-mix(in srgb, var(--accent-primary) 44%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 8%, transparent);
 }
 
 .setting-hint {
@@ -1129,12 +1526,20 @@ async function handleLogout() {
   color: #eef6ff;
   font-size: 13px;
   cursor: pointer;
+  transition:
+    transform 0.16s ease,
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease,
+    box-shadow 0.16s ease;
 }
 
 .manage-entry:hover {
-  background: rgba(98, 214, 255, 0.1);
-  border-color: rgba(98, 214, 255, 0.22);
-  color: #62d6ff;
+  transform: translateX(2px);
+  background: color-mix(in srgb, var(--accent-primary) 11%, transparent);
+  border-color: color-mix(in srgb, var(--accent-primary) 24%, transparent);
+  color: var(--accent-primary);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.14);
 }
 
 /* Password */
@@ -1145,6 +1550,10 @@ async function handleLogout() {
   max-width: 320px;
 }
 
+.password-card .pw-form {
+  max-width: none;
+}
+
 .pw-form input {
   padding: 9px 12px;
   border-radius: 8px;
@@ -1153,22 +1562,28 @@ async function handleLogout() {
   color: #eef6ff;
   font-size: 13px;
   outline: none;
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease;
 }
 
 .pw-form input:focus {
-  border-color: rgba(98, 214, 255, 0.3);
+  border-color: color-mix(in srgb, var(--accent-primary) 32%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 8%, transparent);
 }
 
 .form-error {
-  color: #ff8fa3;
+  color: var(--danger);
   font-size: 12px;
   margin: 0;
 }
 
 .form-success {
-  color: #8cf0b4;
+  color: var(--success);
   font-size: 12px;
   margin: 0;
+  animation: settingsStatusIn 0.22s ease both;
 }
 
 /* Buttons */
@@ -1179,12 +1594,22 @@ async function handleLogout() {
   gap: 6px;
   padding: 9px 20px;
   border-radius: 8px;
-  background: #62d6ff;
+  background: var(--accent-primary);
   color: #08111f;
   font-weight: 600;
   font-size: 13px;
   border: none;
   cursor: pointer;
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease,
+    filter 0.15s ease;
+}
+
+.primary-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--accent-primary) 24%, transparent);
+  filter: brightness(1.04);
 }
 
 .primary-button:disabled {
@@ -1203,10 +1628,33 @@ async function handleLogout() {
   border: 1px solid rgba(255, 255, 255, 0.1);
   font-size: 13px;
   cursor: pointer;
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .secondary-button:hover:not(:disabled) {
+  transform: translateY(-1px);
   background: rgba(255, 255, 255, 0.08);
+  border-color: color-mix(in srgb, var(--accent-primary) 26%, rgba(255, 255, 255, 0.12));
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.12);
+}
+
+.sync-button {
+  position: relative;
+  overflow: hidden;
+}
+
+.sync-button.loading::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 0%, color-mix(in srgb, var(--accent-primary) 18%, transparent) 45%, transparent 72%);
+  transform: translateX(-120%);
+  animation: settingsScan 1s linear infinite;
+  pointer-events: none;
 }
 
 .wide-button {
@@ -1221,14 +1669,22 @@ async function handleLogout() {
   padding: 8px 16px;
   border-radius: 8px;
   background: transparent;
-  color: #ff8fa3;
-  border: 1px solid rgba(255, 143, 163, 0.3);
+  color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 34%, transparent);
   font-size: 13px;
   cursor: pointer;
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .danger-outline:hover {
-  background: rgba(255, 143, 163, 0.08);
+  transform: translateY(-1px);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 46%, transparent);
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--danger) 9%, transparent);
 }
 
 .muted {
@@ -1250,11 +1706,90 @@ async function handleLogout() {
   cursor: pointer;
 }
 
-.icon-button:hover { color: #eef6ff; background: rgba(255, 255, 255, 0.06); }
+.icon-button {
+  transition:
+    transform 0.15s ease,
+    color 0.15s ease,
+    background 0.15s ease;
+}
+
+.icon-button:hover {
+  transform: translateY(-1px);
+  color: #eef6ff;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+@keyframes settingsCardIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes settingsActivePulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent-primary) 10%, transparent),
+      0 0 18px color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1px color-mix(in srgb, var(--accent-primary) 18%, transparent),
+      0 0 24px color-mix(in srgb, var(--accent-primary) 16%, transparent);
+  }
+}
+
+@keyframes settingsScan {
+  to {
+    transform: translateX(120%);
+  }
+}
+
+@keyframes settingsStatusIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 
 @media (prefers-reduced-motion: reduce) {
   .settings-page {
     animation: none;
+  }
+
+  .setting-card,
+  .toggle-btn.active,
+  .form-success,
+  .sync-button.loading::after {
+    animation: none;
+  }
+
+  .setting-card,
+  .toggle-btn,
+  .theme-choice,
+  .segmented-control button,
+  .mini-stat,
+  .quick-stat-row span,
+  .preference-token,
+  .manage-entry,
+  .primary-button,
+  .secondary-button,
+  .danger-outline,
+  .icon-button,
+  .date-input-row input,
+  .threshold-field,
+  .threshold-field input,
+  .pw-form input {
+    transition: none;
   }
 }
 
@@ -1264,8 +1799,49 @@ async function handleLogout() {
     padding: 20px 16px 48px;
   }
 
+  .settings-sidebar {
+    position: sticky;
+    top: 52px;
+    z-index: 8;
+    grid-column: 1 / -1;
+    flex-direction: row;
+    overflow-x: auto;
+    padding: 8px;
+    scrollbar-width: thin;
+  }
+
+  .settings-section-tab {
+    min-width: 132px;
+    flex: 0 0 auto;
+  }
+
+  .settings-main,
+  .settings-side {
+    grid-column: 1 / -1;
+    grid-template-columns: 1fr;
+  }
+
+  .renderer-card,
+  .theme-card,
+  .layout-card,
+  .preferences-card,
+  .density-heat-card,
+  .insight-display-card,
+  .password-card,
+  .account-card,
+  .current-map-card,
+  .manage-card,
+  .preference-overview-card,
+  .sync-card {
+    grid-column: 1 / -1;
+  }
+
   .manage-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .theme-choice-grid {
+    grid-template-columns: 1fr;
   }
 
   .manage-entry {
@@ -1276,6 +1852,7 @@ async function handleLogout() {
 @media (max-width: 620px) {
   .account-stat-grid,
   .manage-grid,
+  .theme-choice-grid,
   .threshold-grid,
   .insight-limit-grid {
     grid-template-columns: 1fr;

@@ -9,7 +9,8 @@ import {
   getUserPreferences,
   updateUserPreferences
 } from '../services/api';
-import type { UserAccount, UserPreferences } from '../types/domain';
+import type { ThemeMode, UserAccount, UserPreferences } from '../types/domain';
+import { isThemeMode } from '../constants/themes';
 import { useGraphStore } from './graph';
 import { useMapsStore } from './maps';
 import { useUiStore } from './ui';
@@ -22,6 +23,11 @@ function readLayoutMode(): 'semantic' | 'domain' {
   return localStorage.getItem('nebula.layoutMode') === 'domain' ? 'domain' : 'semantic';
 }
 
+function readThemeMode(): ThemeMode {
+  const mode = localStorage.getItem('nebula.themeMode');
+  return isThemeMode(mode) ? mode : 'deepSpace';
+}
+
 export const useAuthStore = defineStore('auth', () => {
   const currentUser = ref<UserAccount | null>(null);
   const checkingAuth = ref(true);
@@ -31,6 +37,7 @@ export const useAuthStore = defineStore('auth', () => {
 
   const rendererMode = ref<'canvas' | 'webgpu'>(readRendererMode());
   const layoutMode = ref<'semantic' | 'domain'>(readLayoutMode());
+  const themeMode = ref<ThemeMode>(readThemeMode());
 
   async function checkAuth() {
     checkingAuth.value = true;
@@ -97,11 +104,18 @@ export const useAuthStore = defineStore('auth', () => {
     schedulePreferenceSync();
   }
 
+  function setThemeMode(mode: ThemeMode) {
+    themeMode.value = mode;
+    localStorage.setItem('nebula.themeMode', mode);
+    schedulePreferenceSync();
+  }
+
   function buildPreferences(): UserPreferences {
     const graphStore = useGraphStore();
     return {
       rendererMode: rendererMode.value,
       layoutMode: layoutMode.value,
+      themeMode: themeMode.value,
       timeFilter: graphStore.timeFilter,
       frequencyFilter: graphStore.frequencyFilter,
       highFrequencyMinimum: graphStore.highFrequencyMinimum,
@@ -115,6 +129,7 @@ export const useAuthStore = defineStore('auth', () => {
       nebulaHeatMediumDelta: graphStore.nebulaHeatMediumDelta,
       nebulaHeatStrongDelta: graphStore.nebulaHeatStrongDelta,
       nebulaHeatFlatOpacity: graphStore.nebulaHeatFlatOpacity,
+      nebulaLogDensityMode: graphStore.nebulaLogDensityMode,
       sortMode: graphStore.sortMode,
       customStartDate: graphStore.customStartDate,
       customEndDate: graphStore.customEndDate
@@ -131,6 +146,10 @@ export const useAuthStore = defineStore('auth', () => {
       if (preferences?.layoutMode) {
         layoutMode.value = preferences.layoutMode;
         localStorage.setItem('nebula.layoutMode', preferences.layoutMode);
+      }
+      if (preferences?.themeMode) {
+        themeMode.value = preferences.themeMode;
+        localStorage.setItem('nebula.themeMode', preferences.themeMode);
       }
       const graphStore = useGraphStore();
       if (preferences?.timeFilter) graphStore.setTimeFilter(preferences.timeFilter);
@@ -167,6 +186,9 @@ export const useAuthStore = defineStore('auth', () => {
       }
       if (typeof preferences?.nebulaHeatFlatOpacity === 'number') {
         graphStore.setNebulaHeatFlatOpacity(preferences.nebulaHeatFlatOpacity);
+      }
+      if (preferences?.nebulaLogDensityMode) {
+        graphStore.setNebulaLogDensityMode(preferences.nebulaLogDensityMode);
       }
       if (preferences?.sortMode) graphStore.setSortMode(preferences.sortMode);
       if (preferences?.customStartDate !== undefined) {
@@ -216,6 +238,7 @@ export const useAuthStore = defineStore('auth', () => {
     preferenceSyncing,
     rendererMode,
     layoutMode,
+    themeMode,
     checkAuth,
     acceptAuthenticatedUser,
     handleLogin,
@@ -224,6 +247,7 @@ export const useAuthStore = defineStore('auth', () => {
     handleChangePassword,
     setRendererMode,
     setLayoutMode,
+    setThemeMode,
     syncPreferences,
     savePreferencesNow,
     schedulePreferenceSync

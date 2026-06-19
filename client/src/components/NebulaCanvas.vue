@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import type { DomainCategory, GraphData, LayoutMode, LogEntry, TagNode } from '../types/domain';
+import { buildLogClusters, shouldClusterLogs, type ClusterPoint } from '../utils/logClusters';
 
 type PickNode =
   | { kind: 'tag'; id: number; x: number; y: number; r: number }
-  | { kind: 'log'; id: number; x: number; y: number; r: number };
+  | { kind: 'log'; id: number; x: number; y: number; r: number }
+  | { kind: 'cluster'; id: string; x: number; y: number; r: number; logIds: number[] };
 
 type LayoutPoint = { x: number; y: number; r: number };
 type LayoutSnapshot = {
@@ -28,6 +30,8 @@ type DrawState = {
   visibleTagIds: Set<number>;
   selectedLogTagIds: Set<number>;
   relatedTagIds: Set<number>;
+  clusters: ClusterPoint[];
+  clusteredLogIds: Set<number>;
 };
 
 const props = defineProps<{
@@ -38,6 +42,8 @@ const props = defineProps<{
   focusPulseLogId?: number | null;
   priorityTagIds?: number[];
   priorityDisplayLimit?: number;
+  logClusteringEnabled?: boolean;
+  activeClusterLogIds?: Set<number> | null;
   domainFocusTagIds?: Set<number>;
 }>();
 
@@ -46,6 +52,7 @@ const emit = defineEmits<{
   tagContext: [payload: { tagId: number; x: number; y: number; width: number; height: number }];
   logOpen: [logId: number];
   logInspect: [payload: { logId: number; x: number; y: number; width: number; height: number }];
+  logClusterOpen: [payload: { logIds: number[]; x: number; y: number; width: number; height: number }];
   layoutDirty: [dirty: boolean];
 }>();
 
@@ -160,7 +167,16 @@ watch(
 );
 
 watch(
-  () => [props.activeTagIds, props.selectedLogId, props.focusPulseLogId, props.priorityTagIds, props.priorityDisplayLimit, props.domainFocusTagIds],
+  () => [
+    props.activeTagIds,
+    props.selectedLogId,
+    props.focusPulseLogId,
+    props.priorityTagIds,
+    props.priorityDisplayLimit,
+    props.logClusteringEnabled,
+    props.activeClusterLogIds,
+    props.domainFocusTagIds
+  ],
   () => draw(),
   { deep: true }
 );
@@ -256,7 +272,7 @@ function draw() {
   drawTags(state);
 
   ctx.restore();
-  drawHud(rect.width, rect.height);
+  drawHud(rect.width, rect.height, state);
 }
 
 function buildDrawState(): DrawState {
@@ -286,42 +302,33 @@ function buildDrawState(): DrawState {
       visibleTagIds.add(tag.id);
       relatedTagIds.add(tag.id);
     }
-    return {
-      logsById,
-      tagsById,
-      selectedLogId: props.selectedLogId,
-      activeRelationMode,
-      highlightedLogIds,
-      visibleLogIds,
-      visibleTagIds,
-      selectedLogTagIds,
-      relatedTagIds
-    };
-  }
-
-  for (const tagId of activeIds) {
-    visibleTagIds.add(tagId);
-    relatedTagIds.add(tagId);
-  }
-
-  for (const log of props.graph.logs) {
-    if (!highlightedLogIds.has(log.id)) {
-      continue;
+  } else {
+    for (const tagId of activeIds) {
+      visibleTagIds.add(tagId);
+      relatedTagIds.add(tagId);
     }
-    visibleLogIds.add(log.id);
-    for (const tag of log.tags) {
-      visibleTagIds.add(tag.id);
-      relatedTagIds.add(tag.id);
+
+    for (const log of props.graph.logs) {
+      if (!highlightedLogIds.has(log.id)) {
+        continue;
+      }
+      visibleLogIds.add(log.id);
+      for (const tag of log.tags) {
+        visibleTagIds.add(tag.id);
+        relatedTagIds.add(tag.id);
+      }
+    }
+
+    if (selectedLog) {
+      visibleLogIds.add(selectedLog.id);
+      for (const tag of selectedLog.tags) {
+        visibleTagIds.add(tag.id);
+        relatedTagIds.add(tag.id);
+      }
     }
   }
 
-  if (selectedLog) {
-    visibleLogIds.add(selectedLog.id);
-    for (const tag of selectedLog.tags) {
-      visibleTagIds.add(tag.id);
-      relatedTagIds.add(tag.id);
-    }
-  }
+  const clusterState = computeCanvasClusters(visibleLogIds);
 
   return {
     logsById,
@@ -332,8 +339,33 @@ function buildDrawState(): DrawState {
     visibleLogIds,
     visibleTagIds,
     selectedLogTagIds,
-    relatedTagIds
+    relatedTagIds,
+    clusters: clusterState.clusters,
+    clusteredLogIds: clusterState.clusteredLogIds
   };
+}
+
+function computeCanvasClusters(visibleLogIds: Set<number>) {
+  const visibleLogs = props.graph.logs.filter((log) => visibleLogIds.has(log.id) && logPositions.has(log.id));
+  if (!shouldClusterLogs(visibleLogs.length, transform.scale, props.logClusteringEnabled !== false)) {
+    return { clusters: [] as ClusterPoint[], clusteredLogIds: new Set<number>() };
+  }
+  const clusterState = buildLogClusters(visibleLogs, logPositions, tagPositions, {
+    selectedLogId: props.selectedLogId,
+    focusPulseLogId: props.focusPulseLogId ?? null,
+    activeTagIds: props.activeTagIds,
+    expandedLogIds: props.activeClusterLogIds
+  });
+  const clusteredLogIds = new Set<number>();
+  for (const cluster of clusterState.clusters) {
+    for (const logId of cluster.logIds) {
+      clusteredLogIds.add(logId);
+    }
+  }
+  for (const logId of clusterState.singleLogIds) {
+    clusteredLogIds.delete(logId);
+  }
+  return { clusters: clusterState.clusters, clusteredLogIds };
 }
 
 function drawBackground(width: number, height: number) {
@@ -341,9 +373,9 @@ function drawBackground(width: number, height: number) {
     return;
   }
   const gradient = ctx.createLinearGradient(0, 0, width, height);
-  gradient.addColorStop(0, '#08111f');
-  gradient.addColorStop(0.48, '#101927');
-  gradient.addColorStop(1, '#061318');
+  gradient.addColorStop(0, themeColor('--canvas-bg', '#08111f'));
+  gradient.addColorStop(0.48, themeColor('--page-bg-b', '#101927'));
+  gradient.addColorStop(1, themeColor('--page-bg-c', '#061318'));
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, width, height);
 
@@ -355,9 +387,9 @@ function drawBackground(width: number, height: number) {
   const wrapHeight = height + 260;
 
   const glowPoints = [
-    { seed: 31, radius: 210, color: 'rgba(98, 214, 255, 0.08)' },
-    { seed: 63, radius: 260, color: 'rgba(185, 156, 255, 0.06)' },
-    { seed: 97, radius: 180, color: 'rgba(247, 215, 116, 0.045)' }
+    { seed: 31, radius: 210, color: colorWithAlpha(themeColor('--accent-primary', '#62d6ff'), 0.08) },
+    { seed: 63, radius: 260, color: colorWithAlpha(themeColor('--accent-secondary', '#6f8ed8'), 0.06) },
+    { seed: 97, radius: 180, color: colorWithAlpha(themeColor('--warning', '#f7d774'), 0.045) }
   ];
 
   for (const glow of glowPoints) {
@@ -407,6 +439,13 @@ function drawRelationFlows(state: DrawState) {
     if (!tag || !log || !logEntry || !tagEntry) {
       continue;
     }
+    if (
+      state.clusteredLogIds.has(logEntry.id) &&
+      props.selectedLogId !== logEntry.id &&
+      props.focusPulseLogId !== logEntry.id
+    ) {
+      continue;
+    }
     const relation = relationFlowState(edge.tagId, logEntry, state);
     if (!relation.visible) {
       continue;
@@ -420,29 +459,119 @@ function drawRelationFlows(state: DrawState) {
       y: (tag.y + log.y) / 2 + (dx / length) * bend
     };
     const phase = seeded(edge.tagId * 31 + edge.logId);
-    const alpha = relation.selected ? 0.18 : 0.12;
+    const logToTag = relation.direction === 'log-to-tag';
+    const alpha = logToTag ? 0.24 : relation.selected ? 0.18 : 0.12;
 
     ctx.beginPath();
     ctx.moveTo(tag.x, tag.y);
     ctx.quadraticCurveTo(control.x, control.y, log.x, log.y);
     ctx.strokeStyle = hexToRgba(tagEntry.color, alpha);
-    ctx.lineWidth = (relation.selected ? 7 : 4.5) / transform.scale;
+    ctx.lineWidth = (logToTag ? 6.8 : relation.selected ? 7 : 4.5) / transform.scale;
     ctx.shadowColor = tagEntry.color;
-    ctx.shadowBlur = (relation.selected ? 9 : 4) / transform.scale;
+    ctx.shadowBlur = (logToTag ? 11 : relation.selected ? 9 : 4) / transform.scale;
+    ctx.lineCap = 'round';
+    if (logToTag) {
+      ctx.setLineDash([10 / transform.scale, 8 / transform.scale]);
+      ctx.lineDashOffset = -(frame * 0.22 + phase * 24) / transform.scale;
+    } else {
+      ctx.setLineDash([]);
+      ctx.lineDashOffset = 0;
+    }
     ctx.stroke();
+    ctx.setLineDash([]);
 
-    const particleCount = relation.selected ? 4 : 2;
+    if (logToTag) {
+      drawRelationDiamond(log.x, log.y, tagEntry.color, 5.4 / transform.scale);
+      drawRelationRing(tag.x, tag.y, tagEntry.color, 9 / transform.scale);
+    } else {
+      drawRelationSourceDot(tag.x, tag.y, tagEntry.color, 4.8 / transform.scale);
+    }
+
+    const particleCount = logToTag || relation.selected ? 4 : 2;
     for (let index = 0; index < particleCount; index += 1) {
-      const t = (frame * 0.018 + phase + index / particleCount) % 1;
+      const flowT = (frame * 0.018 + phase + index / particleCount) % 1;
+      const t = logToTag ? 1 - flowT : flowT;
       const point = quadraticPoint(tag, control, log, t);
       const pulse = 0.65 + Math.sin((t + phase) * Math.PI * 2) * 0.25;
-      ctx.beginPath();
-      ctx.fillStyle = hexToRgba(tagEntry.color, (relation.selected ? 0.72 : 0.48) * pulse);
-      ctx.shadowBlur = 3 / transform.scale;
-      ctx.arc(point.x, point.y, (1.7 + pulse * 1.4) / transform.scale, 0, Math.PI * 2);
-      ctx.fill();
+      if (logToTag) {
+        const tangent = quadraticTangent(tag, control, log, t);
+        drawRelationArrowParticle(point, { x: -tangent.x, y: -tangent.y }, tagEntry.color, pulse);
+      } else {
+        ctx.beginPath();
+        ctx.fillStyle = hexToRgba(tagEntry.color, (relation.selected ? 0.72 : 0.48) * pulse);
+        ctx.shadowBlur = 3 / transform.scale;
+        ctx.arc(point.x, point.y, (1.7 + pulse * 1.4) / transform.scale, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
   }
+  ctx.restore();
+}
+
+function drawRelationSourceDot(x: number, y: number, color: string, radius: number) {
+  if (!ctx) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.fillStyle = hexToRgba(color, 0.86);
+  ctx.shadowColor = color;
+  ctx.shadowBlur = radius * 2.4;
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawRelationRing(x: number, y: number, color: string, radius: number) {
+  if (!ctx) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.strokeStyle = hexToRgba(color, 0.62);
+  ctx.lineWidth = Math.max(1, radius * 0.16);
+  ctx.shadowColor = color;
+  ctx.shadowBlur = radius * 1.8;
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawRelationDiamond(x: number, y: number, color: string, radius: number) {
+  if (!ctx) return;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.PI / 4);
+  ctx.fillStyle = hexToRgba(color, 0.8);
+  ctx.strokeStyle = hexToRgba('#ffffff', 0.34);
+  ctx.lineWidth = Math.max(0.8, radius * 0.18);
+  ctx.shadowColor = color;
+  ctx.shadowBlur = radius * 2.2;
+  ctx.beginPath();
+  ctx.rect(-radius, -radius, radius * 2, radius * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawRelationArrowParticle(
+  point: { x: number; y: number },
+  tangent: { x: number; y: number },
+  color: string,
+  pulse: number
+) {
+  if (!ctx) return;
+  const angle = Math.atan2(tangent.y, tangent.x);
+  const size = (4.2 + pulse * 1.8) / transform.scale;
+  ctx.save();
+  ctx.translate(point.x, point.y);
+  ctx.rotate(angle);
+  ctx.fillStyle = hexToRgba(color, 0.82 * pulse);
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 5 / transform.scale;
+  ctx.beginPath();
+  ctx.moveTo(size, 0);
+  ctx.lineTo(-size * 0.72, -size * 0.52);
+  ctx.lineTo(-size * 0.42, 0);
+  ctx.lineTo(-size * 0.72, size * 0.52);
+  ctx.closePath();
+  ctx.fill();
   ctx.restore();
 }
 
@@ -559,6 +688,7 @@ function drawLogs(state: DrawState) {
   if (!ctx) {
     return;
   }
+  drawLogClusters(state);
   for (const log of props.graph.logs) {
     const point = logPositions.get(log.id);
     if (!point) {
@@ -570,6 +700,9 @@ function drawLogs(state: DrawState) {
     const selected = props.selectedLogId === log.id;
     const pulsing = props.focusPulseLogId === log.id;
     const highlighted = state.highlightedLogIds.has(log.id);
+    if (state.clusteredLogIds.has(log.id) && !selected && !pulsing && !highlighted) {
+      continue;
+    }
     const muted = props.activeTagIds.size === 0 && state.activeRelationMode && !selected && !highlighted;
     ctx.save();
     ctx.shadowColor = selected || pulsing ? '#ffffff' : highlighted ? '#9ee7ff' : 'transparent';
@@ -585,12 +718,12 @@ function drawLogs(state: DrawState) {
     ctx.closePath();
     ctx.fill();
     ctx.lineWidth = selected || pulsing ? 2 / transform.scale : 1 / transform.scale;
-    ctx.strokeStyle = selected || pulsing ? '#55d6ff' : 'rgba(255,255,255,0.28)';
+    ctx.strokeStyle = selected || pulsing ? themeColor('--accent-primary', '#55d6ff') : 'rgba(255,255,255,0.28)';
     ctx.stroke();
     if (pulsing) {
       ctx.beginPath();
       ctx.shadowBlur = 10 / transform.scale;
-      ctx.strokeStyle = 'rgba(98, 214, 255, 0.58)';
+      ctx.strokeStyle = colorWithAlpha(themeColor('--accent-primary', '#62d6ff'), 0.58);
       ctx.lineWidth = 1.4 / transform.scale;
       ctx.arc(point.x, point.y, logRadius * (2.1 + pulse * 0.35), 0, Math.PI * 2);
       ctx.stroke();
@@ -600,7 +733,116 @@ function drawLogs(state: DrawState) {
   }
 }
 
-function drawHud(width: number, height: number) {
+function drawLogClusters(state: DrawState) {
+  if (!ctx || state.clusters.length === 0) {
+    return;
+  }
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const cluster of state.clusters) {
+    const color = clusterColor(cluster, state);
+    const active = cluster.logIds.some((id) => props.activeClusterLogIds?.has(id));
+    const child = cluster.level === 'child';
+    const pulse = active ? 0.5 + 0.5 * Math.sin(frame * 0.05) : 0;
+    const radius = cluster.r * (child ? 0.9 : 1) * (active ? 1.12 + pulse * 0.04 : 1);
+    const cloudRadius = radius * (child ? 1.78 : 2.28);
+    const seed = seeded(cluster.count * 37 + cluster.x * 0.11 + cluster.y * 0.17);
+    ctx.save();
+    ctx.translate(cluster.x, cluster.y);
+    ctx.shadowColor = color;
+    ctx.shadowBlur = (active ? 24 : child ? 14 : 17) / transform.scale;
+
+    const haze = ctx.createRadialGradient(0, 0, radius * 0.18, 0, 0, cloudRadius);
+    haze.addColorStop(0, hexToRgba(color, active ? 0.32 : 0.2));
+    haze.addColorStop(0.48, hexToRgba(color, active ? 0.16 : 0.1));
+    haze.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.beginPath();
+    ctx.fillStyle = haze;
+    ctx.arc(0, 0, cloudRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    const ringCount = child ? 1 : cluster.count > 28 ? 3 : 2;
+    for (let ring = 0; ring < ringCount; ring += 1) {
+      const ringRadius = radius * (1.1 + ring * 0.36 + pulse * 0.08);
+      ctx.save();
+      ctx.rotate(seed * Math.PI + ring * 0.72 + frame * (active ? 0.0022 : 0.0011));
+      ctx.beginPath();
+      ctx.strokeStyle = hexToRgba(color, active ? 0.38 - ring * 0.06 : 0.22 - ring * 0.04);
+      ctx.lineWidth = (active ? 1.35 : 0.9) / transform.scale;
+      ctx.ellipse(0, 0, ringRadius * (1.18 + ring * 0.08), ringRadius * (0.55 + ring * 0.04), 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    const dustCount = Math.min(child ? 7 : 10, Math.max(4, Math.round(Math.log2(cluster.count + 2) * 1.7)));
+    for (let index = 0; index < dustCount; index += 1) {
+      const angle = seeded(cluster.count * 53 + index * 19 + cluster.x) * Math.PI * 2 + frame * 0.003;
+      const distance = radius * (1.12 + seeded(cluster.y + index * 31) * (child ? 0.86 : 1.28));
+      const dotRadius = (1.05 + seeded(index + cluster.count) * 1.3) / transform.scale;
+      ctx.beginPath();
+      ctx.fillStyle = hexToRgba(index % 3 === 0 ? '#ffffff' : color, active ? 0.72 : 0.48);
+      ctx.arc(Math.cos(angle) * distance, Math.sin(angle) * distance * 0.72, dotRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.beginPath();
+    ctx.fillStyle = hexToRgba(color, active ? 0.72 : child ? 0.58 : 0.52);
+    ctx.strokeStyle = active ? '#ffffff' : hexToRgba(color, child ? 0.72 : 0.58);
+    ctx.lineWidth = (active ? 2.2 : 1.4) / transform.scale;
+    ctx.arc(0, 0, radius * (child ? 0.58 : 0.68), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    if (active || child) {
+      const label = `${cluster.count}条`;
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.font = `700 ${Math.max(10, 11 / transform.scale)}px "Microsoft YaHei", sans-serif`;
+      const labelWidth = ctx.measureText(label).width + 14 / transform.scale;
+      const labelHeight = 18 / transform.scale;
+      const labelX = radius * 0.86;
+      const labelY = -radius * 1.08;
+      ctx.fillStyle = 'rgba(5, 13, 24, 0.78)';
+      ctx.strokeStyle = hexToRgba(color, 0.46);
+      ctx.lineWidth = 1 / transform.scale;
+      roundRect(ctx, labelX, labelY, labelWidth, labelHeight, 9 / transform.scale);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(241, 249, 255, 0.88)';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, labelX + labelWidth / 2, labelY + labelHeight / 2);
+    }
+    ctx.restore();
+    pickNodes.push({ kind: 'cluster', id: cluster.id, x: cluster.x, y: cluster.y, r: cloudRadius + 10 / transform.scale, logIds: cluster.logIds });
+  }
+  ctx.restore();
+}
+
+function roundRect(context: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number) {
+  const r = Math.min(radius, width / 2, height / 2);
+  context.beginPath();
+  context.moveTo(x + r, y);
+  context.lineTo(x + width - r, y);
+  context.quadraticCurveTo(x + width, y, x + width, y + r);
+  context.lineTo(x + width, y + height - r);
+  context.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
+  context.lineTo(x + r, y + height);
+  context.quadraticCurveTo(x, y + height, x, y + height - r);
+  context.lineTo(x, y + r);
+  context.quadraticCurveTo(x, y, x + r, y);
+  context.closePath();
+}
+
+function clusterColor(cluster: ClusterPoint, state: DrawState) {
+  const tagColor = cluster.primaryTagId ? state.tagsById.get(cluster.primaryTagId)?.color : null;
+  if (tagColor) {
+    return tagColor;
+  }
+  const log = cluster.logIds.map((id) => state.logsById.get(id)).find(Boolean);
+  return log?.tags[0]?.color ?? themeColor('--accent-primary', '#62d6ff');
+}
+
+function drawHud(width: number, height: number, state: DrawState) {
   const context = ctx;
   if (!context) {
     return;
@@ -617,6 +859,9 @@ function drawHud(width: number, height: number) {
   context.fillText(layoutBusy.value ? '图谱关系正在由 Web Worker 计算...' : cleanHint, 18, height - 18, Math.max(160, width - 150));
   context.textAlign = 'right';
   context.fillText(cleanScaleText, width - 18, height - 18);
+  if (state.activeRelationMode && width > 560) {
+    drawRelationLegend(context);
+  }
   return;
   /*
   const hint =
@@ -641,12 +886,96 @@ function hasActiveRelationMode() {
 function relationFlowState(tagId: number, log: LogEntry, state: DrawState) {
   const selected = state.selectedLogId === log.id;
   const active = props.activeTagIds.has(tagId) && state.highlightedLogIds.has(log.id);
+  const visible =
+    (selected && state.visibleLogIds.has(log.id) && state.visibleTagIds.has(tagId)) ||
+    active;
   return {
-    visible:
-      (selected && state.visibleLogIds.has(log.id) && state.visibleTagIds.has(tagId)) ||
-      active,
-    selected
+    visible,
+    selected,
+    direction: selected ? 'log-to-tag' : 'tag-to-log'
   };
+}
+
+function drawRelationLegend(context: CanvasRenderingContext2D) {
+  const x = 18;
+  const y = 18;
+  const width = 242;
+  const height = 58;
+  const accent = themeColor('--accent-primary', '#62d6ff');
+  context.save();
+  context.globalCompositeOperation = 'source-over';
+  roundRect(context, x, y, width, height, 12);
+  context.fillStyle = colorWithAlpha(themeColor('--panel-bg-strong', '#071421'), 0.76);
+  context.strokeStyle = colorWithAlpha(themeColor('--panel-border', 'rgba(238, 246, 255, 0.14)'), 0.92);
+  context.lineWidth = 1;
+  context.fill();
+  context.stroke();
+
+  context.font = '11px "Microsoft YaHei", sans-serif';
+  context.textAlign = 'left';
+  context.textBaseline = 'middle';
+  context.fillStyle = colorWithAlpha(themeColor('--text-muted', '#9fb3c8'), 0.88);
+
+  drawLegendSolidLine(context, x + 14, y + 20, accent);
+  context.fillText('实线：标签 → 日志', x + 62, y + 20);
+  drawLegendDashedLine(context, x + 14, y + 40, accent);
+  context.fillText('分段线：日志 → 标签', x + 62, y + 40);
+  context.restore();
+}
+
+function themeColor(name: string, fallback: string) {
+  const target = canvas.value;
+  if (!target) {
+    return fallback;
+  }
+  return getComputedStyle(target).getPropertyValue(name).trim() || fallback;
+}
+
+function colorWithAlpha(color: string, alpha: number) {
+  const normalized = color.trim();
+  if (normalized.startsWith('#')) {
+    return hexToRgba(normalized, alpha);
+  }
+  const rgbMatch = normalized.match(/^rgba?\(([^)]+)\)$/);
+  if (rgbMatch) {
+    const parts = rgbMatch[1].split(',').map((part) => part.trim());
+    if (parts.length >= 3) {
+      return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+    }
+  }
+  return normalized;
+}
+
+function drawLegendSolidLine(context: CanvasRenderingContext2D, x: number, y: number, color: string) {
+  context.save();
+  context.strokeStyle = hexToRgba(color, 0.62);
+  context.lineWidth = 2;
+  context.beginPath();
+  context.moveTo(x, y);
+  context.lineTo(x + 36, y);
+  context.stroke();
+  context.fillStyle = hexToRgba(color, 0.86);
+  context.beginPath();
+  context.arc(x, y, 3.5, 0, Math.PI * 2);
+  context.fill();
+  context.restore();
+}
+
+function drawLegendDashedLine(context: CanvasRenderingContext2D, x: number, y: number, color: string) {
+  context.save();
+  context.strokeStyle = hexToRgba(color, 0.7);
+  context.lineWidth = 2;
+  context.setLineDash([7, 5]);
+  context.beginPath();
+  context.moveTo(x, y);
+  context.lineTo(x + 36, y);
+  context.stroke();
+  context.setLineDash([]);
+  context.translate(x + 2, y);
+  context.rotate(Math.PI / 4);
+  context.fillStyle = hexToRgba(color, 0.82);
+  context.fillRect(-3, -3, 6, 6);
+  context.restore();
 }
 
 function quadraticPoint(
@@ -786,6 +1115,10 @@ function onPointerUp(event: PointerEvent) {
   if (!picked) {
     return;
   }
+  if (picked.kind === 'cluster') {
+    openLogCluster(picked, event);
+    return;
+  }
   if (button === 2) {
     if (picked.kind === 'log') {
       inspectLogAt(picked.id, event);
@@ -799,6 +1132,30 @@ function onPointerUp(event: PointerEvent) {
   } else {
     emit('logOpen', picked.id);
   }
+}
+
+function quadraticTangent(
+  start: { x: number; y: number },
+  control: { x: number; y: number },
+  end: { x: number; y: number },
+  t: number
+) {
+  const inv = 1 - t;
+  const dx = 2 * inv * (control.x - start.x) + 2 * t * (end.x - control.x);
+  const dy = 2 * inv * (control.y - start.y) + 2 * t * (end.y - control.y);
+  const length = Math.max(0.001, Math.hypot(dx, dy));
+  return { x: dx / length, y: dy / length };
+}
+
+function openLogCluster(cluster: Extract<PickNode, { kind: 'cluster' }>, event: PointerEvent) {
+  const rect = canvas.value?.getBoundingClientRect();
+  emit('logClusterOpen', {
+    logIds: cluster.logIds,
+    x: event.offsetX,
+    y: event.offsetY,
+    width: rect?.width ?? window.innerWidth,
+    height: rect?.height ?? window.innerHeight
+  });
 }
 
 function onWheel(event: WheelEvent) {

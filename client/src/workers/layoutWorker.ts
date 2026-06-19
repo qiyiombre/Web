@@ -35,20 +35,22 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
   const manualLogPositions = new Map(request.manualLogPositions.map((item) => [item.id, { x: item.x, y: item.y }]));
   const tagPositions = new Map<number, Point>();
   const logPositions = new Map<number, Point>();
+  const densityScale = logDensityScale(logs.length);
 
   if (layoutMode === 'domain') {
-    applyDomainLayout(tags, tagGroups, tagPositions, manualTagPositions);
+    applyDomainLayout(tags, tagGroups, tagPositions, manualTagPositions, densityScale);
   } else {
-    applyOrbitLayout(tags, tagPositions, manualTagPositions);
+    applyOrbitLayout(tags, tagPositions, manualTagPositions, densityScale);
     applySimilarityLayout(tags, similarities, tagPositions, manualTagPositions);
-    relaxTagCollisions(tags, tagPositions, manualTagPositions, 128, 150);
+    relaxTagCollisions(tags, tagPositions, manualTagPositions, 128, 150 * (1 + (densityScale - 1) * 0.16));
   }
 
   logs.forEach((log) => {
     const related = log.tags.map((tag) => tagPositions.get(tag.id)).filter(Boolean) as Point[];
     const seed = seeded(log.id);
     const jitterAngle = seed * Math.PI * 2;
-    const jitterDistance = related.length <= 1 ? 90 + (seed % 1) * 110 : 30 + (seed % 1) * 50;
+    const logSpread = 1 + (densityScale - 1) * 0.74;
+    const jitterDistance = (related.length <= 1 ? 90 + (seed % 1) * 110 : 30 + (seed % 1) * 50) * logSpread;
     const center =
       related.length > 0
         ? related.reduce(
@@ -70,7 +72,13 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
     });
   });
 
-  relaxLogCollisions(logs, logPositions, manualLogPositions, 60, 48);
+  relaxLogCollisions(
+    logs,
+    logPositions,
+    manualLogPositions,
+    Math.round(60 + (densityScale - 1) * 36),
+    48 * (1 + (densityScale - 1) * 0.55)
+  );
 
   return {
     requestId: request.requestId,
@@ -82,10 +90,11 @@ function computeLayout(request: LayoutRequest): LayoutResponse {
 function applyOrbitLayout(
   tags: TagNode[],
   tagPositions: Map<number, Point>,
-  manualPositions: Map<number, { x: number; y: number }>
+  manualPositions: Map<number, { x: number; y: number }>,
+  densityScale = 1
 ) {
   const tagCount = Math.max(tags.length, 1);
-  const baseRadius = Math.max(500, 350 + tagCount * 80);
+  const baseRadius = Math.max(500, 350 + tagCount * 80) * (1 + (densityScale - 1) * 0.42);
 
   tags.forEach((tag, index) => {
     const angle = (Math.PI * 2 * index) / tagCount - Math.PI / 2;
@@ -102,18 +111,19 @@ function applyDomainLayout(
   tags: TagNode[],
   tagGroups: TagGroup[],
   tagPositions: Map<number, Point>,
-  manualPositions: Map<number, { x: number; y: number }>
+  manualPositions: Map<number, { x: number; y: number }>,
+  densityScale = 1
 ) {
   const groups = normalizeWorkerGroups(tags, tagGroups);
   if (groups.length === 0) {
-    applyOrbitLayout(tags, tagPositions, manualPositions);
+    applyOrbitLayout(tags, tagPositions, manualPositions, densityScale);
     return;
   }
 
   const tagById = new Map(tags.map((tag) => [tag.id, tag]));
   const groupCount = groups.length;
   const galaxyRadius =
-    groupCount === 1 ? 0 : Math.max(600, 450 + groupCount * 180 + Math.sqrt(tags.length) * 60);
+    groupCount === 1 ? 0 : Math.max(600, 450 + groupCount * 180 + Math.sqrt(tags.length) * 60) * (1 + (densityScale - 1) * 0.36);
 
   groups.forEach((group, groupIndex) => {
     const groupTags = group.tagIds
@@ -129,7 +139,7 @@ function applyDomainLayout(
       x: Math.cos(groupAngle) * galaxyRadius,
       y: Math.sin(groupAngle) * galaxyRadius * 0.76
     };
-    const innerRadius = Math.max(200, 120 + Math.sqrt(groupTags.length) * 90);
+    const innerRadius = Math.max(200, 120 + Math.sqrt(groupTags.length) * 90) * (1 + (densityScale - 1) * 0.34);
 
     groupTags.forEach((tag, index) => {
       const r = tagRadius(tag);
@@ -149,7 +159,7 @@ function applyDomainLayout(
     });
   });
 
-  relaxTagCollisions(tags, tagPositions, manualPositions, 112, 168);
+  relaxTagCollisions(tags, tagPositions, manualPositions, 112, 168 * (1 + (densityScale - 1) * 0.16));
 }
 
 function applySimilarityLayout(
@@ -340,6 +350,13 @@ function normalizeWorkerGroups(tags: TagNode[], tagGroups: TagGroup[]): WorkerGr
 
 function tagRadius(tag: TagNode) {
   return 20 + Math.log2(tag.count + 1) * 5.8;
+}
+
+function logDensityScale(count: number) {
+  if (count <= 120) {
+    return 1;
+  }
+  return Math.min(2.35, Math.sqrt(count / 120));
 }
 
 function seeded(input: number) {

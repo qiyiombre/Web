@@ -8,6 +8,7 @@ import type { GraphData, LogEntry, TagNode, DomainCategory } from '../types/doma
 type TimeFilterMode = 'all' | 'week' | 'month' | 'quarter' | 'custom';
 type FrequencyFilterMode = 'all' | 'high' | 'low';
 type NebulaSortMode = 'layout' | 'frequency' | 'lowFrequency' | 'recent';
+type NebulaLogDensityMode = 'auto' | 'single';
 
 const RELATED_TAG_PAGE_SIZE = 12;
 const DEFAULT_HIGH_FREQUENCY_MINIMUM = 2;
@@ -140,6 +141,7 @@ export const useGraphStore = defineStore('graph', () => {
   const nebulaHeatMediumDelta = ref(readPositiveInteger('nebula.heatMediumDelta', DEFAULT_NEBULA_HEAT_MEDIUM_DELTA, 1, 99));
   const nebulaHeatStrongDelta = ref(readPositiveInteger('nebula.heatStrongDelta', DEFAULT_NEBULA_HEAT_STRONG_DELTA, 1, 99));
   const nebulaHeatFlatOpacity = ref(readPositiveInteger('nebula.heatFlatOpacity', DEFAULT_NEBULA_HEAT_FLAT_OPACITY, 5, 80));
+  const nebulaLogDensityMode = ref<NebulaLogDensityMode>(localStorage.getItem('nebula.logDensityMode') === 'single' ? 'single' : 'auto');
   const sortMode = ref<NebulaSortMode>('layout');
   const customStartDate = ref('');
   const customEndDate = ref('');
@@ -182,6 +184,7 @@ export const useGraphStore = defineStore('graph', () => {
       readPositiveInteger('nebula.heatStrongDelta', DEFAULT_NEBULA_HEAT_STRONG_DELTA, 1, 99)
     );
     nebulaHeatFlatOpacity.value = readPositiveInteger('nebula.heatFlatOpacity', DEFAULT_NEBULA_HEAT_FLAT_OPACITY, 5, 80);
+    nebulaLogDensityMode.value = localStorage.getItem('nebula.logDensityMode') === 'single' ? 'single' : 'auto';
     if (savedSortMode === 'frequency' || savedSortMode === 'lowFrequency' || savedSortMode === 'recent') {
       sortMode.value = savedSortMode;
     }
@@ -203,6 +206,7 @@ export const useGraphStore = defineStore('graph', () => {
     localStorage.setItem('nebula.heatMediumDelta', String(nebulaHeatMediumDelta.value));
     localStorage.setItem('nebula.heatStrongDelta', String(nebulaHeatStrongDelta.value));
     localStorage.setItem('nebula.heatFlatOpacity', String(nebulaHeatFlatOpacity.value));
+    localStorage.setItem('nebula.logDensityMode', nebulaLogDensityMode.value);
     localStorage.setItem('nebula.sortMode', sortMode.value);
     localStorage.setItem('nebula.customStartDate', customStartDate.value);
     localStorage.setItem('nebula.customEndDate', customEndDate.value);
@@ -303,6 +307,11 @@ export const useGraphStore = defineStore('graph', () => {
     nebulaHeatFlatOpacity.value = Number.isFinite(parsed)
       ? Math.min(80, Math.max(5, parsed))
       : DEFAULT_NEBULA_HEAT_FLAT_OPACITY;
+    persistToLocalStorage();
+  }
+
+  function setNebulaLogDensityMode(mode: NebulaLogDensityMode) {
+    nebulaLogDensityMode.value = mode === 'single' ? 'single' : 'auto';
     persistToLocalStorage();
   }
 
@@ -508,6 +517,7 @@ export const useGraphStore = defineStore('graph', () => {
     nebulaHeatMediumDelta,
     nebulaHeatStrongDelta,
     nebulaHeatFlatOpacity,
+    nebulaLogDensityMode,
     sortMode,
     customStartDate,
     customEndDate,
@@ -541,6 +551,7 @@ export const useGraphStore = defineStore('graph', () => {
     setNebulaHeatMediumDelta,
     setNebulaHeatStrongDelta,
     setNebulaHeatFlatOpacity,
+    setNebulaLogDensityMode,
     setSortMode,
     toggleTag,
     clearActiveTags,

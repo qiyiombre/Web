@@ -52,8 +52,8 @@ const showDrawer = ref(false);
 type DrawerTab = 'tags' | 'related' | 'manage' | 'insights' | 'domains' | 'maps' | 'logs';
 const drawerTab = ref<DrawerTab | null>(null);
 const selectedLogId = ref<number | null>(null);
-const priorityRankCollapsed = ref(localStorage.getItem('nebula.priorityRankCollapsed') === 'true');
 const focusPulseLogId = ref<number | null>(null);
+const activeClusterLogIds = ref<Set<number> | null>(null);
 let focusPulseTimer: number | null = null;
 let shortcutsBound = false;
 
@@ -61,24 +61,10 @@ const mapId = computed(() => Number(route.params.id));
 const visibleGraph = computed(() => graphStore.filteredGraph);
 const drawerLogs = computed(() => (
   [...graphStore.filteredLogs]
+    .filter((log) => !activeClusterLogIds.value || activeClusterLogIds.value.has(log.id))
     .sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime())
 ));
-const priorityRankItems = computed<Array<{ rank: number; tag: TagNode }>>(() => {
-  if (!visibleGraph.value || graphStore.priorityTagIds.length === 0) return [];
-  const tagById = new Map(visibleGraph.value.tags.map((tag) => [tag.id, tag]));
-  return graphStore.priorityTagIds
-    .map((id, index) => ({ rank: index + 1, tag: tagById.get(id) }))
-    .filter((item): item is { rank: number; tag: TagNode } => Boolean(item.tag));
-});
-const priorityRankTitle = computed(() => {
-  if (graphStore.sortMode === 'frequency') return '高频排名';
-  if (graphStore.sortMode === 'lowFrequency') return '低频排名';
-  if (graphStore.sortMode === 'recent') return '最近活跃';
-  return '';
-});
-const priorityRankVisibleItems = computed(() => (
-  priorityRankCollapsed.value ? [] : priorityRankItems.value
-));
+const activeClusterCount = computed(() => activeClusterLogIds.value?.size ?? 0);
 const drawerTitle = computed(() => {
   const titles: Partial<Record<DrawerTab, string>> = {
     tags: '激活标签',
@@ -90,6 +76,23 @@ const drawerTitle = computed(() => {
   };
   return drawerTab.value ? (titles[drawerTab.value] ?? '日志定位') : '';
 });
+const priorityModeTitle = computed(() => {
+  if (graphStore.sortMode === 'frequency') return '高频排名';
+  if (graphStore.sortMode === 'lowFrequency') return '低频排名';
+  if (graphStore.sortMode === 'recent') return '活跃排名';
+  return '';
+});
+const priorityRankRows = computed(() => {
+  const tags = new Map<number, TagNode>((visibleGraph.value?.tags ?? []).map(tag => [tag.id, tag]));
+  return graphStore.priorityTagIds
+    .map((id, index) => {
+      const tag = tags.get(id);
+      return tag ? { rank: index + 1, tag } : null;
+    })
+    .filter((item): item is { rank: number; tag: TagNode } => Boolean(item));
+});
+const showPriorityRankPanel = computed(() => graphStore.sortMode !== 'layout' && priorityRankRows.value.length > 0);
+const priorityRankTotal = computed(() => visibleGraph.value?.tags.length ?? 0);
 
 onMounted(async () => {
   bindNebulaShortcuts();
@@ -141,6 +144,18 @@ watch(
   }
 );
 
+watch(
+  () => [
+    mapId.value,
+    graphStore.timeFilter,
+    graphStore.frequencyFilter,
+    graphStore.customStartDate,
+    graphStore.customEndDate,
+    [...graphStore.activeTagIds].sort((a, b) => a - b).join(',')
+  ],
+  () => clearActiveLogCluster()
+);
+
 function toggleDrawer(tab: DrawerTab) {
   if (drawerTab.value === tab) {
     showDrawer.value = !showDrawer.value;
@@ -172,6 +187,7 @@ function applyDrawerQuery() {
 }
 
 function handleTagToggle(tagId: number) {
+  clearActiveLogCluster();
   graphStore.toggleTag(tagId);
 }
 
@@ -199,6 +215,19 @@ function handleLogInspect(payload: { logId: number; x: number; y: number; width:
     height
   };
   void scrollDrawerLogIntoView(payload.logId);
+}
+
+function handleLogClusterOpen(payload: { logIds: number[]; x: number; y: number; width: number; height: number }) {
+  activeClusterLogIds.value = new Set(payload.logIds);
+  selectedLogId.value = null;
+  graphStore.nebulaLogCard = null;
+  drawerTab.value = 'logs';
+  showDrawer.value = true;
+  ui.showNotice(`已展开 ${payload.logIds.length} 条聚合日志`);
+}
+
+function clearActiveLogCluster() {
+  activeClusterLogIds.value = null;
 }
 
 function focusLogFromDrawer(logId: number) {
@@ -229,6 +258,11 @@ function focusTag(tagId: number) {
   }
 }
 
+function updatePriorityDisplayLimit(event: Event) {
+  const input = event.target as HTMLInputElement;
+  graphStore.setNebulaPriorityDisplayLimit(Number(input.value));
+}
+
 function focusDomainCategory(cat: DomainCategory) {
   graphStore.focusDomainCategory(cat);
   if (canvasRef.value?.focusDomainCategory) {
@@ -245,6 +279,7 @@ async function applyFocusLogQuery() {
   const visibleLog = graphStore.filteredLogs.find((item) => item.id === logId);
   const log = visibleLog ?? mapsStore.graph?.logs.find((item) => item.id === logId);
   if (!log) return;
+  clearActiveLogCluster();
   drawerTab.value = 'logs';
   showDrawer.value = true;
   if (!visibleLog) {
@@ -256,14 +291,24 @@ async function applyFocusLogQuery() {
   selectedLogId.value = log.id;
   graphStore.nebulaLogCard = null;
   await nextTick();
-  canvasRef.value?.focusLog?.(log.id);
+  focusLogAndOpenCard(log.id);
   markLogFocus(log.id);
   await scrollDrawerLogIntoView(log.id);
 }
 
-function togglePriorityRankCollapsed() {
-  priorityRankCollapsed.value = !priorityRankCollapsed.value;
-  localStorage.setItem('nebula.priorityRankCollapsed', String(priorityRankCollapsed.value));
+function focusLogAndOpenCard(logId: number) {
+  const payload = canvasRef.value?.focusLog?.(logId);
+  if (payload) {
+    handleLogInspect(payload);
+    return;
+  }
+  window.setTimeout(() => {
+    if (selectedLogId.value !== logId) return;
+    const retryPayload = canvasRef.value?.focusLog?.(logId);
+    if (retryPayload) {
+      handleLogInspect(retryPayload);
+    }
+  }, 180);
 }
 
 async function scrollDrawerLogIntoView(logId: number) {
@@ -534,16 +579,14 @@ const layoutAiStatus = computed(() => {
         :focus-pulse-log-id="focusPulseLogId"
         :priority-tag-ids="graphStore.priorityTagIds"
         :priority-display-limit="graphStore.nebulaPriorityDisplayLimit"
-        :heat-window-days="graphStore.nebulaHeatWindowDays"
-        :heat-minimum-delta="graphStore.nebulaHeatMinimumDelta"
-        :heat-medium-delta="graphStore.nebulaHeatMediumDelta"
-        :heat-strong-delta="graphStore.nebulaHeatStrongDelta"
-        :heat-flat-opacity="graphStore.nebulaHeatFlatOpacity"
+        :log-clustering-enabled="graphStore.nebulaLogDensityMode === 'auto'"
+        :active-cluster-log-ids="activeClusterLogIds"
         :domain-focus-tag-ids="graphStore.domainFocusTagIds"
         @tag-toggle="handleTagToggle"
         @tag-context="(p: any) => ui.openTagMenu(p.tagId, p.x, p.y, p.width, p.height)"
         @log-open="handleLogOpen"
         @log-inspect="handleLogInspect"
+        @log-cluster-open="handleLogClusterOpen"
         @layout-dirty="handleLayoutDirty"
       >
         <template #overlay>
@@ -594,23 +637,26 @@ const layoutAiStatus = computed(() => {
           <div
             v-if="graphStore.nebulaCardLog"
             class="nebula-log-card"
-            :style="{ left: `${graphStore.nebulaCardLog.x}px`, top: `${graphStore.nebulaCardLog.y}px` }"
+            :style="{
+              left: `${graphStore.nebulaCardLog.x}px`,
+              top: `${graphStore.nebulaCardLog.y}px`,
+              '--card-accent': graphStore.nebulaCardLog.log.tags[0]?.color || 'var(--accent-primary)'
+            }"
             @click.stop @pointerdown.stop @pointerup.stop
           >
             <div class="nebula-log-card-head">
-              <span>日志星卡</span>
-              <div class="nebula-log-card-actions">
-                <button class="icon-button" title="查看详情" @click.stop="openLogFromDrawer(graphStore.nebulaCardLog.log.id)"><FileText :size="15" /></button>
-                <button class="icon-button" title="编辑" @click.stop="startEditLog(graphStore.nebulaCardLog.log.id)"><Edit3 :size="15" /></button>
-                <button class="icon-button" title="导出 Markdown" @click.stop="exportLog(graphStore.nebulaCardLog.log.id)"><Download :size="15" /></button>
-                <button class="icon-button danger" title="删除" @click.stop="removeLog(graphStore.nebulaCardLog.log.id)"><Trash2 :size="15" /></button>
-                <button class="icon-button" title="关闭" @click.stop="closeNebulaCard"><X :size="14" /></button>
+              <div class="nebula-log-card-eyebrow">
+                <span>日志星卡</span>
+                <small>{{ formatDate(graphStore.nebulaCardLog.log.createdAt) }}</small>
               </div>
+              <button class="icon-button" title="关闭" @click.stop="closeNebulaCard"><X :size="14" /></button>
             </div>
-            <h3>{{ graphStore.nebulaCardLog.log.title }}</h3>
-            <p class="detail-time">{{ formatDate(graphStore.nebulaCardLog.log.createdAt) }}</p>
+            <div class="nebula-log-card-title-row">
+              <h3>{{ graphStore.nebulaCardLog.log.title || '无标题' }}</h3>
+              <span>{{ graphStore.nebulaCardLog.log.tags.length }} 标签</span>
+            </div>
             <p class="nebula-log-card-content">{{ graphStore.nebulaCardLog.log.content }}</p>
-            <div class="chip-list">
+            <div class="chip-list nebula-log-card-tags">
               <button
                 v-for="tag in graphStore.nebulaCardLog.log.tags"
                 :key="tag.id" class="chip"
@@ -619,6 +665,17 @@ const layoutAiStatus = computed(() => {
               >
                 {{ tag.name }}
               </button>
+            </div>
+            <div class="nebula-log-card-actions">
+              <button class="nebula-log-card-detail" title="查看详情" @click.stop="openLogFromDrawer(graphStore.nebulaCardLog.log.id)">
+                <FileText :size="15" />
+                <span>阅读详情</span>
+              </button>
+              <div class="nebula-log-card-icon-row">
+                <button class="icon-button" title="编辑" @click.stop="startEditLog(graphStore.nebulaCardLog.log.id)"><Edit3 :size="15" /></button>
+                <button class="icon-button" title="导出 Markdown" @click.stop="exportLog(graphStore.nebulaCardLog.log.id)"><Download :size="15" /></button>
+                <button class="icon-button danger" title="删除" @click.stop="removeLog(graphStore.nebulaCardLog.log.id)"><Trash2 :size="15" /></button>
+              </div>
             </div>
           </div>
         </template>
@@ -634,11 +691,19 @@ const layoutAiStatus = computed(() => {
         :focus-pulse-log-id="focusPulseLogId"
         :priority-tag-ids="graphStore.priorityTagIds"
         :priority-display-limit="graphStore.nebulaPriorityDisplayLimit"
+        :heat-window-days="graphStore.nebulaHeatWindowDays"
+        :heat-minimum-delta="graphStore.nebulaHeatMinimumDelta"
+        :heat-medium-delta="graphStore.nebulaHeatMediumDelta"
+        :heat-strong-delta="graphStore.nebulaHeatStrongDelta"
+        :heat-flat-opacity="graphStore.nebulaHeatFlatOpacity"
+        :log-clustering-enabled="graphStore.nebulaLogDensityMode === 'auto'"
+        :active-cluster-log-ids="activeClusterLogIds"
         :domain-focus-tag-ids="graphStore.domainFocusTagIds"
         @tag-toggle="handleTagToggle"
         @tag-context="(p: any) => ui.openTagMenu(p.tagId, p.x, p.y, p.width, p.height)"
         @log-open="handleLogOpen"
         @log-inspect="handleLogInspect"
+        @log-cluster-open="handleLogClusterOpen"
         @layout-dirty="handleLayoutDirty"
       >
         <template #overlay>
@@ -689,23 +754,26 @@ const layoutAiStatus = computed(() => {
           <div
             v-if="graphStore.nebulaCardLog"
             class="nebula-log-card"
-            :style="{ left: `${graphStore.nebulaCardLog.x}px`, top: `${graphStore.nebulaCardLog.y}px` }"
+            :style="{
+              left: `${graphStore.nebulaCardLog.x}px`,
+              top: `${graphStore.nebulaCardLog.y}px`,
+              '--card-accent': graphStore.nebulaCardLog.log.tags[0]?.color || 'var(--accent-primary)'
+            }"
             @click.stop @pointerdown.stop @pointerup.stop
           >
             <div class="nebula-log-card-head">
-              <span>日志星卡</span>
-              <div class="nebula-log-card-actions">
-                <button class="icon-button" title="查看详情" @click.stop="openLogFromDrawer(graphStore.nebulaCardLog.log.id)"><FileText :size="15" /></button>
-                <button class="icon-button" title="编辑" @click.stop="startEditLog(graphStore.nebulaCardLog.log.id)"><Edit3 :size="15" /></button>
-                <button class="icon-button" title="导出 Markdown" @click.stop="exportLog(graphStore.nebulaCardLog.log.id)"><Download :size="15" /></button>
-                <button class="icon-button danger" title="删除" @click.stop="removeLog(graphStore.nebulaCardLog.log.id)"><Trash2 :size="15" /></button>
-                <button class="icon-button" title="关闭" @click.stop="closeNebulaCard"><X :size="14" /></button>
+              <div class="nebula-log-card-eyebrow">
+                <span>日志星卡</span>
+                <small>{{ formatDate(graphStore.nebulaCardLog.log.createdAt) }}</small>
               </div>
+              <button class="icon-button" title="关闭" @click.stop="closeNebulaCard"><X :size="14" /></button>
             </div>
-            <h3>{{ graphStore.nebulaCardLog.log.title }}</h3>
-            <p class="detail-time">{{ formatDate(graphStore.nebulaCardLog.log.createdAt) }}</p>
+            <div class="nebula-log-card-title-row">
+              <h3>{{ graphStore.nebulaCardLog.log.title || '无标题' }}</h3>
+              <span>{{ graphStore.nebulaCardLog.log.tags.length }} 标签</span>
+            </div>
             <p class="nebula-log-card-content">{{ graphStore.nebulaCardLog.log.content }}</p>
-            <div class="chip-list">
+            <div class="chip-list nebula-log-card-tags">
               <button
                 v-for="tag in graphStore.nebulaCardLog.log.tags"
                 :key="tag.id" class="chip"
@@ -715,6 +783,17 @@ const layoutAiStatus = computed(() => {
                 {{ tag.name }}
               </button>
             </div>
+            <div class="nebula-log-card-actions">
+              <button class="nebula-log-card-detail" title="查看详情" @click.stop="openLogFromDrawer(graphStore.nebulaCardLog.log.id)">
+                <FileText :size="15" />
+                <span>阅读详情</span>
+              </button>
+              <div class="nebula-log-card-icon-row">
+                <button class="icon-button" title="编辑" @click.stop="startEditLog(graphStore.nebulaCardLog.log.id)"><Edit3 :size="15" /></button>
+                <button class="icon-button" title="导出 Markdown" @click.stop="exportLog(graphStore.nebulaCardLog.log.id)"><Download :size="15" /></button>
+                <button class="icon-button danger" title="删除" @click.stop="removeLog(graphStore.nebulaCardLog.log.id)"><Trash2 :size="15" /></button>
+              </div>
+            </div>
           </div>
         </template>
       </WebGpuNebulaCanvas>
@@ -723,41 +802,48 @@ const layoutAiStatus = computed(() => {
         <p v-else-if="mapsStore.error">{{ mapsStore.error }}</p>
         <p v-else>选择一个星图开始探索</p>
       </div>
-      <div v-if="priorityRankItems.length" class="priority-rank-panel" :class="{ collapsed: priorityRankCollapsed }">
+      <aside
+        v-if="showPriorityRankPanel"
+        class="priority-rank-panel"
+        aria-label="星云标签排行"
+        @click.stop
+        @pointerdown.stop
+        @wheel.stop
+      >
         <div class="priority-rank-head">
-          <button type="button" class="priority-rank-toggle" @click="togglePriorityRankCollapsed">
-            <ChevronRight v-if="priorityRankCollapsed" :size="14" />
-            <ChevronLeft v-else :size="14" />
-            <span>{{ priorityRankTitle }}</span>
-          </button>
-          <small>全部 {{ priorityRankItems.length }}</small>
+          <div class="priority-rank-title">
+            <button class="priority-rank-back" title="回到布局模式" @click="graphStore.setSortMode('layout')">
+              <ChevronLeft :size="14" />
+            </button>
+            <h3>{{ priorityModeTitle }}</h3>
+          </div>
+          <span>全部 {{ priorityRankTotal }}</span>
         </div>
-        <div v-if="!priorityRankCollapsed" class="priority-rank-control">
+        <label class="priority-rank-control">
           <span>星云标记 {{ graphStore.nebulaPriorityDisplayLimit }} 个</span>
           <input
-            v-model.number="graphStore.nebulaPriorityDisplayLimit"
             type="range"
             min="0"
             max="30"
-            @change="graphStore.setNebulaPriorityDisplayLimit(graphStore.nebulaPriorityDisplayLimit)"
+            :value="graphStore.nebulaPriorityDisplayLimit"
+            @input="updatePriorityDisplayLimit"
           />
-        </div>
-        <div v-if="!priorityRankCollapsed" class="priority-rank-list">
+        </label>
+        <div class="priority-rank-list">
           <button
-            v-for="item in priorityRankVisibleItems"
-            :key="item.tag.id"
-            type="button"
+            v-for="row in priorityRankRows"
+            :key="row.tag.id"
             class="priority-rank-item"
-            :class="{ active: graphStore.activeTagIds.has(item.tag.id) }"
-            @click="focusTag(item.tag.id)"
+            :class="{ marked: row.rank <= graphStore.nebulaPriorityDisplayLimit }"
+            @click="focusTag(row.tag.id)"
           >
-            <span class="priority-rank-no">#{{ item.rank }}</span>
-            <i :style="{ backgroundColor: item.tag.color }"></i>
-            <span>{{ item.tag.name }}</span>
-            <small>{{ item.tag.count }}</small>
+            <span class="priority-rank-index">#{{ row.rank }}</span>
+            <span class="priority-rank-dot" :style="{ backgroundColor: row.tag.color, boxShadow: `0 0 12px ${row.tag.color}` }"></span>
+            <span class="priority-rank-name">{{ row.tag.name }}</span>
+            <span class="priority-rank-count">{{ row.tag.count }}</span>
           </button>
         </div>
-      </div>
+      </aside>
     </div>
 
     <!-- Drawer overlay -->
@@ -860,6 +946,10 @@ const layoutAiStatus = computed(() => {
             <div class="drawer-section compact">
               <h4>日志定位</h4>
               <p class="muted drawer-hint">显示当前筛选命中的日志，点击后会在星云图中定位并打开详情。</p>
+              <div v-if="activeClusterLogIds" class="cluster-drawer-filter">
+                <span>当前展开日志簇：{{ activeClusterCount }} 条</span>
+                <button type="button" @click="clearActiveLogCluster">显示全部筛选日志</button>
+              </div>
             </div>
             <div v-if="drawerLogs.length" class="drawer-log-list">
               <div
@@ -924,8 +1014,8 @@ const layoutAiStatus = computed(() => {
   align-items: center;
   gap: 12px;
   padding: 8px 16px;
-  background: rgba(10, 20, 36, 0.9);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: color-mix(in srgb, var(--panel-bg-strong) 90%, transparent);
+  border-bottom: 1px solid var(--panel-border);
   flex-shrink: 0;
   z-index: 10;
   flex-wrap: wrap;
@@ -952,7 +1042,7 @@ const layoutAiStatus = computed(() => {
 
 .dirty-mark {
   font-size: 11px;
-  color: #ffb86b;
+  color: var(--warning);
 }
 
 .toolbar-center {
@@ -967,7 +1057,7 @@ const layoutAiStatus = computed(() => {
   display: flex;
   border-radius: 8px;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--control-border);
 }
 
 .filter-group button {
@@ -975,34 +1065,34 @@ const layoutAiStatus = computed(() => {
   font-size: 12px;
   background: transparent;
   border: none;
-  color: rgba(238, 246, 255, 0.5);
+  color: var(--text-muted);
   cursor: pointer;
-  border-right: 1px solid rgba(255, 255, 255, 0.06);
+  border-right: 1px solid var(--control-border);
 }
 
 .filter-group button:last-child { border-right: none; }
 
 .filter-group button.active {
-  background: rgba(98, 214, 255, 0.15);
-  color: #62d6ff;
+  background: var(--control-active-bg);
+  color: var(--accent-primary);
 }
 
 .stat-badge {
   font-size: 11px;
   padding: 3px 10px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.05);
-  color: rgba(238, 246, 255, 0.5);
+  background: var(--control-bg);
+  color: var(--text-muted);
 }
 
 .ai-badge {
-  color: #b99cff;
-  background: rgba(185, 156, 255, 0.1);
+  color: var(--accent-secondary);
+  background: color-mix(in srgb, var(--accent-secondary) 12%, transparent);
 }
 
 .stat-badge.highlight {
-  color: #8cf0b4;
-  background: rgba(140, 240, 180, 0.1);
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
 }
 
 .date-row {
@@ -1010,15 +1100,15 @@ const layoutAiStatus = computed(() => {
   align-items: center;
   gap: 6px;
   font-size: 12px;
-  color: rgba(238, 246, 255, 0.4);
+  color: var(--text-muted);
 }
 
 .date-row input {
   padding: 3px 8px;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: #eef6ff;
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
+  color: var(--text-strong);
   font-size: 12px;
 }
 
@@ -1031,8 +1121,8 @@ const layoutAiStatus = computed(() => {
 .primary-button.sm {
   padding: 6px 14px;
   border-radius: 8px;
-  background: #62d6ff;
-  color: #08111f;
+  background: var(--accent-primary);
+  color: var(--app-bg);
   font-weight: 600;
   font-size: 13px;
   border: none;
@@ -1043,7 +1133,7 @@ const layoutAiStatus = computed(() => {
 }
 
 .primary-button.sm:hover {
-  background: #4dc8f5;
+  background: color-mix(in srgb, var(--accent-primary) 84%, white 8%);
 }
 
 .icon-button {
@@ -1055,14 +1145,14 @@ const layoutAiStatus = computed(() => {
   border-radius: 8px;
   background: transparent;
   border: none;
-  color: rgba(238, 246, 255, 0.55);
+  color: var(--text-muted);
   cursor: pointer;
   transition: all 0.15s;
 }
 
 .icon-button:hover {
-  color: #eef6ff;
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  background: var(--control-bg);
 }
 
 .canvas-area {
@@ -1072,7 +1162,7 @@ const layoutAiStatus = computed(() => {
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  background: radial-gradient(ellipse at center, rgba(10, 34, 60, 0.6) 0%, #07111e 70%);
+  background: radial-gradient(ellipse at center, color-mix(in srgb, var(--accent-primary) 12%, transparent) 0%, var(--canvas-bg) 70%);
 }
 
 .canvas-placeholder {
@@ -1080,30 +1170,29 @@ const layoutAiStatus = computed(() => {
   align-items: center;
   justify-content: center;
   height: 100%;
-  color: rgba(238, 246, 255, 0.25);
+  color: color-mix(in srgb, var(--text-muted) 42%, transparent);
   font-size: 16px;
 }
 
 .priority-rank-panel {
   position: absolute;
   left: 16px;
-  bottom: 16px;
-  z-index: 8;
-  width: min(270px, calc(100% - 32px));
-  max-height: min(42vh, 330px);
+  top: 16px;
+  z-index: 12;
   display: flex;
+  width: min(270px, calc(100% - 32px));
+  max-height: min(430px, calc(100% - 32px));
   flex-direction: column;
   overflow: hidden;
+  border: 1px solid var(--panel-border);
   border-radius: 14px;
-  border: 1px solid rgba(98, 214, 255, 0.14);
-  background: rgba(6, 15, 28, 0.76);
-  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  backdrop-filter: blur(14px);
-}
-
-.priority-rank-panel.collapsed {
-  width: auto;
-  max-width: min(270px, calc(100% - 32px));
+  background:
+    radial-gradient(circle at 20% 0%, color-mix(in srgb, var(--accent-primary) 12%, transparent), transparent 42%),
+    color-mix(in srgb, var(--panel-bg-strong) 92%, transparent);
+  box-shadow:
+    0 18px 46px rgba(0, 0, 0, 0.28),
+    inset 0 0 0 1px color-mix(in srgb, var(--text-strong) 3%, transparent);
+  backdrop-filter: blur(18px);
 }
 
 .priority-rank-head {
@@ -1112,109 +1201,146 @@ const layoutAiStatus = computed(() => {
   justify-content: space-between;
   gap: 10px;
   padding: 10px 12px 8px;
-  color: rgba(238, 246, 255, 0.88);
-  font-size: 12px;
-  font-weight: 700;
+  border-bottom: 1px solid var(--panel-border);
 }
 
-.priority-rank-toggle {
-  display: inline-flex;
+.priority-rank-title {
+  display: flex;
+  min-width: 0;
   align-items: center;
   gap: 6px;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  cursor: pointer;
 }
 
-.priority-rank-toggle span {
+.priority-rank-title h3 {
   overflow: hidden;
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.priority-rank-head small {
-  color: rgba(238, 246, 255, 0.42);
+.priority-rank-head > span {
+  flex-shrink: 0;
+  color: var(--text-muted);
   font-size: 11px;
-  font-weight: 500;
+}
+
+.priority-rank-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+
+.priority-rank-back:hover {
+  background: var(--control-bg);
+  color: var(--text-strong);
 }
 
 .priority-rank-control {
   display: grid;
-  grid-template-columns: auto minmax(82px, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
   align-items: center;
   gap: 10px;
-  padding: 0 12px 7px;
-  color: rgba(238, 246, 255, 0.56);
+  padding: 9px 12px 10px;
+  color: var(--text-muted);
   font-size: 11px;
 }
 
 .priority-rank-control input {
-  width: 100%;
-  accent-color: #62d6ff;
+  min-width: 0;
+  accent-color: var(--accent-primary);
 }
 
 .priority-rank-list {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  gap: 3px;
   overflow-y: auto;
-  padding: 0 8px 9px;
+  padding: 0 8px 8px;
+  scrollbar-color: color-mix(in srgb, var(--accent-primary) 34%, transparent) transparent;
+  scrollbar-width: thin;
+}
+
+.priority-rank-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.priority-rank-list::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-primary) 28%, transparent);
+}
+
+.priority-rank-list::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .priority-rank-item {
   display: grid;
-  grid-template-columns: 38px 9px minmax(0, 1fr) auto;
+  grid-template-columns: 40px 14px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   width: 100%;
-  min-height: 31px;
-  margin-top: 5px;
-  padding: 5px 7px;
+  min-height: 34px;
+  padding: 7px 8px;
   border: 1px solid transparent;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.028);
-  color: rgba(238, 246, 255, 0.72);
+  background: color-mix(in srgb, var(--control-bg) 64%, transparent);
+  color: var(--text-strong);
   font: inherit;
-  font-size: 12px;
   text-align: left;
   cursor: pointer;
-  transition: border-color 0.16s, background 0.16s, transform 0.16s;
+  transition:
+    transform 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease;
 }
 
 .priority-rank-item:hover,
-.priority-rank-item.active {
-  border-color: rgba(98, 214, 255, 0.22);
-  background: rgba(98, 214, 255, 0.075);
-  color: #eef6ff;
-}
-
-.priority-rank-item:hover {
+.priority-rank-item:focus-visible {
   transform: translateX(2px);
+  border-color: color-mix(in srgb, var(--accent-primary) 26%, transparent);
+  background: color-mix(in srgb, var(--accent-primary) 10%, var(--control-bg));
+  outline: none;
 }
 
-.priority-rank-no {
-  color: rgba(98, 214, 255, 0.88);
-  font-variant-numeric: tabular-nums;
+.priority-rank-item.marked {
+  border-color: color-mix(in srgb, var(--accent-primary) 18%, transparent);
+}
+
+.priority-rank-index {
+  color: var(--accent-primary);
+  font-size: 12px;
   font-weight: 800;
 }
 
-.priority-rank-item i {
+.priority-rank-dot {
   width: 9px;
   height: 9px;
-  border-radius: 50%;
-  box-shadow: 0 0 10px currentColor;
+  border-radius: 999px;
 }
 
-.priority-rank-item span:nth-child(3) {
+.priority-rank-name {
   overflow: hidden;
+  font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.priority-rank-item small {
-  color: rgba(238, 246, 255, 0.42);
-  font-size: 11px;
+.priority-rank-count {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Drawer */
@@ -1224,8 +1350,8 @@ const layoutAiStatus = computed(() => {
   top: 0;
   bottom: 0;
   width: 340px;
-  background: rgba(14, 26, 44, 0.96);
-  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--panel-bg-strong);
+  border-left: 1px solid var(--panel-border);
   backdrop-filter: blur(16px);
   z-index: 20;
   display: flex;
@@ -1238,7 +1364,7 @@ const layoutAiStatus = computed(() => {
   align-items: center;
   justify-content: space-between;
   padding: 14px 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--panel-border);
   font-size: 14px;
   font-weight: 600;
 }
@@ -1266,9 +1392,37 @@ const layoutAiStatus = computed(() => {
   margin-top: 0;
 }
 
+.cluster-drawer-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-primary) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 24%, var(--control-border));
+  color: var(--text-strong);
+  font-size: 12px;
+}
+
+.cluster-drawer-filter button {
+  border: 0;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--accent-primary) 20%, transparent);
+  color: var(--accent-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cluster-drawer-filter button:hover {
+  background: color-mix(in srgb, var(--accent-primary) 30%, transparent);
+}
+
 .drawer-section h4 {
   font-size: 12px;
-  color: rgba(238, 246, 255, 0.4);
+  color: var(--text-muted);
   margin: 0 0 10px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -1284,8 +1438,8 @@ const layoutAiStatus = computed(() => {
   width: 100%;
   padding: 11px 12px;
   border-radius: 11px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--panel-border);
+  background: color-mix(in srgb, var(--panel-bg) 54%, transparent);
   color: inherit;
   text-align: left;
   cursor: pointer;
@@ -1294,15 +1448,15 @@ const layoutAiStatus = computed(() => {
 
 .drawer-log-item:hover,
 .drawer-log-item.active {
-  border-color: rgba(98, 214, 255, 0.28);
-  background: rgba(98, 214, 255, 0.075);
+  border-color: color-mix(in srgb, var(--accent-primary) 30%, var(--panel-border));
+  background: color-mix(in srgb, var(--accent-primary) 8%, transparent);
 }
 
 .drawer-log-item.pulse {
-  border-color: rgba(98, 214, 255, 0.62);
+  border-color: color-mix(in srgb, var(--accent-primary) 64%, var(--panel-border));
   box-shadow:
-    0 0 0 1px rgba(98, 214, 255, 0.22),
-    0 0 22px rgba(98, 214, 255, 0.18);
+    0 0 0 1px color-mix(in srgb, var(--accent-primary) 24%, transparent),
+    0 0 22px color-mix(in srgb, var(--accent-primary) 20%, transparent);
   animation: drawer-log-pulse 0.9s ease-in-out 2;
 }
 
@@ -1318,7 +1472,7 @@ const layoutAiStatus = computed(() => {
 
 .drawer-log-title {
   overflow: hidden;
-  color: #eef6ff;
+  color: var(--text-strong);
   font-size: 13px;
   font-weight: 650;
   text-overflow: ellipsis;
@@ -1327,7 +1481,7 @@ const layoutAiStatus = computed(() => {
 
 .drawer-log-meta {
   margin-top: 4px;
-  color: rgba(238, 246, 255, 0.34);
+  color: var(--text-muted);
   font-size: 11px;
 }
 
@@ -1346,14 +1500,14 @@ const layoutAiStatus = computed(() => {
   padding: 0 7px;
   border-radius: 999px;
   border: 1px solid currentColor;
-  background: rgba(255, 255, 255, 0.025);
+  background: color-mix(in srgb, var(--panel-bg) 42%, transparent);
   font-size: 11px;
   font-style: normal;
 }
 
 .drawer-log-tags small {
-  border-color: rgba(238, 246, 255, 0.14);
-  color: rgba(238, 246, 255, 0.45);
+  border-color: var(--panel-border);
+  color: var(--text-muted);
 }
 
 .drawer-log-actions {
@@ -1369,13 +1523,13 @@ const layoutAiStatus = computed(() => {
   padding: 4px 0;
   border: 0;
   background: transparent;
-  color: #62d6ff;
+  color: var(--accent-primary);
   font-size: 12px;
   cursor: pointer;
 }
 
 .drawer-log-actions button:hover {
-  color: #9be9ff;
+  color: color-mix(in srgb, var(--accent-primary) 72%, white 18%);
 }
 
 @keyframes drawer-log-pulse {
@@ -1398,19 +1552,19 @@ const layoutAiStatus = computed(() => {
   padding: 5px 12px;
   border-radius: 16px;
   font-size: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.15);
+  border: 1px solid var(--control-border);
   background: transparent;
-  color: #eef6ff;
+  color: var(--text-strong);
   cursor: pointer;
   transition: all 0.15s;
 }
 
 .chip.active {
-  background: rgba(98, 214, 255, 0.12);
+  background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
 }
 
 .chip:hover {
-  border-color: rgba(255, 255, 255, 0.3);
+  border-color: color-mix(in srgb, var(--text-strong) 28%, transparent);
 }
 
 .tag-dot {
@@ -1429,23 +1583,23 @@ const layoutAiStatus = computed(() => {
   border-radius: 8px;
   background: transparent;
   border: none;
-  color: #eef6ff;
+  color: var(--text-strong);
   cursor: pointer;
   font-size: 13px;
 }
 
 .related-item:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: var(--control-bg);
 }
 
 .related-item small {
   margin-left: auto;
-  color: rgba(238, 246, 255, 0.35);
+  color: var(--text-muted);
   font-size: 12px;
 }
 
 .muted {
-  color: rgba(238, 246, 255, 0.35);
+  color: var(--text-muted);
   font-size: 13px;
 }
 
@@ -1455,7 +1609,7 @@ const layoutAiStatus = computed(() => {
 
 .text-button {
   font-size: 12px;
-  color: #62d6ff;
+  color: var(--accent-primary);
   background: transparent;
   border: none;
   cursor: pointer;
@@ -1507,8 +1661,8 @@ const layoutAiStatus = computed(() => {
 }
 
 .drawer-map-item.active {
-  background: rgba(98, 214, 255, 0.1);
-  color: #62d6ff;
+  background: color-mix(in srgb, var(--accent-primary) 11%, transparent);
+  color: var(--accent-primary);
 }
 
 .map-rename-form {
@@ -1534,7 +1688,7 @@ const layoutAiStatus = computed(() => {
 }
 
 .icon-button.danger:hover {
-  color: #ff8fa3;
-  background: rgba(255, 143, 163, 0.1);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
 }
 </style>
