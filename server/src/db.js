@@ -664,8 +664,7 @@ export async function listTopTagPairs(mapId) {
      JOIN logs l ON l.id = a.log_id
      WHERE l.map_id = $1
      GROUP BY a.tag_id, b.tag_id, ta.name, tb.name
-     ORDER BY COUNT(*) DESC, ta.name ASC
-     LIMIT 6`,
+     ORDER BY COUNT(*) DESC, ta.name ASC`,
     [mapId]
   );
 }

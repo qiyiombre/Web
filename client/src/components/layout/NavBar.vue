@@ -12,6 +12,7 @@ import {
 import { useAuthStore } from '../../stores/auth';
 import { useMapsStore } from '../../stores/maps';
 import { useUiStore } from '../../stores/ui';
+import { THEME_OPTIONS } from '../../constants/themes';
 
 const route = useRoute();
 const router = useRouter();
@@ -118,6 +119,26 @@ onBeforeUnmount(() => {
               <strong>{{ auth.currentUser.username }}</strong>
             </div>
           </div>
+          <div class="menu-theme-switcher" aria-label="主题切换">
+            <small>主题</small>
+            <div class="menu-theme-grid">
+              <button
+                v-for="theme in THEME_OPTIONS"
+                :key="theme.id"
+                type="button"
+                class="menu-theme-dot"
+                :class="{ active: auth.themeMode === theme.id }"
+                :title="theme.label"
+                @click="auth.setThemeMode(theme.id)"
+              >
+                <span
+                  v-for="color in theme.swatches"
+                  :key="color"
+                  :style="{ background: color }"
+                />
+              </button>
+            </div>
+          </div>
           <button class="menu-item" @click="router.push('/settings'); ui.closeUserMenu()">
             <Settings :size="15" />
             设置
@@ -139,8 +160,8 @@ onBeforeUnmount(() => {
   gap: 0;
   height: 52px;
   padding: 0 20px;
-  background: rgba(10, 20, 36, 0.95);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  background: var(--nav-bg);
+  border-bottom: 1px solid var(--panel-border);
   backdrop-filter: blur(12px);
   position: sticky;
   top: 0;
@@ -165,16 +186,16 @@ onBeforeUnmount(() => {
   width: 28px;
   height: 28px;
   border-radius: 9px;
-  color: #08111f;
-  background: linear-gradient(135deg, #62d6ff, #b99cff);
-  box-shadow: 0 0 22px rgba(98, 214, 255, 0.22);
+  color: var(--app-bg);
+  background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+  box-shadow: 0 0 22px color-mix(in srgb, var(--accent-primary) 24%, transparent);
 }
 
 .brand-text {
   font-size: 16px;
   font-weight: 700;
   letter-spacing: 0.02em;
-  color: #eef6ff;
+  color: var(--text-strong);
 }
 
 .navbar-links {
@@ -191,19 +212,19 @@ onBeforeUnmount(() => {
   padding: 7px 14px;
   border-radius: 8px;
   font-size: 13.5px;
-  color: rgba(238, 246, 255, 0.6);
+  color: var(--text-muted);
   text-decoration: none;
   transition: all 0.15s;
 }
 
 .nav-link:hover {
-  color: #eef6ff;
-  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-strong);
+  background: var(--control-bg);
 }
 
 .nav-link.active {
-  color: #62d6ff;
-  background: rgba(98, 214, 255, 0.1);
+  color: var(--accent-primary);
+  background: color-mix(in srgb, var(--accent-primary) 13%, transparent);
 }
 
 .navbar-user {
@@ -218,16 +239,16 @@ onBeforeUnmount(() => {
   gap: 7px;
   padding: 6px 14px;
   border-radius: 20px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  color: #eef6ff;
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
+  color: var(--text-strong);
   font-size: 13px;
   cursor: pointer;
   transition: background 0.15s;
 }
 
 .user-pill:hover {
-  background: rgba(255, 255, 255, 0.1);
+  background: var(--control-bg-hover);
 }
 
 .user-initials {
@@ -236,10 +257,10 @@ onBeforeUnmount(() => {
   justify-content: center;
   border-radius: 50%;
   background:
-    linear-gradient(135deg, rgba(98, 214, 255, 0.28), rgba(185, 156, 255, 0.2)),
-    rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(98, 214, 255, 0.22);
-  color: #97e6ff;
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-primary) 30%, transparent), color-mix(in srgb, var(--accent-secondary) 20%, transparent)),
+    var(--control-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 24%, var(--control-border));
+  color: color-mix(in srgb, var(--accent-primary) 78%, var(--text-strong));
   font-weight: 800;
   letter-spacing: 0;
 }
@@ -254,12 +275,12 @@ onBeforeUnmount(() => {
   position: absolute;
   right: 0;
   top: calc(100% + 8px);
-  min-width: 200px;
-  background: #142130;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  min-width: 244px;
+  background: var(--panel-bg-strong);
+  border: 1px solid var(--panel-border);
   border-radius: 12px;
   padding: 8px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 12px 32px var(--shadow-strong);
   z-index: 200;
 }
 
@@ -268,7 +289,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 10px;
   padding: 8px 10px 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-bottom: 1px solid var(--panel-border);
   margin-bottom: 4px;
 }
 
@@ -277,13 +298,13 @@ onBeforeUnmount(() => {
   height: 34px;
   border-radius: 50%;
   background:
-    linear-gradient(135deg, rgba(98, 214, 255, 0.28), rgba(185, 156, 255, 0.2)),
-    rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(98, 214, 255, 0.22);
+    linear-gradient(135deg, color-mix(in srgb, var(--accent-primary) 30%, transparent), color-mix(in srgb, var(--accent-secondary) 20%, transparent)),
+    var(--control-bg);
+  border: 1px solid color-mix(in srgb, var(--accent-primary) 24%, var(--control-border));
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #62d6ff;
+  color: var(--accent-primary);
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0;
@@ -297,21 +318,70 @@ onBeforeUnmount(() => {
   padding: 8px 10px;
   border-radius: 8px;
   font-size: 13px;
-  color: #eef6ff;
+  color: var(--text-strong);
   background: transparent;
   cursor: pointer;
   border: none;
 }
 
 .menu-item:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--control-bg);
 }
 
 .menu-item.danger {
-  color: #ff8fa3;
+  color: var(--danger);
 }
 
 .menu-item.danger:hover {
-  background: rgba(255, 143, 163, 0.1);
+  background: color-mix(in srgb, var(--danger) 13%, transparent);
+}
+
+.menu-theme-switcher {
+  padding: 8px 8px 10px;
+  border-bottom: 1px solid var(--panel-border);
+  margin-bottom: 4px;
+}
+
+.menu-theme-switcher small {
+  display: block;
+  margin: 0 2px 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.menu-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.menu-theme-dot {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2px;
+  height: 28px;
+  padding: 4px;
+  border-radius: 9px;
+  border: 1px solid var(--control-border);
+  background: var(--control-bg);
+  cursor: pointer;
+  transition:
+    transform 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.menu-theme-dot span {
+  border-radius: 999px;
+}
+
+.menu-theme-dot:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent-primary) 38%, var(--control-border));
+}
+
+.menu-theme-dot.active {
+  border-color: color-mix(in srgb, var(--accent-primary) 70%, var(--control-border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 16%, transparent);
 }
 </style>

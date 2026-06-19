@@ -2,6 +2,7 @@ import { getAiCache, listLogs, listTagTrends, listTags, listTopTagPairs, setAiCa
 import { callDeepSeekJson, hasDeepSeekKey } from './deepseek.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const INSIGHT_RESULT_LIMIT = 50;
 
 export async function buildInsights(mapId, rangeInput = null) {
   const range = rangeInput ? normalizeInsightRange(rangeInput, 'week') : null;
@@ -168,7 +169,7 @@ async function buildRangeInsightStats(mapId, range) {
     .map((tag) => ({ ...tag, count: currentUsage.get(tag.id) ?? 0 }))
     .filter((tag) => tag.count > 0)
     .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
-    .slice(0, 6);
+    .slice(0, INSIGHT_RESULT_LIMIT);
   const trendRows = tags.map((tag) => {
     const current = currentUsage.get(tag.id) ?? 0;
     const previous = previousUsage.get(tag.id) ?? 0;
@@ -184,17 +185,17 @@ async function buildRangeInsightStats(mapId, range) {
   const risingTags = trendRows
     .filter((row) => row.delta > 0)
     .sort((a, b) => b.delta - a.delta || b.current - a.current)
-    .slice(0, 4);
+    .slice(0, INSIGHT_RESULT_LIMIT);
   const fallingTags = trendRows
     .filter((row) => row.previous > 0 && row.delta < 0)
     .sort((a, b) => a.delta - b.delta || b.previous - a.previous)
-    .slice(0, 4);
+    .slice(0, INSIGHT_RESULT_LIMIT);
 
   return {
     topTags,
     risingTags,
     fallingTags,
-    cooccurrence: buildCooccurrence(currentLogs).slice(0, 6),
+    cooccurrence: buildCooccurrence(currentLogs).slice(0, INSIGHT_RESULT_LIMIT),
     range: {
       timeFilter: range.timeFilter,
       customStartDate: range.customStartDate,
@@ -205,20 +206,20 @@ async function buildRangeInsightStats(mapId, range) {
 
 async function buildInsightStats(mapId) {
   const [topTags, trendRows, cooccurrence] = await Promise.all([
-    listTags(mapId).then((tags) => tags.slice(0, 6)),
+    listTags(mapId).then((tags) => tags.slice(0, INSIGHT_RESULT_LIMIT)),
     listTagTrends(mapId),
-    listTopTagPairs(mapId)
+    listTopTagPairs(mapId).then((pairs) => pairs.slice(0, INSIGHT_RESULT_LIMIT))
   ]);
 
   const risingTags = trendRows
     .filter((row) => row.delta > 0)
     .sort((a, b) => b.delta - a.delta)
-    .slice(0, 4);
+    .slice(0, INSIGHT_RESULT_LIMIT);
 
   const fallingTags = trendRows
     .filter((row) => row.previous > 0 && row.delta < 0)
     .sort((a, b) => a.delta - b.delta)
-    .slice(0, 4);
+    .slice(0, INSIGHT_RESULT_LIMIT);
 
   return {
     topTags,

@@ -8,6 +8,7 @@ import AuthPanel from './components/AuthPanel.vue';
 import AssistantPanel from './components/AssistantPanel.vue';
 import NavBar from './components/layout/NavBar.vue';
 import type { UserAccount } from './types/domain';
+import { themeClassName } from './constants/themes';
 
 const auth = useAuthStore();
 const graphStore = useGraphStore();
@@ -16,6 +17,7 @@ const route = useRoute();
 const router = useRouter();
 
 const showGlobalConfirm = computed(() => Boolean(ui.nebulaConfirm) && route.name !== 'map');
+const themeClass = computed(() => themeClassName(auth.themeMode));
 
 watch(
   () => [
@@ -32,6 +34,7 @@ watch(
     graphStore.nebulaHeatMediumDelta,
     graphStore.nebulaHeatStrongDelta,
     graphStore.nebulaHeatFlatOpacity,
+    graphStore.nebulaLogDensityMode,
     graphStore.sortMode,
     graphStore.customStartDate,
     graphStore.customEndDate
@@ -71,7 +74,7 @@ async function confirmGlobalAction() {
 <template>
   <AuthPanel v-if="!auth.checkingAuth && !auth.currentUser" @authenticated="handleAuthenticated" />
 
-  <div v-else-if="auth.currentUser" class="app-root">
+  <div v-else-if="auth.currentUser" class="app-root" :class="themeClass">
     <NavBar />
     <div v-if="ui.notice" class="global-notice success">{{ ui.notice }}</div>
     <div v-if="!ui.isOnline" class="global-notice warning">当前离线：可以继续写新日志，草稿会自动保存到 IndexedDB。</div>
@@ -113,7 +116,7 @@ async function confirmGlobalAction() {
   height: 100vh;
   min-height: 100vh;
   overflow: hidden;
-  background: #08111f;
+  background: var(--app-bg);
 }
 
 .app-main {
@@ -129,14 +132,14 @@ async function confirmGlobalAction() {
   align-items: center;
   justify-content: center;
   height: 100vh;
-  background: #08111f;
+  background: var(--app-bg);
 }
 
 .splash-ring {
   width: 36px;
   height: 36px;
   border: 3px solid rgba(255, 255, 255, 0.1);
-  border-top-color: #62d6ff;
+  border-top-color: var(--accent-primary);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
@@ -154,21 +157,21 @@ async function confirmGlobalAction() {
   padding: 10px 20px;
   border-radius: 8px;
   font-size: 13px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 8px 32px var(--shadow-strong);
   animation: fadeInNotice 0.25s ease;
   pointer-events: none;
 }
 
 .global-notice.success {
-  background: rgba(140, 240, 180, 0.15);
-  color: #8cf0b4;
-  border: 1px solid rgba(140, 240, 180, 0.3);
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+  border: 1px solid color-mix(in srgb, var(--success) 34%, transparent);
 }
 
 .global-notice.warning {
-  background: rgba(247, 215, 116, 0.15);
-  color: #f7d774;
-  border: 1px solid rgba(247, 215, 116, 0.3);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning);
+  border: 1px solid color-mix(in srgb, var(--warning) 34%, transparent);
 }
 
 .global-confirm-backdrop {
@@ -179,7 +182,7 @@ async function confirmGlobalAction() {
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: rgba(2, 8, 18, 0.58);
+  background: var(--overlay-bg);
   backdrop-filter: blur(8px);
 }
 
@@ -187,21 +190,21 @@ async function confirmGlobalAction() {
   width: min(420px, 100%);
   border-radius: 12px;
   padding: 20px;
-  background: rgba(16, 29, 48, 0.96);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 20px 64px rgba(0, 0, 0, 0.45);
+  background: var(--panel-bg-strong);
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 20px 64px var(--shadow-strong);
 }
 
 .global-confirm-title {
   margin: 0 0 8px;
-  color: #eef6ff;
+  color: var(--text-strong);
   font-size: 16px;
   font-weight: 700;
 }
 
 .global-confirm-message {
   margin: 0;
-  color: rgba(238, 246, 255, 0.62);
+  color: var(--text-muted);
   font-size: 13px;
   line-height: 1.65;
 }
@@ -218,20 +221,20 @@ async function confirmGlobalAction() {
   min-width: 76px;
   height: 34px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px solid var(--control-border);
   font-size: 13px;
   cursor: pointer;
 }
 
 .secondary-button {
-  background: rgba(255, 255, 255, 0.05);
-  color: #eef6ff;
+  background: var(--control-bg);
+  color: var(--text-strong);
 }
 
 .danger-confirm {
-  background: rgba(255, 143, 163, 0.16);
-  border-color: rgba(255, 143, 163, 0.3);
-  color: #ff9caf;
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 34%, transparent);
+  color: var(--danger);
 }
 
 .secondary-button:disabled,
