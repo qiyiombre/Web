@@ -179,6 +179,14 @@ function startNew() {
   showEditor.value = true;
 }
 
+function openNewLogEditor() {
+  startNew();
+  if (route.query.new === '1') {
+    return;
+  }
+  router.push({ path: `/maps/${mapId.value}/logs`, query: { new: '1' } });
+}
+
 function startEdit(log: LogEntry) {
   editingLog.value = log;
   selectedLogId.value = log.id;
@@ -188,6 +196,12 @@ function startEdit(log: LogEntry) {
 function closeEditor() {
   showEditor.value = false;
   editingLog.value = null;
+  if (route.query.new || route.query.edit) {
+    const query = { ...route.query };
+    delete query.new;
+    delete query.edit;
+    router.replace({ path: route.path, query });
+  }
 }
 
 function selectLog(log: LogEntry) {
@@ -346,7 +360,7 @@ function setNotice(msg: string) {
             <X :size="14" />
           </button>
         </div>
-        <button class="primary-button sm" @click="startNew">
+        <button class="primary-button sm" @click="openNewLogEditor">
           <Plus :size="16" />
           写日志
         </button>

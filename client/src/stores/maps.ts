@@ -32,9 +32,12 @@ export const useMapsStore = defineStore('maps', () => {
   const renamingMapId = ref<number | null>(null);
   const renameLocation = ref<'list' | 'title'>('title');
   const renameDraft = ref('');
+  const renameDescriptionDraft = ref('');
   const renameSaving = ref(false);
   const nebulaRenderKey = ref(0);
   const draft = ref<DraftLog | undefined>();
+  const graphCache = new Map<number, GraphData>();
+  const insightCache = new Map<number, Insight | null>();
 
   const hasNoMaps = computed(() => maps.value.length === 0 && !loading.value);
 
@@ -64,6 +67,16 @@ export const useMapsStore = defineStore('maps', () => {
     if (!options.force && graph.value?.map.id === id) {
       return;
     }
+    const cachedGraph = graphCache.get(id);
+    if (!options.force && cachedGraph) {
+      layoutDirty.value = false;
+      error.value = '';
+      loading.value = false;
+      graph.value = cachedGraph;
+      insights.value = insightCache.get(id) ?? null;
+      await loadCurrentDraft();
+      return;
+    }
     layoutDirty.value = false;
     error.value = '';
     loading.value = true;
@@ -71,6 +84,8 @@ export const useMapsStore = defineStore('maps', () => {
       const [g, ins] = await Promise.all([getGraph(id), getInsights(id).catch(() => null)]);
       graph.value = g;
       insights.value = ins;
+      graphCache.set(id, g);
+      insightCache.set(id, ins);
       await loadCurrentDraft();
     } catch (e: any) {
       error.value = e.message ?? '加载星图数据失败';
@@ -94,10 +109,16 @@ export const useMapsStore = defineStore('maps', () => {
     if (graph.value && graph.value.map.id === id) {
       graph.value = { ...graph.value, map: { ...graph.value.map, ...updated } };
     }
+    const cachedGraph = graphCache.get(id);
+    if (cachedGraph) {
+      graphCache.set(id, { ...cachedGraph, map: { ...cachedGraph.map, ...updated } });
+    }
   }
 
   async function removeMap(id: number) {
     await deleteMap(id);
+    graphCache.delete(id);
+    insightCache.delete(id);
     maps.value = maps.value.filter(m => m.id !== id);
     if (activeMapId.value === id) {
       activeMapId.value = null;
@@ -112,11 +133,13 @@ export const useMapsStore = defineStore('maps', () => {
     renamingMapId.value = id;
     renameLocation.value = location;
     renameDraft.value = map.name;
+    renameDescriptionDraft.value = map.description ?? '';
   }
 
   function cancelRenameMap() {
     renamingMapId.value = null;
     renameDraft.value = '';
+    renameDescriptionDraft.value = '';
   }
 
   async function saveRenameMap(id: number) {
@@ -124,9 +147,10 @@ export const useMapsStore = defineStore('maps', () => {
     if (!name) return;
     renameSaving.value = true;
     try {
-      await renameMap(id, name);
+      await renameMap(id, name, renameDescriptionDraft.value);
       renamingMapId.value = null;
       renameDraft.value = '';
+      renameDescriptionDraft.value = '';
     } catch (e: any) {
       // error handled upstream
     } finally {
@@ -193,6 +217,8 @@ export const useMapsStore = defineStore('maps', () => {
     loading.value = false;
     error.value = '';
     layoutDirty.value = false;
+    graphCache.clear();
+    insightCache.clear();
   }
 
   return {
@@ -206,6 +232,7 @@ export const useMapsStore = defineStore('maps', () => {
     renamingMapId,
     renameLocation,
     renameDraft,
+    renameDescriptionDraft,
     renameSaving,
     nebulaRenderKey,
     draft,

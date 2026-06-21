@@ -16,6 +16,22 @@ type LayoutSnapshot = {
   tags: Array<[number, { x: number; y: number }]>;
   logs: Array<[number, { x: number; y: number }]>;
 };
+type CompleteLayoutCache = {
+  signature: string;
+  tags: Record<string, LayoutPoint>;
+  logs: Record<string, LayoutPoint>;
+  manualTags: Record<string, { x: number; y: number }>;
+  manualLogs: Record<string, { x: number; y: number }>;
+  view?: {
+    scale: number;
+    yaw: number;
+    pitch: number;
+    panX: number;
+    panY: number;
+    panZ: number;
+  };
+};
+type LayoutRequestOptions = { preferCache?: boolean };
 
 interface LayoutResponse {
   requestId: number;
@@ -242,11 +258,12 @@ onMounted(async () => {
     resizeObserver.observe(wrap.value);
   }
   await initWebGpu();
-  requestLayout();
+  requestLayout({ preferCache: true });
   raf = requestAnimationFrame(render);
 });
 
 onBeforeUnmount(() => {
+  saveCompleteLayout();
   window.removeEventListener('resize', resize);
   document.removeEventListener('fullscreenchange', onFullscreenChange);
   resizeObserver?.disconnect();
@@ -259,14 +276,14 @@ watch(
   () => {
     pendingFitAllFrontView = true;
     loadManualPositions();
-    requestLayout();
+    requestLayout({ preferCache: true });
   },
   { immediate: true }
 );
 
 watch(
   () => [props.graph.tags, props.graph.logs, props.graph.tagSimilarities, props.graph.tagGroups, props.layoutMode],
-  () => requestLayout(),
+  () => requestLayout({ preferCache: true }),
   { deep: true }
 );
 
@@ -295,6 +312,7 @@ defineExpose({
   resetTagLayout,
   refreshLayout,
   saveLayout,
+  saveCompleteLayout,
   undoLayout,
   redoLayout
 });
@@ -581,7 +599,10 @@ function buildStars() {
   stars = [];
 }
 
-function requestLayout() {
+function requestLayout(options: LayoutRequestOptions = {}) {
+  if (options.preferCache && restoreCompleteLayout()) {
+    return;
+  }
   latestLayoutRequestId += 1;
   layoutBusy = true;
   layoutWorker.postMessage({
@@ -1750,6 +1771,10 @@ function logPositionStorageKey() {
   return `nebula.logPositions.${props.graph.map.id}.${props.layoutMode}`;
 }
 
+function completeLayoutStorageKey() {
+  return `nebula.completeLayout.webgpu.${props.graph.map.id}.${props.layoutMode}`;
+}
+
 function loadManualPositions() {
   manualTagPositions.clear();
   manualLogPositions.clear();
@@ -1791,8 +1816,87 @@ function saveLayout() {
     return false;
   }
   saveManualPositions();
+  saveCompleteLayout();
   emit('layoutDirty', false);
   return true;
+}
+
+function saveCompleteLayout() {
+  if (tagPositions.size === 0 && logPositions.size === 0) {
+    return false;
+  }
+  const cache: CompleteLayoutCache = {
+    signature: layoutSignature(),
+    tags: pointRecord(tagPositions),
+    logs: pointRecord(logPositions),
+    manualTags: manualPointRecord(manualTagPositions),
+    manualLogs: manualPointRecord(manualLogPositions),
+    view: {
+      scale: transform.scale,
+      yaw: camera.yaw,
+      pitch: camera.pitch,
+      panX: camera.panX,
+      panY: camera.panY,
+      panZ: camera.panZ
+    }
+  };
+  window.localStorage.setItem(completeLayoutStorageKey(), JSON.stringify(cache));
+  return true;
+}
+
+function restoreCompleteLayout() {
+  const raw = window.localStorage.getItem(completeLayoutStorageKey());
+  if (!raw) {
+    return false;
+  }
+  try {
+    const cache = JSON.parse(raw) as Partial<CompleteLayoutCache>;
+    if (cache.signature !== layoutSignature()) {
+      return false;
+    }
+    const validTagIds = new Set(props.graph.tags.map((tag) => tag.id));
+    const validLogIds = new Set(props.graph.logs.map((log) => log.id));
+    const restoredTags = loadLayoutPointRecord(cache.tags, validTagIds);
+    const restoredLogs = loadLayoutPointRecord(cache.logs, validLogIds);
+    if (restoredTags.size !== validTagIds.size || restoredLogs.size !== validLogIds.size) {
+      return false;
+    }
+
+    tagPositions.clear();
+    logPositions.clear();
+    manualTagPositions.clear();
+    manualLogPositions.clear();
+    copyPointMap(restoredTags, tagPositions);
+    copyPointMap(restoredLogs, logPositions);
+    copyManualPointMap(loadManualPointRecord(cache.manualTags, validTagIds), manualTagPositions);
+    copyManualPointMap(loadManualPointRecord(cache.manualLogs, validLogIds), manualLogPositions);
+
+    if (
+      cache.view &&
+      Number.isFinite(cache.view.scale) &&
+      Number.isFinite(cache.view.yaw) &&
+      Number.isFinite(cache.view.pitch) &&
+      Number.isFinite(cache.view.panX) &&
+      Number.isFinite(cache.view.panY) &&
+      Number.isFinite(cache.view.panZ)
+    ) {
+      transform.scale = cache.view.scale;
+      camera.yaw = cache.view.yaw;
+      camera.pitch = cache.view.pitch;
+      camera.panX = cache.view.panX;
+      camera.panY = cache.view.panY;
+      camera.panZ = cache.view.panZ;
+      pendingFitAllFrontView = false;
+    } else if (pendingFitAllFrontView) {
+      pendingFitAllFrontView = !fitAllTagsFrontView();
+    }
+    layoutBusy = false;
+    updateLabels();
+    return true;
+  } catch {
+    window.localStorage.removeItem(completeLayoutStorageKey());
+    return false;
+  }
 }
 
 function undoLayout() {
@@ -1866,18 +1970,110 @@ function saveManualPointMap(
   window.localStorage.setItem(key, JSON.stringify(saved));
 }
 
+function pointRecord(source: Map<number, LayoutPoint>) {
+  return Object.fromEntries(
+    [...source.entries()].map(([id, point]) => [id, { x: point.x, y: point.y, r: point.r }])
+  );
+}
+
+function manualPointRecord(source: Map<number, { x: number; y: number }>) {
+  return Object.fromEntries([...source.entries()].map(([id, point]) => [id, { x: point.x, y: point.y }]));
+}
+
+function loadLayoutPointRecord(
+  source: CompleteLayoutCache['tags'] | undefined,
+  validIds: Set<number>
+) {
+  const points = new Map<number, LayoutPoint>();
+  if (!source) {
+    return points;
+  }
+  for (const [id, point] of Object.entries(source)) {
+    const nodeId = Number(id);
+    if (
+      validIds.has(nodeId) &&
+      Number.isFinite(point.x) &&
+      Number.isFinite(point.y) &&
+      Number.isFinite(point.r)
+    ) {
+      points.set(nodeId, { x: point.x, y: point.y, r: point.r });
+    }
+  }
+  return points;
+}
+
+function loadManualPointRecord(
+  source: CompleteLayoutCache['manualTags'] | undefined,
+  validIds: Set<number>
+) {
+  const points = new Map<number, { x: number; y: number }>();
+  if (!source) {
+    return points;
+  }
+  for (const [id, point] of Object.entries(source)) {
+    const nodeId = Number(id);
+    if (validIds.has(nodeId) && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+      points.set(nodeId, { x: point.x, y: point.y });
+    }
+  }
+  return points;
+}
+
+function copyPointMap(source: Map<number, LayoutPoint>, target: Map<number, LayoutPoint>) {
+  for (const [id, point] of source) {
+    target.set(id, { ...point });
+  }
+}
+
+function copyManualPointMap(
+  source: Map<number, { x: number; y: number }>,
+  target: Map<number, { x: number; y: number }>
+) {
+  for (const [id, point] of source) {
+    target.set(id, { ...point });
+  }
+}
+
+function layoutSignature() {
+  return JSON.stringify({
+    mapId: props.graph.map.id,
+    layoutMode: props.layoutMode,
+    tags: [...props.graph.tags]
+      .map((tag) => [tag.id, tag.name, tag.count])
+      .sort((a, b) => Number(a[0]) - Number(b[0])),
+    logs: [...props.graph.logs]
+      .map((log) => [
+        log.id,
+        log.updatedAt,
+        log.createdAt,
+        log.tags.map((tag) => tag.id).sort((a, b) => a - b)
+      ])
+      .sort((a, b) => Number(a[0]) - Number(b[0])),
+    similarities: [...(props.graph.tagSimilarities ?? [])]
+      .map((item) => [item.tagAId, item.tagBId, Number(item.score).toFixed(4)])
+      .sort((a, b) => Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1])),
+    groups: [...(props.graph.tagGroups ?? [])]
+      .map((group) => [group.name, [...group.tagIds].sort((a, b) => a - b)])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+  });
+}
+
 function resetTagLayout() {
   pushLayoutHistory(captureManualPositions());
   manualTagPositions.clear();
   manualLogPositions.clear();
   window.localStorage.removeItem(tagPositionStorageKey());
   window.localStorage.removeItem(logPositionStorageKey());
+  window.localStorage.removeItem(completeLayoutStorageKey());
   emit('layoutDirty', false);
   pendingFitAllFrontView = true;
   requestLayout();
 }
 
 function refreshLayout() {
+  loadManualPositions();
+  window.localStorage.removeItem(completeLayoutStorageKey());
+  emit('layoutDirty', false);
   pendingFitAllFrontView = true;
   requestLayout();
   updateLabels();
@@ -2427,7 +2623,7 @@ const backgroundShader = `
     let aspect = max(0.4, u.viewport.x / max(1.0, u.viewport.y));
     let rawScreen = (input.uv * 2.0 - vec2f(1.0)) * vec2f(aspect, 1.0);
     let skyZoom = max(0.28, pow(max(u.viewport.z, 0.05), 0.62));
-    let skyPan = vec2f(u.camera.x, u.camera.y) * 0.00042;
+    let skyPan = vec2f(u.camera.x, -u.camera.y) * 0.00042;
     let screen = rawScreen / skyZoom + skyPan;
     let viewDir = normalize(vec3f(screen.x * 0.76, -screen.y * 0.76, 1.0));
     let dir = rotateSky(viewDir);

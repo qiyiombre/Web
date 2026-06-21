@@ -246,6 +246,45 @@ export function generateAdvice(mapId: number, range?: InsightRangePayload) {
 
 const DB_NAME = 'nebula-insight-local';
 const STORE_NAME = 'drafts';
+const DRAFT_BACKUP_PREFIX = 'nebula.draft.';
+
+function draftBackupKey(mapId: number) {
+  return `${DRAFT_BACKUP_PREFIX}${mapId}`;
+}
+
+function saveDraftBackup(mapId: number, draft: DraftLog) {
+  try {
+    localStorage.setItem(draftBackupKey(mapId), JSON.stringify(draft));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function loadDraftBackup(mapId: number): DraftLog | undefined {
+  try {
+    const raw = localStorage.getItem(draftBackupKey(mapId));
+    if (!raw) {
+      return undefined;
+    }
+    const draft = JSON.parse(raw) as Partial<DraftLog>;
+    return {
+      title: String(draft.title ?? ''),
+      content: String(draft.content ?? ''),
+      tagNames: Array.isArray(draft.tagNames) ? draft.tagNames.map(String) : []
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function clearDraftBackup(mapId: number) {
+  try {
+    localStorage.removeItem(draftBackupKey(mapId));
+  } catch {
+    // ignore backup cleanup failures
+  }
+}
 
 function openDraftDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -262,31 +301,48 @@ function openDraftDb(): Promise<IDBDatabase> {
 }
 
 export async function saveDraft(mapId: number, draft: DraftLog) {
-  const db = await openDraftDb();
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).put(draft, String(mapId));
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  }).finally(() => db.close());
+  const hasBackup = saveDraftBackup(mapId, draft);
+  try {
+    const db = await openDraftDb();
+    return await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).put(draft, String(mapId));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    }).finally(() => db.close());
+  } catch (error) {
+    if (!hasBackup) {
+      throw error;
+    }
+  }
 }
 
 export async function loadDraft(mapId: number) {
-  const db = await openDraftDb();
-  return new Promise<DraftLog | undefined>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const req = tx.objectStore(STORE_NAME).get(String(mapId));
-    req.onsuccess = () => resolve(req.result as DraftLog | undefined);
-    req.onerror = () => reject(req.error);
-  }).finally(() => db.close());
+  try {
+    const db = await openDraftDb();
+    const draft = await new Promise<DraftLog | undefined>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const req = tx.objectStore(STORE_NAME).get(String(mapId));
+      req.onsuccess = () => resolve(req.result as DraftLog | undefined);
+      req.onerror = () => reject(req.error);
+    }).finally(() => db.close());
+    return draft ?? loadDraftBackup(mapId);
+  } catch {
+    return loadDraftBackup(mapId);
+  }
 }
 
 export async function clearDraft(mapId: number) {
-  const db = await openDraftDb();
-  return new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).delete(String(mapId));
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  }).finally(() => db.close());
+  clearDraftBackup(mapId);
+  try {
+    const db = await openDraftDb();
+    return await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).delete(String(mapId));
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    }).finally(() => db.close());
+  } catch {
+    // ignore IndexedDB cleanup failures when backup has already been cleared
+  }
 }

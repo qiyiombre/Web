@@ -114,6 +114,7 @@ onDeactivated(() => {
 });
 
 onBeforeUnmount(() => {
+  persistCurrentNebulaLayout();
   unbindNebulaShortcuts();
   if (focusPulseTimer !== null) {
     window.clearTimeout(focusPulseTimer);
@@ -121,8 +122,12 @@ onBeforeUnmount(() => {
   }
 });
 
-watch(mapId, async (id) => {
+watch(mapId, async (id, previousId) => {
   if (id && !isNaN(id)) {
+    if (previousId && id !== previousId) {
+      persistCurrentNebulaLayout();
+      clearMapSelectionState();
+    }
     await ensureMapSelected(id);
     applyDrawerQuery();
     await applyFocusLogQuery();
@@ -172,10 +177,67 @@ function closeDrawer() {
   showDrawer.value = false;
 }
 
+function persistCurrentNebulaLayout() {
+  canvasRef.value?.saveCompleteLayout?.();
+}
+
+function clearMapSelectionState() {
+  graphStore.clearActiveTags();
+  graphStore.selectedLogId = null;
+  graphStore.nebulaLogCard = null;
+  graphStore.domainFocusTagIds = new Set();
+  selectedLogId.value = null;
+  activeClusterLogIds.value = null;
+  focusPulseLogId.value = null;
+  if (focusPulseTimer !== null) {
+    window.clearTimeout(focusPulseTimer);
+    focusPulseTimer = null;
+  }
+  ui.closeTagMenu();
+}
+
+function clearForeignMapSelectionState() {
+  const graph = mapsStore.graph;
+  if (!graph) {
+    return;
+  }
+  const validTagIds = new Set(graph.tags.map((tag) => tag.id));
+  const validLogIds = new Set(graph.logs.map((log) => log.id));
+  const hasForeignTag = [...graphStore.activeTagIds].some((id) => !validTagIds.has(id));
+  const hasForeignDomainFocus = [...graphStore.domainFocusTagIds].some((id) => !validTagIds.has(id));
+  const hasForeignSelectedLog = selectedLogId.value !== null && !validLogIds.has(selectedLogId.value);
+  const hasForeignStoreSelectedLog = graphStore.selectedLogId !== null && !validLogIds.has(graphStore.selectedLogId);
+  const hasForeignCard = graphStore.nebulaLogCard !== null && !validLogIds.has(graphStore.nebulaLogCard.logId);
+  const hasForeignTagMenu = ui.nebulaTagMenu !== null && !validTagIds.has(ui.nebulaTagMenu.tagId);
+  if (
+    hasForeignTag ||
+    hasForeignDomainFocus ||
+    hasForeignSelectedLog ||
+    hasForeignStoreSelectedLog ||
+    hasForeignCard ||
+    hasForeignTagMenu
+  ) {
+    clearMapSelectionState();
+  }
+}
+
+function switchMap(nextMapId: number) {
+  if (!Number.isFinite(nextMapId) || nextMapId === mapId.value) {
+    return;
+  }
+  persistCurrentNebulaLayout();
+  clearMapSelectionState();
+  router.push(`/maps/${nextMapId}`);
+}
+
 async function ensureMapSelected(id = mapId.value) {
   if (!id || Number.isNaN(id)) return;
+  if (mapsStore.graph?.map.id && mapsStore.graph.map.id !== id) {
+    clearMapSelectionState();
+  }
   mapsStore.activeMapId = id;
   await mapsStore.selectMap(id);
+  clearForeignMapSelectionState();
 }
 
 function applyDrawerQuery() {
@@ -253,6 +315,15 @@ function handleLayoutDirty(dirty: boolean) {
 
 function focusTag(tagId: number) {
   graphStore.focusTag(tagId);
+  if (canvasRef.value?.focusTag) {
+    canvasRef.value.focusTag(tagId);
+  }
+}
+
+function addAndFocusRelatedTag(tagId: number) {
+  if (!graphStore.activeTagIds.has(tagId)) {
+    graphStore.toggleTag(tagId);
+  }
   if (canvasRef.value?.focusTag) {
     canvasRef.value.focusTag(tagId);
   }
@@ -343,7 +414,7 @@ function unbindNebulaShortcuts() {
 }
 
 function refreshNebulaView() {
-  mapsStore.refreshNebulaView();
+  canvasRef.value?.refreshLayout?.();
 }
 
 function saveNebulaLayout() {
@@ -391,8 +462,21 @@ function requestDeleteMap(map: NebulaMap) {
   );
 }
 
+function requestNewMapDetails() {
+  const name = window.prompt('星图名称', '未命名星图')?.trim();
+  if (!name) {
+    return null;
+  }
+  const description = window.prompt('星图描述（可选）', '')?.trim() ?? '';
+  return { name, description };
+}
+
 async function createAndEnter() {
-  const map = await mapsStore.addMap('未命名星图', '');
+  const draft = requestNewMapDetails();
+  if (!draft) {
+    return;
+  }
+  const map = await mapsStore.addMap(draft.name, draft.description);
   router.push(`/maps/${map.id}`);
 }
 
@@ -878,7 +962,7 @@ const layoutAiStatus = computed(() => {
                 v-for="item in graphStore.relatedTags"
                 :key="item.tag.id"
                 class="related-item"
-                @click="focusTag(item.tag.id)"
+                @click="addAndFocusRelatedTag(item.tag.id)"
               >
                 <span class="tag-dot" :style="{ backgroundColor: item.tag.color }" />
                 <span>{{ item.tag.name }}</span>
@@ -928,12 +1012,21 @@ const layoutAiStatus = computed(() => {
                 class="map-rename-form"
                 @submit.prevent="mapsStore.saveRenameMap(map.id)"
               >
-                <input v-model="mapsStore.renameDraft" @keydown.escape.prevent="mapsStore.cancelRenameMap()" />
-                <button class="icon-button" :disabled="mapsStore.renameSaving"><Check :size="15" /></button>
-                <button class="icon-button" type="button" @click="mapsStore.cancelRenameMap"><X :size="15" /></button>
+                <div class="map-rename-fields">
+                  <input v-model="mapsStore.renameDraft" placeholder="星图名称" @keydown.escape.prevent="mapsStore.cancelRenameMap()" />
+                  <input
+                    v-model="mapsStore.renameDescriptionDraft"
+                    placeholder="星图描述（可选）"
+                    @keydown.escape.prevent="mapsStore.cancelRenameMap()"
+                  />
+                </div>
+                <div class="map-rename-actions">
+                  <button class="icon-button" :disabled="mapsStore.renameSaving"><Check :size="15" /></button>
+                  <button class="icon-button" type="button" @click="mapsStore.cancelRenameMap"><X :size="15" /></button>
+                </div>
               </form>
               <template v-else>
-                <button class="drawer-map-item" :class="{ active: map.id === mapId }" @click="router.push(`/maps/${map.id}`)">
+                <button class="drawer-map-item" :class="{ active: map.id === mapId }" @click="switchMap(map.id)">
                   <span>{{ map.name }}</span>
                 </button>
                 <button class="icon-button sm" title="重命名" @click="mapsStore.startRenameMap(map.id, 'list')"><Edit3 :size="14" /></button>
@@ -1667,13 +1760,27 @@ const layoutAiStatus = computed(() => {
 
 .map-rename-form {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 4px;
   flex: 1;
 }
 
-.map-rename-form input {
+.map-rename-fields {
+  display: flex;
   flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.map-rename-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
+}
+
+.map-rename-form input {
+  width: 100%;
   padding: 5px 8px;
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.06);

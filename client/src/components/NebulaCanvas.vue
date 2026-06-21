@@ -13,6 +13,15 @@ type LayoutSnapshot = {
   tags: Array<[number, { x: number; y: number }]>;
   logs: Array<[number, { x: number; y: number }]>;
 };
+type CompleteLayoutCache = {
+  signature: string;
+  tags: Record<string, LayoutPoint>;
+  logs: Record<string, LayoutPoint>;
+  manualTags: Record<string, { x: number; y: number }>;
+  manualLogs: Record<string, { x: number; y: number }>;
+  view?: { scale: number; x: number; y: number };
+};
+type LayoutRequestOptions = { fitAll?: boolean; preferCache?: boolean };
 
 interface LayoutResponse {
   requestId: number;
@@ -141,10 +150,11 @@ onMounted(async () => {
   resize();
   window.addEventListener('resize', resize);
   animate();
-  requestLayout({ fitAll: true });
+  requestLayout({ fitAll: true, preferCache: true });
 });
 
 onBeforeUnmount(() => {
+  saveCompleteLayout();
   window.removeEventListener('resize', resize);
   cancelAnimationFrame(raf);
   cancelAnimationFrame(cursorRaf);
@@ -155,14 +165,14 @@ watch(
   () => [props.graph.map.id, props.layoutMode],
   () => {
     loadManualPositions();
-    requestLayout({ fitAll: true });
+    requestLayout({ fitAll: true, preferCache: true });
   },
   { immediate: true }
 );
 
 watch(
   () => [props.graph.tags, props.graph.logs, props.graph.tagSimilarities, props.graph.tagGroups, props.layoutMode],
-  () => requestLayout({ fitAll: true }),
+  () => requestLayout({ fitAll: true, preferCache: true }),
   { deep: true }
 );
 
@@ -189,6 +199,7 @@ defineExpose({
   resetTagLayout,
   refreshLayout,
   saveLayout,
+  saveCompleteLayout,
   undoLayout,
   redoLayout
 });
@@ -227,9 +238,12 @@ function animate(timestamp = 0) {
   raf = requestAnimationFrame(animate);
 }
 
-function requestLayout(options: { fitAll?: boolean } = {}) {
+function requestLayout(options: LayoutRequestOptions = {}) {
   if (options.fitAll) {
     pendingFitAllTags = true;
+  }
+  if (options.preferCache && restoreCompleteLayout(options)) {
+    return;
   }
   latestLayoutRequestId += 1;
   layoutBusy.value = true;
@@ -1422,6 +1436,10 @@ function logPositionStorageKey() {
   return `nebula.logPositions.${props.graph.map.id}.${props.layoutMode}`;
 }
 
+function completeLayoutStorageKey() {
+  return `nebula.completeLayout.canvas.${props.graph.map.id}.${props.layoutMode}`;
+}
+
 function loadManualPositions() {
   manualTagPositions.clear();
   manualLogPositions.clear();
@@ -1463,8 +1481,78 @@ function saveLayout() {
     return false;
   }
   saveManualPositions();
+  saveCompleteLayout();
   emit('layoutDirty', false);
   return true;
+}
+
+function saveCompleteLayout() {
+  if (tagPositions.size === 0 && logPositions.size === 0) {
+    return false;
+  }
+  const cache: CompleteLayoutCache = {
+    signature: layoutSignature(),
+    tags: pointRecord(tagPositions),
+    logs: pointRecord(logPositions),
+    manualTags: manualPointRecord(manualTagPositions),
+    manualLogs: manualPointRecord(manualLogPositions),
+    view: {
+      scale: transform.scale,
+      x: transform.x,
+      y: transform.y
+    }
+  };
+  window.localStorage.setItem(completeLayoutStorageKey(), JSON.stringify(cache));
+  return true;
+}
+
+function restoreCompleteLayout(options: LayoutRequestOptions = {}) {
+  const raw = window.localStorage.getItem(completeLayoutStorageKey());
+  if (!raw) {
+    return false;
+  }
+  try {
+    const cache = JSON.parse(raw) as Partial<CompleteLayoutCache>;
+    if (cache.signature !== layoutSignature()) {
+      return false;
+    }
+    const validTagIds = new Set(props.graph.tags.map((tag) => tag.id));
+    const validLogIds = new Set(props.graph.logs.map((log) => log.id));
+    const restoredTags = loadLayoutPointRecord(cache.tags, validTagIds);
+    const restoredLogs = loadLayoutPointRecord(cache.logs, validLogIds);
+    if (restoredTags.size !== validTagIds.size || restoredLogs.size !== validLogIds.size) {
+      return false;
+    }
+
+    tagPositions.clear();
+    logPositions.clear();
+    manualTagPositions.clear();
+    manualLogPositions.clear();
+    copyPointMap(restoredTags, tagPositions);
+    copyPointMap(restoredLogs, logPositions);
+    copyManualPointMap(loadManualPointRecord(cache.manualTags, validTagIds), manualTagPositions);
+    copyManualPointMap(loadManualPointRecord(cache.manualLogs, validLogIds), manualLogPositions);
+
+    if (
+      cache.view &&
+      Number.isFinite(cache.view.scale) &&
+      Number.isFinite(cache.view.x) &&
+      Number.isFinite(cache.view.y)
+    ) {
+      transform.scale = cache.view.scale;
+      transform.x = cache.view.x;
+      transform.y = cache.view.y;
+      pendingFitAllTags = false;
+    } else if (options.fitAll && fitAllTags(false)) {
+      pendingFitAllTags = false;
+    }
+    layoutBusy.value = false;
+    draw();
+    return true;
+  } catch {
+    window.localStorage.removeItem(completeLayoutStorageKey());
+    return false;
+  }
 }
 
 function undoLayout() {
@@ -1538,18 +1626,110 @@ function saveManualPointMap(
   window.localStorage.setItem(key, JSON.stringify(saved));
 }
 
+function pointRecord(source: Map<number, LayoutPoint>) {
+  return Object.fromEntries(
+    [...source.entries()].map(([id, point]) => [id, { x: point.x, y: point.y, r: point.r }])
+  );
+}
+
+function manualPointRecord(source: Map<number, { x: number; y: number }>) {
+  return Object.fromEntries([...source.entries()].map(([id, point]) => [id, { x: point.x, y: point.y }]));
+}
+
+function loadLayoutPointRecord(
+  source: CompleteLayoutCache['tags'] | undefined,
+  validIds: Set<number>
+) {
+  const points = new Map<number, LayoutPoint>();
+  if (!source) {
+    return points;
+  }
+  for (const [id, point] of Object.entries(source)) {
+    const nodeId = Number(id);
+    if (
+      validIds.has(nodeId) &&
+      Number.isFinite(point.x) &&
+      Number.isFinite(point.y) &&
+      Number.isFinite(point.r)
+    ) {
+      points.set(nodeId, { x: point.x, y: point.y, r: point.r });
+    }
+  }
+  return points;
+}
+
+function loadManualPointRecord(
+  source: CompleteLayoutCache['manualTags'] | undefined,
+  validIds: Set<number>
+) {
+  const points = new Map<number, { x: number; y: number }>();
+  if (!source) {
+    return points;
+  }
+  for (const [id, point] of Object.entries(source)) {
+    const nodeId = Number(id);
+    if (validIds.has(nodeId) && Number.isFinite(point.x) && Number.isFinite(point.y)) {
+      points.set(nodeId, { x: point.x, y: point.y });
+    }
+  }
+  return points;
+}
+
+function copyPointMap(source: Map<number, LayoutPoint>, target: Map<number, LayoutPoint>) {
+  for (const [id, point] of source) {
+    target.set(id, { ...point });
+  }
+}
+
+function copyManualPointMap(
+  source: Map<number, { x: number; y: number }>,
+  target: Map<number, { x: number; y: number }>
+) {
+  for (const [id, point] of source) {
+    target.set(id, { ...point });
+  }
+}
+
+function layoutSignature() {
+  return JSON.stringify({
+    mapId: props.graph.map.id,
+    layoutMode: props.layoutMode,
+    tags: [...props.graph.tags]
+      .map((tag) => [tag.id, tag.name, tag.count])
+      .sort((a, b) => Number(a[0]) - Number(b[0])),
+    logs: [...props.graph.logs]
+      .map((log) => [
+        log.id,
+        log.updatedAt,
+        log.createdAt,
+        log.tags.map((tag) => tag.id).sort((a, b) => a - b)
+      ])
+      .sort((a, b) => Number(a[0]) - Number(b[0])),
+    similarities: [...(props.graph.tagSimilarities ?? [])]
+      .map((item) => [item.tagAId, item.tagBId, Number(item.score).toFixed(4)])
+      .sort((a, b) => Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1])),
+    groups: [...(props.graph.tagGroups ?? [])]
+      .map((group) => [group.name, [...group.tagIds].sort((a, b) => a - b)])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+  });
+}
+
 function resetTagLayout() {
   pushLayoutHistory(captureManualPositions());
   manualTagPositions.clear();
   manualLogPositions.clear();
   window.localStorage.removeItem(tagPositionStorageKey());
   window.localStorage.removeItem(logPositionStorageKey());
+  window.localStorage.removeItem(completeLayoutStorageKey());
   emit('layoutDirty', false);
   requestLayout();
 }
 
 function refreshLayout() {
-  requestLayout();
+  loadManualPositions();
+  window.localStorage.removeItem(completeLayoutStorageKey());
+  emit('layoutDirty', false);
+  requestLayout({ fitAll: true });
   draw();
 }
 

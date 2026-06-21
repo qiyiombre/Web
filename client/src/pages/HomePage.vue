@@ -58,10 +58,23 @@ const statsScopeLabel = computed(() => {
   return name ? `当前星图：${name}` : '当前星图';
 });
 
+function requestNewMapDetails() {
+  const name = window.prompt('星图名称', '未命名星图')?.trim();
+  if (!name) {
+    return null;
+  }
+  const description = window.prompt('星图描述（可选）', '')?.trim() ?? '';
+  return { name, description };
+}
+
 async function createAndEnter() {
+  const draft = requestNewMapDetails();
+  if (!draft) {
+    return;
+  }
   creating.value = true;
   try {
-    const map = await mapsStore.addMap('未命名星图', '');
+    const map = await mapsStore.addMap(draft.name, draft.description);
     router.push(`/maps/${map.id}`);
   } catch {
     // error handled
@@ -229,9 +242,18 @@ function formatTime(iso: string) {
             @submit.prevent="mapsStore.saveRenameMap(map.id)"
             @click.stop
           >
-            <input v-model="mapsStore.renameDraft" @keydown.escape.prevent="mapsStore.cancelRenameMap()" />
-            <button class="icon-button" :disabled="mapsStore.renameSaving"><Check :size="15" /></button>
-            <button class="icon-button" type="button" @click="mapsStore.cancelRenameMap"><X :size="15" /></button>
+            <div class="map-rename-fields">
+              <input v-model="mapsStore.renameDraft" placeholder="星图名称" @keydown.escape.prevent="mapsStore.cancelRenameMap()" />
+              <input
+                v-model="mapsStore.renameDescriptionDraft"
+                placeholder="星图描述（可选）"
+                @keydown.escape.prevent="mapsStore.cancelRenameMap()"
+              />
+            </div>
+            <div class="map-rename-actions">
+              <button class="icon-button" :disabled="mapsStore.renameSaving"><Check :size="15" /></button>
+              <button class="icon-button" type="button" @click="mapsStore.cancelRenameMap"><X :size="15" /></button>
+            </div>
           </form>
           <div v-else class="map-card" @click="enterMap(map.id)">
             <div class="map-card-preview">
@@ -699,8 +721,22 @@ function formatTime(iso: string) {
   border: 1px solid rgba(98, 214, 255, 0.25);
 }
 
-.map-rename-card input {
+.map-rename-fields {
+  display: flex;
   flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.map-rename-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 4px;
+}
+
+.map-rename-card input {
+  width: 100%;
   padding: 6px 10px;
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.06);

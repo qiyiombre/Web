@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { Check, Save, Plus, Sparkles, WifiOff, X } from 'lucide-vue-next';
 import { suggestTags } from '../services/api';
 import type { AiMeta, DraftLog, LogEntry, TagNode, TagSuggestion, TagSuggestionResponse } from '../types/domain';
@@ -29,6 +29,8 @@ const loadingSuggestions = ref(false);
 const suggestionHint = ref('');
 const error = ref('');
 let suggestionRequestId = 0;
+let resettingForm = false;
+let resetToken = 0;
 
 const isEditing = computed(() => Boolean(props.initialLog));
 const canSave = computed(() => title.value.trim() && content.value.trim() && selectedTags.value.length > 0);
@@ -39,7 +41,24 @@ watch(
   { immediate: true }
 );
 
+watch(
+  () => props.draft,
+  (draft) => {
+    if (isEditing.value || !draft) {
+      return;
+    }
+    const formIsEmpty = !title.value.trim() && !content.value.trim() && selectedTags.value.length === 0;
+    if (formIsEmpty) {
+      resetForm();
+    }
+  },
+  { deep: true }
+);
+
 watch([title, content, selectedTags], () => {
+  if (resettingForm) {
+    return;
+  }
   if (!isEditing.value) {
     emit('draftChange', {
       title: title.value,
@@ -50,12 +69,19 @@ watch([title, content, selectedTags], () => {
 });
 
 function resetForm() {
+  const token = ++resetToken;
+  resettingForm = true;
   if (props.initialLog) {
     title.value = props.initialLog.title;
     content.value = props.initialLog.content;
     selectedTags.value = props.initialLog.tags.map((tag) => tag.name);
     suggestions.value = [];
     suggestionHint.value = '';
+    void nextTick(() => {
+      if (token === resetToken) {
+        resettingForm = false;
+      }
+    });
     return;
   }
 
@@ -64,6 +90,11 @@ function resetForm() {
   selectedTags.value = props.draft?.tagNames ?? [];
   suggestions.value = [];
   suggestionHint.value = '';
+  void nextTick(() => {
+    if (token === resetToken) {
+      resettingForm = false;
+    }
+  });
 }
 
 async function requestSuggestions(trigger: 'auto' | 'manual' = 'manual') {
@@ -192,7 +223,7 @@ function save() {
 
     <label class="field">
       <span>标题</span>
-      <input v-model="title" placeholder="例如：Web 项目今天有进展" />
+      <input v-model="title" placeholder="例如：周末小结" />
     </label>
 
     <label class="field">
