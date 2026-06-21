@@ -131,7 +131,7 @@ function switchMode(nextMode: 'login' | 'register') {
         </button>
       </form>
 
-      <p class="auth-footnote">课堂展示账号可用 demo / demo123456。</p>
+      <p class="auth-footnote">可用账号demo / demo123456</p>
     </section>
   </main>
 </template>
